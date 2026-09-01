@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Decision 03 · Dependency rule: the domain references nothing.
+       This empty ItemGroup is deliberate — before adding any PackageReference, be sure it is
+       part of the enterprise business rules. tests/UserSvc.ArchitectureTests enforces this. -->
+
+</Project>

@@ -1,0 +1,55 @@
+# CI 门禁（蓝图 · 附二）。每一条都对应一类真实事故，不要因为「暂时红了」就注释掉。
+trigger:
+  branches: { include: [main] }
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  buildConfiguration: Release
+
+steps:
+  - task: UseDotNet@2
+    displayName: Install .NET SDK
+    inputs:
+      packageType: sdk
+      useGlobalJson: true
+
+  - script: dotnet restore UserSvc.slnx
+    displayName: Restore
+
+  # 门禁 01：构建零警告（TreatWarningsAsErrors 已开）
+  - script: dotnet build UserSvc.slnx -c $(buildConfiguration) --no-restore
+    displayName: Build (zero warnings)
+
+  # 门禁 02：全部测试绿 —— 含架构守卫，依赖方向违规会在这里失败
+  - script: dotnet test UserSvc.slnx -c $(buildConfiguration) --no-build --logger trx
+    displayName: Test
+
+  # 门禁 03：DDL 双跑幂等
+  - script: |
+      set -e
+      for f in db/*.sql; do
+        psql "$DATABASE_URL" -f "$f"
+        psql "$DATABASE_URL" -f "$f"   # 第二遍必须成功且无副作用
+      done
+    displayName: DDL idempotency (run twice)
+    env:
+      DATABASE_URL: $(CiDatabaseUrl)
+
+  # 门禁 04：模型与手写 DDL 对照，防止悄悄漂移
+  - script: |
+      set -e
+      dotnet tool restore
+      dotnet dotnet-ef dbcontext script \
+        -p src/UserSvc.Infrastructure -s src/UserSvc.Infrastructure \
+        --no-build -o $(Agent.TempDirectory)/model.sql
+      echo "Review model.sql against db/*.sql — see db/README.md"
+    displayName: EF model vs db/ scripts
+
+  # 门禁 06：依赖漏洞，High/Critical 直接失败
+  - script: |
+      set -e
+      dotnet list UserSvc.slnx package --vulnerable --include-transitive 2>&1 | tee audit.txt
+      ! grep -qiE '\b(High|Critical)\b' audit.txt
+    displayName: Dependency vulnerability gate

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Decision 03 · Dependency rule: references Domain and nothing else.
+       Any of EntityFrameworkCore / Npgsql / AspNetCore appearing here is an architecture
+       violation and tests/UserSvc.ArchitectureTests will fail the build. -->
+  <ItemGroup>
+    <ProjectReference Include="../UserSvc.Domain/UserSvc.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FluentValidation" />
+    <PackageReference Include="Microsoft.Extensions.Options.DataAnnotations" />
+  </ItemGroup>
+
+</Project>
