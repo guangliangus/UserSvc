@@ -8,6 +8,13 @@
         "dotnet-ef"
       ],
       "rollForward": false
+    },
+    "dotnet-stack": {
+      "version": "9.0.661903",
+      "commands": [
+        "dotnet-stack"
+      ],
+      "rollForward": false
     }
   }
 }

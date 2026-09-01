@@ -65,16 +65,99 @@ Api ──────► Infrastructure ──────► Application ─�
   不是今天用字符串去预防的理由
 - 时间用 `DateTimeOffset`，序列化成 ISO 8601 带偏移量
 
-## 占位实现要选安全的那一侧
+## 认证与会话
 
-未落地的依赖先定端口 + 写占位实现，让调用方逻辑一次写全。但占位实现宁可**失败**也不要
-静默放行：
+**OpenIddict 独占 refresh token。**`UserSession` 聚合保留会话身份（`sid`）、设备信息、`LastSeenAt`
+和撤销，**不再自己做轮换**。两套 refresh token 实现就是两个真相源。
 
-| 占位 | 行为 |
+这条不是偏好，是实测结论：OpenIddict 在 `SetRefreshTokenReuseLeeway(TimeSpan.Zero)` 下，重放已赎回的
+refresh token 会返回 `400 invalid_grant` **并撤销该 authorization 下的每一行 token**——正是蓝图要的。
+
+> ⚠️ **那一行配置的默认值是 30 秒，而在默认值下重放会静默成功并发出新令牌。**
+> 蓝图的核心安全承诺离「悄悄不成立」只有一行配置的距离。改它之前先读 `OpenIddictRegistration`
+> 里的注释。
+
+两侧靠 `sid` claim 和 `user_sessions.authorization_id` 关联。设备登出时
+`ITokenChainRevoker` 顺着 `authorization_id` 杀掉整条链。
+
+### 撤销为什么要有两处
+
+| 机制 | 生效范围 | 时机 |
+|---|---|---|
+| `user_sessions.status = REVOKED` | 刷新路径 | 立即，且是权威来源 |
+| Redis 撤销集 `revoked:sid:{sid}` | **已签发的 access token** | 立即，靠 `RevokedSessionMiddleware` 每请求检查 |
+
+只有第一处的话，「登出此设备」在 access token 过期前（最多 10 分钟）都不生效——那不是任何人要的功能。
+
+撤销集的 TTL **等于 access token 寿命**，所以集合里只会有最近几分钟被踢掉的会话，永远不会长大，
+也不需要清理任务。
+
+`RevokedSessionMiddleware` 是网关落地前的临时位置。蓝图的终态是网关查一次、注入结果，下游零成本；
+到那天，删掉这个文件就是全部改动。
+
+## 失败语义：判断标准是「降级后回落到什么」
+
+| 组件 | 失败时 | 为什么 |
+|---|---|---|
+| PostgreSQL | fail-closed，`/health/ready` 报不健康 | 没有库就给不出正确答案 |
+| Redis · 读撤销集 | **fail-open**，放行并告警 | 这是在一个已完整验签的有效令牌之上的额外检查，**短命令牌本身就是保底** |
+| Redis · 写撤销集（单设备登出） | **fail-loud**，抛 502 | 静默失败 = 被登出的设备照常能用，且无任何信号 |
+| Redis · 写撤销集（全设备登出） | 全部尝试完再报错 | 第一次失败就中断会留下一半设备无撤销记录，比慢更糟 |
+| Redis · 写撤销集（重放处理 / 顶替旧会话） | 记 Error 日志，不抛 | 抛出会把 OAuth 的 `400 invalid_grant` 变成 `502 ProblemDetails`，破坏令牌端点契约；而会话行已提交为 REVOKED，安全结果不依赖它 |
+| 通知服务 5xx / 超时 | 502 `UpstreamException` | 上游的错，不是调用方的错 |
+| 通知服务 4xx | 500 类，响应体只记日志 | 是**我们**发错了；把它变成 502 等于甩锅给上游 |
+
+同一个 Redis，读 fail-open 写 fail-loud——因为读有保底、写没有。
+
+## 生产环境会拒绝启动的配置
+
+不是缺陷，是设计。宁可启动失败，也不要带着错误配置静默运行：
+
+| 配置 | 缺失时 |
 |---|---|
-| `InMemorySessionRevocationStore` | 非 Development 环境**拒绝启动**——单副本内存集合在多副本下撤销不会传播 |
-| `UnavailableNotificationClient` | 抛 502——假装发送成功会让用户永远等不到验证码却看不到错误 |
-| `DevAuthenticationHandler` | 只在 Development 注册；生产缺认证方案会启动失败 |
+| `ConnectionStrings:Default` | 抛，不启动 |
+| `Redis:Configuration` | `[Required]` 拒空串——**故意不在 `appsettings.json` 里给默认值**，一个 `localhost` 默认值比缺失更糟 |
+| `Notification:BaseAddress` | 同上；且**必须以 `/` 结尾**，否则 `HttpClient.BaseAddress` 会吞掉最后一段路径 |
+| `AuthToken:SigningCertificateThumbprint` / `EncryptionCertificateThumbprint` | 非 Development 拒绝启动。用临时密钥意味着每次重启作废全部令牌，且两个副本互相不认——一次看起来像随机 bug 的故障 |
+
+`DevAuthenticationHandler` 只在 Development 注册，用 `X-Dev-User-Id` / `X-Dev-Session-Id` 伪造身份，
+**不做任何验证**。它和 OpenIddict 并存，所以本地 curl 和集成测试不受影响。
+
+## 中间件顺序里两处不能动的地方
+
+`Program.cs` 的管道顺序不是风格问题，有两处错了会静默出错：
+
+1. **`UseSerilogRequestLogging()` 必须在 `UseExceptionHandler()` 之前（最外层）。**
+   放在后面，它看到的是仍在飞的异常，会把请求记成 500——而异常处理器接下来会把它变成 400。
+   于是每一次普通的校验失败都在请求日志里长得像一次服务端故障，所有基于该日志的 SLO 看板
+   都会把我们自己的 4xx 读成我们自己的宕机。
+2. **`RevokedSessionMiddleware` 必须在认证之后、授权之前。** 之前没有 `sid` 可读；之后
+   一个已撤销的会话可能已经通过了某条授权策略。
+
+## 测试宿主不要向操作系统要密钥
+
+`AuthToken:UseEphemeralKeys` 存在的原因值得记下来：探测「能不能打开 CurrentUser/My 存储」
+不足以判断能不能用它。在 macOS 上，测试宿主里这个存储**打开成功，第一次使用私钥时阻塞**——
+整个测试套件挂死在令牌生成里，没有异常、没有超时，看起来像 OpenIddict 死锁。
+
+任何非交互宿主（集成测试、CI、容器）都应该把它设成 `true`，别再问操作系统要许可。
+
+## 消息：有 outbox，没有投递器
+
+Go 服务不用 RabbitMQ，本服务也不引。但 `identity.outbox_messages` 保留，领域事件仍然**在业务事务里
+原子落表**（`DomainEventOutboxInterceptor`）。
+
+抽取放在拦截器而不是 `UnitOfWork` 里，是因为共享同一个 `DbContext` 的库——OpenIddict 的 EF store
+就是——会直接调 `SaveChanges`。留在 `UnitOfWork` 里会在那些保存上静默跳过 outbox，事件搁在实体上没人管，
+而且不报任何错。
+
+当前没有消费者，所以 outbox 是一份持久事件日志（重放检测这类安全事件值得留痕）。等真正的集成机制定下来，
+加一个投递器读它即可，业务代码一行不动。
+
+## 日志抽象可以进内环，日志实现不行
+
+`Microsoft.Extensions.Logging.Abstractions` 允许出现在 Application 层；`Serilog` 被守卫禁止。
+一个说不出自己哪里出错的应用服务，耦合程度比依赖 `ILogger<T>` 更糟。
 
 ## 数据库
 

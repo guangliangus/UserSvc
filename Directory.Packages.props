@@ -11,6 +11,17 @@
     <PackageVersion Include="Asp.Versioning.Mvc" Version="10.2.1" />
     <PackageVersion Include="Asp.Versioning.Mvc.ApiExplorer" Version="10.2.1" />
     <PackageVersion Include="Asp.Versioning.OpenApi" Version="10.2.3" />
+  </ItemGroup>
+
+  <!-- OpenIddict is the OAuth2/OIDC protocol stack (decision 10). Do NOT reference the
+       'OpenIddict' metapackage: its net10.0 group drags in the OAuth *client* stack
+       (Client, Client.WebIntegration, Client.SystemIntegration, Client.SystemNetHttp,
+       Validation.SystemNetHttp), none of which this service has any use for. -->
+  <ItemGroup Label="Identity">
+    <PackageVersion Include="OpenIddict.EntityFrameworkCore" Version="7.6.1" />
+    <PackageVersion Include="OpenIddict.Server.AspNetCore" Version="7.6.1" />
+    <PackageVersion Include="OpenIddict.Validation.AspNetCore" Version="7.6.1" />
+    <PackageVersion Include="OpenIddict.Validation.ServerIntegration" Version="7.6.1" />
     <PackageVersion Include="FluentValidation" Version="12.1.1" />
     <PackageVersion Include="FluentValidation.DependencyInjectionExtensions" Version="12.1.1" />
   </ItemGroup>
@@ -27,16 +38,32 @@
     <PackageVersion Include="EFCore.NamingConventions" Version="10.0.1" />
   </ItemGroup>
 
+  <ItemGroup Label="Caching">
+    <PackageVersion Include="StackExchange.Redis" Version="3.1.31" />
+  </ItemGroup>
+
+  <ItemGroup Label="Resilience">
+    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="10.9.0" />
+  </ItemGroup>
+
   <ItemGroup Label="Observability">
     <PackageVersion Include="Serilog.AspNetCore" Version="10.0.0" />
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.18.0" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.18.0" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.18.0" />
     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.18.0" />
     <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.11" />
   </ItemGroup>
 
   <ItemGroup Label="Extensions">
     <PackageVersion Include="Microsoft.Extensions.Options.DataAnnotations" Version="10.0.11" />
+    <!-- The logging ABSTRACTION is allowed in the inner rings; the architecture guard bans Serilog,
+         which is the implementation. An application service that cannot say what went wrong is
+         worse coupled than one that depends on ILogger<T>. -->
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <!-- BackgroundService / IHostedService / AddHostedService. EF Core does NOT bring this
+         transitively, so a hosted service in Infrastructure fails with CS0234 without it. -->
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.11" />
   </ItemGroup>
 
   <ItemGroup Label="Testing">
@@ -47,7 +74,9 @@
     <PackageVersion Include="Shouldly" Version="4.3.0" />
     <PackageVersion Include="NetArchTest.Rules" Version="1.3.2" />
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.11" />
+    <PackageVersion Include="Npgsql" Version="10.0.3" />
     <PackageVersion Include="Testcontainers.PostgreSql" Version="4.14.0" />
+    <PackageVersion Include="Testcontainers.Redis" Version="4.14.0" />
   </ItemGroup>
 
 </Project>

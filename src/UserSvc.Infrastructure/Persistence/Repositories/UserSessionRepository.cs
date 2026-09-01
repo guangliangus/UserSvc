@@ -9,13 +9,6 @@ public sealed class UserSessionRepository(UserSvcDbContext db) : IUserSessionRep
     public Task<UserSession?> FindBySessionIdAsync(string sessionId, CancellationToken cancellationToken) =>
         db.UserSessions.FirstOrDefaultAsync(s => s.SessionId == sessionId, cancellationToken);
 
-    public Task<UserSession?> FindActiveByRefreshHashAsync(
-        string refreshTokenHash,
-        CancellationToken cancellationToken) =>
-        db.UserSessions.FirstOrDefaultAsync(
-            s => s.CurrentRefreshTokenHash == refreshTokenHash && s.Status == SessionStatuses.Active,
-            cancellationToken);
-
     public async Task<IReadOnlyList<UserSession>> ListActiveByUserAsync(
         int userId,
         CancellationToken cancellationToken) =>

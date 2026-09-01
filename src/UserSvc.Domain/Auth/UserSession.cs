@@ -4,14 +4,20 @@ using UserSvc.Domain.Auth.Events;
 namespace UserSvc.Domain.Auth;
 
 /// <summary>
-/// One sign-in on one device: the session and its refresh-token family chain, which share a
-/// lifetime.
+/// One sign-in on one device: the session identity (<see cref="SessionId"/>, the <c>sid</c> claim),
+/// the device metadata, the last-seen timestamp and revocation.
 /// <para>
-/// This is one of the three <b>deliberately rich</b> concepts (decision 04). The test is not
-/// "is this feature important" but "is a broken invariant here a security incident" — rotation
-/// happens once, a replay means a leak, and a revoked session never comes back. Those rules in
-/// the application layer would mean every caller has to remember to check; here, breaking them
-/// means the code does not compile.
+/// It is <b>narrower than it used to be</b> (decision 10). Refresh-token rotation and replay
+/// detection now belong to OpenIddict, which owns the token rows and enforces single-use
+/// rotation in the protocol layer where the raw token actually lives. Keeping a second, hand-rolled
+/// rotation here would have meant two sources of truth for the same security promise, and the one
+/// that silently drifted would have been ours.
+/// </para>
+/// <para>
+/// What is left is still <b>deliberately rich</b> (decision 04): a revoked session must never come
+/// back, and the reason of the <i>first</i> revocation is the one that gets audited. Those are
+/// invariants whose violation is a security incident, so they are enforced here rather than
+/// remembered by every caller.
 /// </para>
 /// </summary>
 public sealed class UserSession : Entity
@@ -23,6 +29,13 @@ public sealed class UserSession : Entity
     public string SessionId { get; private set; } = string.Empty;
 
     public int UserId { get; private set; }
+
+    /// <summary>
+    /// The OpenIddict authorization id every token issued for this session hangs off. Signing the
+    /// device out revokes the session row <b>and</b> this whole token chain; without the id stored
+    /// here, a sign-out would kill the session but leave a usable refresh token behind.
+    /// </summary>
+    public string AuthorizationId { get; private set; } = string.Empty;
 
     /// <summary>
     /// The client-reported <c>X-Device-ID</c>. <b>Not trustworthy</b> — used only for display and
@@ -40,12 +53,8 @@ public sealed class UserSession : Entity
     public string Status { get; private set; } = SessionStatuses.Active;
     public string RevokedBy { get; private set; } = string.Empty;
 
-    /// <summary>SHA-256 of the currently valid refresh token. Presenting anything else is a replay.</summary>
-    public string CurrentRefreshTokenHash { get; private set; } = string.Empty;
-
     public DateTimeOffset CreatedAt { get; private set; }
     public DateTimeOffset LastSeenAt { get; private set; }
-    public DateTimeOffset RefreshExpiresAt { get; private set; }
     public DateTimeOffset? RevokedAt { get; private set; }
 
     /// <summary>For EF.</summary>
@@ -59,24 +68,28 @@ public sealed class UserSession : Entity
         string sessionId,
         int userId,
         DeviceDescriptor device,
-        string refreshTokenHash,
-        DateTimeOffset now,
-        TimeSpan refreshLifetime)
+        string authorizationId,
+        DateTimeOffset now)
     {
         if (string.IsNullOrWhiteSpace(sessionId))
         {
             throw new DomainRuleException("SESSION_ID_REQUIRED", "Session id must be supplied by the server.");
         }
 
-        if (string.IsNullOrWhiteSpace(refreshTokenHash))
+        // Not cosmetic: a session with no authorization id cannot have its token chain revoked, so
+        // signing the device out would leave a working refresh token behind (decision 10).
+        if (string.IsNullOrWhiteSpace(authorizationId))
         {
-            throw new DomainRuleException("REFRESH_HASH_REQUIRED", "Refresh token hash is required.");
+            throw new DomainRuleException(
+                "AUTHORIZATION_ID_REQUIRED",
+                "The OpenIddict authorization id is required so the token chain can be revoked.");
         }
 
         return new UserSession
         {
             SessionId = sessionId,
             UserId = userId,
+            AuthorizationId = authorizationId,
             DeviceId = device.DeviceId,
             DeviceName = device.DeviceName,
             Platform = device.Platform,
@@ -84,47 +97,23 @@ public sealed class UserSession : Entity
             IpAddress = device.IpAddress,
             UserAgent = device.UserAgent,
             Status = SessionStatuses.Active,
-            CurrentRefreshTokenHash = refreshTokenHash,
             CreatedAt = now,
             LastSeenAt = now,
-            RefreshExpiresAt = now.Add(refreshLifetime),
         };
     }
 
     /// <summary>
-    /// Trade a refresh token for a new one. This method is the reason the aggregate exists: three
-    /// of its four outcomes are refusals, and <see cref="RefreshOutcome.Replayed"/> takes the whole
-    /// chain down with it.
+    /// Record that the device is still around. Called on token refresh only — writing on every
+    /// request is write amplification for a column nobody reads that precisely.
     /// </summary>
-    public RefreshOutcome PresentRefreshToken(
-        string presentedHash,
-        string newHash,
-        DateTimeOffset now,
-        TimeSpan refreshLifetime)
+    public void Touch(DateTimeOffset now)
     {
         if (!IsActive)
         {
-            return RefreshOutcome.Revoked;
+            return;
         }
 
-        // Replay detection runs before the expiry check: a leaked old token means the chain is
-        // already compromised, whether or not that token has expired.
-        if (!FixedTimeEquals(presentedHash, CurrentRefreshTokenHash))
-        {
-            Raise(new RefreshTokenReplayDetected(SessionId, UserId, DeviceId, now));
-            RevokeInternal(RevocationReasons.TokenReplay, now);
-            return RefreshOutcome.Replayed;
-        }
-
-        if (now >= RefreshExpiresAt)
-        {
-            return RefreshOutcome.Expired;
-        }
-
-        CurrentRefreshTokenHash = newHash;
-        RefreshExpiresAt = now.Add(refreshLifetime);
-        LastSeenAt = now;   // Updated on refresh only; writing on every request is write amplification.
-        return RefreshOutcome.Rotated;
+        LastSeenAt = now;
     }
 
     /// <summary>Revoke the session. Revoking an already-revoked session is a no-op, not an error.</summary>
@@ -135,33 +124,22 @@ public sealed class UserSession : Entity
             return;
         }
 
-        RevokeInternal(reason, now);
-    }
-
-    private void RevokeInternal(string reason, DateTimeOffset now)
-    {
         Status = SessionStatuses.Revoked;
         RevokedBy = reason;
         RevokedAt = now;
-        CurrentRefreshTokenHash = string.Empty;
         Raise(new SessionRevoked(SessionId, UserId, reason, now));
     }
 
-    /// <summary>Fixed-time comparison, so timing cannot be used to recover a hash prefix.</summary>
-    private static bool FixedTimeEquals(string a, string b)
+    /// <summary>
+    /// A redeemed refresh token was presented again. <b>OpenIddict decides this, not the aggregate</b>
+    /// (decision 10) — it is the only party that sees the raw token and the token row's status — but
+    /// the alert is still a domain fact, and raising it here is what puts it in the outbox in the
+    /// same transaction as the revocation (decision 16).
+    /// </summary>
+    public void RevokeAsReplayed(DateTimeOffset now)
     {
-        if (a.Length != b.Length)
-        {
-            return false;
-        }
-
-        var diff = 0;
-        for (var i = 0; i < a.Length; i++)
-        {
-            diff |= a[i] ^ b[i];
-        }
-
-        return diff == 0;
+        Raise(new RefreshTokenReplayDetected(SessionId, UserId, DeviceId, now));
+        Revoke(RevocationReasons.TokenReplay, now);
     }
 }
 

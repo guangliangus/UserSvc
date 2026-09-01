@@ -31,5 +31,12 @@ public sealed class UserSvcDbContext(DbContextOptions<UserSvcDbContext> options)
         // difference on every run (decision 14).
         modelBuilder.UseSerialColumns();
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(UserSvcDbContext).Assembly);
+
+        // Decision 10: OpenIddict shares this context, so its four tables share our transaction and
+        // our outbox interceptor. GUID keys, not the default string ones (37 bytes per foreign key)
+        // and not int - OpenIddict writes two token rows per token request, so a 4-byte sequence
+        // runs out long before the business does.
+        modelBuilder.UseOpenIddict<Guid>();
+        modelBuilder.ApplyOpenIddictConventions();
     }
 }

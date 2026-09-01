@@ -7,8 +7,6 @@ public interface IUserSessionRepository
 {
     Task<UserSession?> FindBySessionIdAsync(string sessionId, CancellationToken cancellationToken);
 
-    Task<UserSession?> FindActiveByRefreshHashAsync(string refreshTokenHash, CancellationToken cancellationToken);
-
     Task<IReadOnlyList<UserSession>> ListActiveByUserAsync(int userId, CancellationToken cancellationToken);
 
     void Add(UserSession session);

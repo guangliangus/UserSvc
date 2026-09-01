@@ -1,26 +1,47 @@
-using System.Diagnostics;
-using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using UserSvc.Application.Errors;
 using UserSvc.Application.Ports.Platform;
-using UserSvc.Domain.Abstractions;
-using UserSvc.Infrastructure.Persistence.Outbox;
 
 namespace UserSvc.Infrastructure.Persistence;
 
 /// <summary>
-/// The transaction boundary. <b>The point of interest is the first line of
-/// <see cref="SaveChangesAsync"/></b>: domain events become outbox rows inside the same
-/// SaveChanges, so the business row and the event row either both exist or neither does
-/// (decision 16).
+/// The transaction boundary, plus the one place EF's write failures are translated into the
+/// application's error vocabulary.
+/// <para>
+/// Domain events are drained into the outbox by
+/// <see cref="DomainEventOutboxInterceptor"/> rather than here, so that saves issued by libraries
+/// sharing this context are covered too.
+/// </para>
 /// </summary>
 public sealed class UnitOfWork(UserSvcDbContext db) : IUnitOfWork
 {
-    private static readonly JsonSerializerOptions PayloadOptions = new(JsonSerializerDefaults.Web);
+    /// <summary>PostgreSQL unique_violation.</summary>
+    private const string UniqueViolation = "23505";
 
     public async Task<int> SaveChangesAsync(CancellationToken cancellationToken)
     {
-        DrainDomainEventsIntoOutbox();
-        return await db.SaveChangesAsync(cancellationToken);
+        try
+        {
+            return await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateConcurrencyException ex)
+        {
+            // xmin said another writer got there first. The caller must re-read and retry, which
+            // is what 409 tells them - without this the promise made by UseXminConcurrencyToken
+            // would surface as an opaque 500.
+            throw new ConflictException(
+                ErrorCodes.ConcurrencyConflict,
+                "The record was modified by someone else. Re-read it and try again.",
+                ex);
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: UniqueViolation } pg)
+        {
+            throw new ConflictException(
+                ErrorCodes.Conflict,
+                $"The value violates the uniqueness constraint '{pg.ConstraintName}'.",
+                ex);
+        }
     }
 
     public async Task ExecuteInTransactionAsync(
@@ -36,48 +57,5 @@ public sealed class UnitOfWork(UserSvcDbContext db) : IUnitOfWork
             await action(ct);
             await transaction.CommitAsync(ct);
         }, cancellationToken);
-    }
-
-    private void DrainDomainEventsIntoOutbox()
-    {
-        var entities = db.ChangeTracker
-            .Entries<Entity>()
-            .Where(e => e.Entity.DomainEvents.Count > 0)
-            .Select(e => e.Entity)
-            .ToList();
-
-        if (entities.Count == 0)
-        {
-            return;
-        }
-
-        var traceParent = Activity.Current?.Id ?? string.Empty;
-
-        foreach (var entity in entities)
-        {
-            foreach (var domainEvent in entity.DomainEvents)
-            {
-                db.OutboxMessages.Add(new OutboxMessage
-                {
-                    MessageId = Guid.CreateVersion7().ToString("n"),
-                    EventName = ResolveEventName(domainEvent),
-                    Payload = JsonSerializer.Serialize(domainEvent, domainEvent.GetType(), PayloadOptions),
-                    TraceParent = traceParent,
-                    OccurredAt = domainEvent.OccurredAt,
-                });
-            }
-
-            entity.ClearDomainEvents();
-        }
-    }
-
-    private static string ResolveEventName(IDomainEvent domainEvent)
-    {
-        var type = domainEvent.GetType();
-        var attribute = (EventNameAttribute?)Attribute.GetCustomAttribute(type, typeof(EventNameAttribute));
-
-        return attribute?.Name
-               ?? throw new InvalidOperationException(
-                   $"{type.Name} must carry [EventName] — the wire name is a contract and cannot be derived from the class name.");
     }
 }

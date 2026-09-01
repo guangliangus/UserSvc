@@ -23,9 +23,8 @@ public sealed class UserSessionConfiguration : IEntityTypeConfiguration<UserSess
             .IsUnique()
             .HasFilter($"status = '{SessionStatuses.Active}'");
 
-        // Refresh looks a session up by its current hash. Indexing active rows only keeps
-        // revoked rows out of the index.
-        builder.HasIndex(x => x.CurrentRefreshTokenHash)
-            .HasFilter($"status = '{SessionStatuses.Active}'");
+        // Deliberately NOT indexed: authorization_id. The traffic runs the other way - a session is
+        // found by its sid and hands its authorization id to OpenIddict - so an index on it would
+        // be write cost on every sign-in for a lookup no code performs.
     }
 }

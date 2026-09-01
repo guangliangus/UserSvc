@@ -29,4 +29,5 @@ public static class ErrorCodes
     public const string InvalidToken = "INVALID_TOKEN";
     public const string ExpiredToken = "EXPIRED_TOKEN";
     public const string RefreshTokenReplayed = "REFRESH_TOKEN_REPLAYED";
+    public const string SessionRevoked = "SESSION_REVOKED";
 }

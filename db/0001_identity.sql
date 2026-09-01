@@ -13,7 +13,7 @@ CREATE SCHEMA IF NOT EXISTS identity;
 -- ----------------------------------------------------------------- users
 CREATE TABLE IF NOT EXISTS identity.users
 (
-    id                     SERIAL PRIMARY KEY,
+    id                     SERIAL NOT NULL,
     status                 TEXT        NOT NULL DEFAULT 'PENDING',
     first_name             TEXT        NOT NULL DEFAULT '',
     last_name              TEXT        NOT NULL DEFAULT '',
@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS identity.users
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by             TEXT        NOT NULL DEFAULT '',
-    updated_by             TEXT        NOT NULL DEFAULT ''
+    updated_by             TEXT        NOT NULL DEFAULT '',
+    CONSTRAINT pk_users PRIMARY KEY (id)
 );
 
 COMMENT ON COLUMN identity.users.status IS 'PENDING | ACTIVE | DISABLED | DELETED';
@@ -42,7 +43,7 @@ CREATE INDEX IF NOT EXISTS ix_users_birth_date_hash ON identity.users (birth_dat
 -- ------------------------------------------------------- user_identities
 CREATE TABLE IF NOT EXISTS identity.user_identities
 (
-    id                     SERIAL PRIMARY KEY,
+    id                     SERIAL NOT NULL,
     user_id                INTEGER     NOT NULL REFERENCES identity.users (id),
     identity_type          TEXT        NOT NULL,
     identifier_hash        TEXT        NOT NULL,
@@ -52,7 +53,8 @@ CREATE TABLE IF NOT EXISTS identity.user_identities
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by             TEXT        NOT NULL DEFAULT '',
-    updated_by             TEXT        NOT NULL DEFAULT ''
+    updated_by             TEXT        NOT NULL DEFAULT '',
+    CONSTRAINT pk_user_identities PRIMARY KEY (id)
 );
 
 COMMENT ON COLUMN identity.user_identities.identity_type IS
@@ -68,7 +70,7 @@ CREATE INDEX IF NOT EXISTS ix_user_identities_user_id
 -- --------------------------------------------------------- user_sessions
 CREATE TABLE IF NOT EXISTS identity.user_sessions
 (
-    id                         SERIAL PRIMARY KEY,
+    id                         SERIAL NOT NULL,
     session_id                 TEXT        NOT NULL,
     user_id                    INTEGER     NOT NULL,
     device_id                  TEXT        NOT NULL,
@@ -83,7 +85,8 @@ CREATE TABLE IF NOT EXISTS identity.user_sessions
     created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     refresh_expires_at         TIMESTAMPTZ NOT NULL,
-    revoked_at                 TIMESTAMPTZ
+    revoked_at                 TIMESTAMPTZ,
+    CONSTRAINT pk_user_sessions PRIMARY KEY (id)
 );
 
 COMMENT ON TABLE  identity.user_sessions IS 'One sign-in on one device = one row = one refresh token family chain';
@@ -110,7 +113,7 @@ CREATE INDEX IF NOT EXISTS ix_user_sessions_current_refresh_token_hash
 -- one atomic point in the whole chain.
 CREATE TABLE IF NOT EXISTS identity.outbox_messages
 (
-    id            SERIAL PRIMARY KEY,
+    id            SERIAL NOT NULL,
     message_id    TEXT        NOT NULL,
     event_name    TEXT        NOT NULL,
     payload       TEXT        NOT NULL,
@@ -118,7 +121,8 @@ CREATE TABLE IF NOT EXISTS identity.outbox_messages
     occurred_at   TIMESTAMPTZ NOT NULL,
     dispatched_at TIMESTAMPTZ,
     attempts      INTEGER     NOT NULL DEFAULT 0,
-    last_error    TEXT        NOT NULL DEFAULT ''
+    last_error    TEXT        NOT NULL DEFAULT '',
+    CONSTRAINT pk_outbox_messages PRIMARY KEY (id)
 );
 
 COMMENT ON COLUMN identity.outbox_messages.event_name IS 'Published contract name, for example user.session-revoked.v1';

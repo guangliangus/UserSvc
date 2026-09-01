@@ -20,7 +20,8 @@ public sealed class HttpContextCurrentUser(IHttpContextAccessor accessor) : ICur
         }
     }
 
-    public string? SessionId => accessor.HttpContext?.User.FindFirstValue("sid");
+    public string? SessionId =>
+        accessor.HttpContext?.User.FindFirstValue(AuthenticationSchemes.SessionIdClaimType);
 
     public int RequireUserId() =>
         UserId ?? throw new UnauthorizedException(ErrorCodes.Unauthorized, "Authentication is required.");

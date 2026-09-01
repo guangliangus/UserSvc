@@ -12,39 +12,70 @@
 src/
   UserSvc.Domain/          实体与领域规则；不引用任何东西
     Users/                   User, UserIdentity —— 平面
-    Auth/                    UserSession —— 充血（轮换 / 重放检测 / 撤销）
-  UserSvc.Application/     用例、DTO、校验器、端口；只引用 Domain
+    Auth/                    UserSession —— 充血（会话身份 / 设备 / 撤销）+ 领域事件
+  UserSvc.Application/     用例、契约、校验器、端口；只引用 Domain
     Ports/                   按子域分：Users / Auth / External / Platform
     Features/                垂直切片：Profile / Sessions
     Security/                IdentifierProtector —— 纯计算，刻意不是端口
-    Errors/                  错误码与异常层级（携带 HTTP 状态）
-  UserSvc.Infrastructure/  EF DbContext、仓储、占位适配器、DI
-  UserSvc.Api/             宿主：Controllers、ProblemDetails、三探针
+    Errors/                  错误码与异常层级（携带 HTTP 状态与 inner exception）
+  UserSvc.Infrastructure/  适配器；引用 Application 并实现它的端口
+    Persistence/             EF DbContext、仓储、outbox 拦截器、OpenIddict 模型约定
+    Auth/                    OpenIddict 令牌链撤销、过期清理
+    Platform/                Redis 撤销集、系统时钟
+    External/                通知服务 HTTP 客户端（弹性管道）
+  UserSvc.Api/             宿主
+    Auth/                    OpenIddict 注册、重放事件处理器、撤销中间件、开发期认证
+    Controllers/             Profile / Sessions / Token
+    Errors/                  ProblemDetails 映射
 tests/
-  UserSvc.ArchitectureTests/  ★ 依赖方向与分层约定的机器强制
+  UserSvc.ArchitectureTests/  ★ 依赖方向、分层约定、源码语言的机器强制
   UserSvc.UnitTests/          聚合与 AppService，端口全 mock
-db/                        手动执行的幂等 DDL
+  UserSvc.IntegrationTests/   Testcontainers：真 Postgres + 真 Redis + 真代码路径
+db/                        手动执行的幂等 DDL（0001 identity / 0002 openiddict）
 ```
 
 ## 跑起来
 
-```bash
-# 1. 数据库
-docker run -d --name usersvc-pg -p 5432:5432 \
-  -e POSTGRES_DB=usersvc -e POSTGRES_USER=usersvc -e POSTGRES_PASSWORD=usersvc postgres:16
-psql "postgresql://usersvc:usersvc@localhost:5432/usersvc" -f db/0001_identity.sql
+依赖 PostgreSQL 和 Redis。**本机 5432 / 6379 通常已被其他容器占用**，所以下面直接用现有的那套
+（库 `lion_user`，本服务只占 `identity` 和 `openiddict` 两个 schema，与 `uam` 互不干扰）：
 
-# 2. 服务
+```bash
+# 1. DDL 手动先行（幂等，可反复执行）
+export PGPASSWORD=123456
+psql -h localhost -p 5432 -U dev -d lion_user -f db/0001_identity.sql
+psql -h localhost -p 5432 -U dev -d lion_user -f db/0002_openiddict.sql
+
+# 2. 起服务
 dotnet run --project src/UserSvc.Api        # http://localhost:5080
 ```
 
-API 文档在 <http://localhost:5080/scalar/v1>（仅 Development）。
+连接串在 `appsettings.Development.json`。**`appsettings.json` 里刻意没有 `Redis:Configuration`
+和 `Notification:BaseAddress`**——它们是 `[Required]` 且启动时校验，缺失会拒绝启动，而一个
+`localhost` 默认值会让生产静默连错机器。
 
-开发期认证是占位实现，用两个头伪造身份：
+API 文档：<http://localhost:5080/scalar/v1>　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>
+
+### 拿一个令牌
 
 ```bash
-curl http://localhost:5080/api/v1/user/profile \
-  -H 'X-Dev-User-Id: 1' -H 'X-Dev-Session-Id: sid-1'
+# 设备登录（自定义 grant）
+curl -s -X POST http://localhost:5080/connect/token \
+  -d 'grant_type=urn:usersvc:params:oauth:grant-type:device' \
+  -d 'client_id=usersvc-app' \
+  -d 'user_id=1' -d 'device_id=dev-A' -d 'device_name=iPhone 15 Pro' -d 'platform=IOS'
+
+# 带上 access token
+curl -s http://localhost:5080/api/v1/user/profile -H "Authorization: Bearer $AT"
+
+# 列出登录设备 / 踢掉一台
+curl -s http://localhost:5080/api/v1/user/sessions -H "Authorization: Bearer $AT"
+curl -s -X DELETE http://localhost:5080/api/v1/user/sessions/$SID -H "Authorization: Bearer $AT"
+```
+
+开发期也可以绕过 OAuth，用两个头伪造身份（仅 Development）：
+
+```bash
+curl http://localhost:5080/api/v1/user/profile -H 'X-Dev-User-Id: 1' -H 'X-Dev-Session-Id: sid-1'
 ```
 
 ## 验证
@@ -56,24 +87,25 @@ dotnet test  UserSvc.slnx      # 单元 + 架构守卫
 
 ## 当前进度
 
-阶段 0 已完成：骨架、CI 门禁、架构守卫测试，外加一条打通的垂直切片（档案 + 设备会话）。
-
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | 骨架 + CI 门禁 + 架构守卫 | ✅ |
 | 1 | 用户档案 | 🟡 读写已通，缺注册与头像 |
 | 2 | 验证码（Redis 限流、调通知服务） | ⬜ |
-| 3 | 认证核心（OpenIddict、设备会话、令牌轮换） | ⬜ |
+| 3 | 认证核心（OpenIddict、设备会话、令牌轮换） | ✅ |
 | 4 | 第三方身份（微信 / Firebase / LINE / Passkey） | ⬜ |
 | 5 | 后台账号 + RBAC + 租户 | ⬜ |
 
+阶段 3 已端到端验证：设备登录 → 刷新轮换 → **重放已赎回的 token 触发整链撤销**，会话行标记
+`TOKEN_REPLAY`、两条 outbox 行在同一事务落表、Redis 撤销集写入、被撤销会话的 access token
+在下一个请求上立即 401 `SESSION_REVOKED`。
+
 ## 还没接的东西
 
-按蓝图应有、当前是占位或缺失的：
-
-- **认证**：OpenIddict 签发 + JwtBearer 验签（现在是 `X-Dev-*` 头，仅开发）
-- **撤销集**：Redis 适配器（现在是内存实现，非开发环境拒绝启动）
-- **通知服务**：HTTP 客户端（现在抛 502）
-- **Outbox 投递器**：事件已原子落表，还没有后台推送到 RabbitMQ
-- **集成测试**：Testcontainers（包已在清单里，工程未建）
-- **授权快照 / 网关注入**：待确定网关选型
+- **验证码 / 注册 / 头像**：阶段 1 的剩余部分与阶段 2
+- **授权快照与网关注入**：RBAC 表尚不存在，网关产品未定——现在建等于建了要重写
+- **Outbox 投递器**：事件已原子落表，但没有消费者也没有 broker（Go 服务不用 RabbitMQ）。
+  等真正的集成机制定下来再加，业务代码不受影响
+- **通知服务的服务间认证**：不确定对方是否要令牌。DI 里 `IHttpClientBuilder` 特意留在局部变量，
+  一个 `DelegatingHandler` 就能挂上去
+- **`SendDirectPath` 是猜的**：拿不到通知服务的 OpenAPI 文档

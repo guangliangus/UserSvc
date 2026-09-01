@@ -1,6 +1,6 @@
+using System.Diagnostics;
 using Asp.Versioning;
 using FluentValidation;
-using Microsoft.AspNetCore.Authentication;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Scalar.AspNetCore;
@@ -9,6 +9,7 @@ using UserSvc.Api.Auth;
 using UserSvc.Api.Errors;
 using UserSvc.Api.Filters;
 using UserSvc.Api.Health;
+using UserSvc.Application.Errors;
 using UserSvc.Application.Features.Profile;
 using UserSvc.Application.Features.Sessions;
 using UserSvc.Application.Ports.Platform;
@@ -28,6 +29,7 @@ builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService("user-svc"))
     .WithTracing(tracing => tracing
         .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
         .AddOtlpExporter());
 
 // ---------------------------------------------------------------- Configuration
@@ -44,7 +46,7 @@ builder.Services.AddOptions<AuthSessionOptions>()
     .ValidateOnStart();
 
 // ---------------------------------------------------------------- Infrastructure (ports -> adapters)
-builder.Services.AddUserSvcInfrastructure(builder.Configuration, builder.Environment.IsDevelopment());
+builder.Services.AddUserSvcInfrastructure(builder.Configuration);
 
 // ---------------------------------------------------------------- Application
 // Decision 05: no MediatR. App services are registered directly and injected into controllers.
@@ -56,22 +58,11 @@ builder.Services.AddValidatorsFromAssemblyContaining<UpdateProfileRequestValidat
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<ICurrentUser, HttpContextCurrentUser>();
 
-// ---------------------------------------------------------------- Authentication
-if (builder.Environment.IsDevelopment())
-{
-    // Placeholder, Development only. Production swaps in OpenIddict issuance plus JwtBearer
-    // validation (decision 10).
-    builder.Services
-        .AddAuthentication(DevAuthenticationHandler.SchemeName)
-        .AddScheme<AuthenticationSchemeOptions, DevAuthenticationHandler>(
-            DevAuthenticationHandler.SchemeName, _ => { });
-}
-else
-{
-    throw new InvalidOperationException(
-        "No production authentication scheme is wired yet. Add the OpenIddict/JwtBearer adapter " +
-        "before running outside Development — failing to start beats silently accepting anyone.");
-}
+// ---------------------------------------------------------------- Authentication (decision 10)
+// OpenIddict issues the tokens and validates them in the same process. Under Development a policy
+// scheme still falls back to DevAuthenticationHandler when no Authorization header is present, so
+// the existing curl and integration-test workflow keeps working.
+builder.Services.AddUserSvcAuthentication(builder.Configuration, builder.Environment.IsDevelopment());
 
 builder.Services.AddAuthorization();
 
@@ -96,19 +87,48 @@ builder.Services
     .AddOpenApi();
 
 // Decision 09: RFC 9457 is the only error contract. There is no envelope.
-builder.Services.AddProblemDetails();
+// AppExceptionHandler fills errorCode and traceId for thrown errors; this callback covers the
+// responses it never sees - the ones a middleware produces by setting a status code and returning,
+// such as an authentication challenge - so every error body carries the same two members.
+builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
+{
+    context.ProblemDetails.Extensions.TryAdd("errorCode", ErrorCodeFor(context.HttpContext.Response.StatusCode));
+    context.ProblemDetails.Extensions.TryAdd(
+        "traceId",
+        Activity.Current?.TraceId.ToString() ?? context.HttpContext.TraceIdentifier);
+    context.ProblemDetails.Instance ??= context.HttpContext.Request.Path;
+});
 builder.Services.AddExceptionHandler<AppExceptionHandler>();
 
 // ---------------------------------------------------------------- Three probes, three meanings
 builder.Services.AddHealthChecks()
-    .AddCheck<DatabaseHealthCheck>("postgres", tags: ["ready"]);
+    .AddCheck<DatabaseHealthCheck>("postgres", tags: ["ready"])
+    .AddCheck<RedisHealthCheck>("redis", tags: ["ready"]);
 
 var app = builder.Build();
 
-app.UseExceptionHandler();
+// Outermost on purpose, ahead of the exception handler. Registered after it, this middleware sees
+// the exception still in flight and records the request as a 500 - so a plain validation failure,
+// which the handler is about to turn into a 400, lands in the request log as a server error. Every
+// SLO dashboard built on that log would then read our own 4xx as our own outage (decision 20).
+// Out here it observes the status the client actually received. The exception itself is not lost:
+// AppExceptionHandler logs it, at a level chosen from the mapped status.
 app.UseSerilogRequestLogging();
 
+app.UseExceptionHandler();
+
+// An authentication challenge never reaches AppExceptionHandler - the auth handler just sets 401
+// and returns, leaving an empty body with no content type. Without this, "every failure is
+// ProblemDetails" is false for exactly the two statuses clients hit most often, 401 and 403.
+// With AddProblemDetails registered, this middleware fills any empty error response with one.
+app.UseStatusCodePages();
+
 app.UseAuthentication();
+
+// Between authentication and authorization: there is no sid before the first, and a revoked
+// session must not reach a policy that might approve it.
+app.UseMiddleware<RevokedSessionMiddleware>();
+
 app.UseAuthorization();
 
 app.MapControllers();
@@ -126,6 +146,16 @@ if (app.Environment.IsDevelopment())
 }
 
 await app.RunAsync();
+
+static string ErrorCodeFor(int statusCode) => statusCode switch
+{
+    StatusCodes.Status401Unauthorized => ErrorCodes.Unauthorized,
+    StatusCodes.Status403Forbidden => ErrorCodes.Forbidden,
+    StatusCodes.Status404NotFound => ErrorCodes.NotFound,
+    StatusCodes.Status429TooManyRequests => ErrorCodes.RateLimitExceeded,
+    >= 500 => ErrorCodes.InternalError,
+    _ => ErrorCodes.BadRequest,
+};
 
 /// <summary>WebApplicationFactory in the integration tests needs a visible entry point type.</summary>
 public partial class Program;
