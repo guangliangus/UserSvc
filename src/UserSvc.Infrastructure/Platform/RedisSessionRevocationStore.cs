@@ -66,15 +66,7 @@ public sealed class RedisSessionRevocationStore(
                 when: When.Always,
                 flags: CommandFlags.None);
         }
-        catch (RedisException ex)
-        {
-            throw RevocationNotRecorded(ex);
-        }
-        catch (RedisTimeoutException ex)
-        {
-            throw RevocationNotRecorded(ex);
-        }
-        catch (RedisCommandException ex)
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             throw RevocationNotRecorded(ex);
         }
@@ -88,15 +80,11 @@ public sealed class RedisSessionRevocationStore(
         {
             return await connection.GetDatabase().KeyExistsAsync(KeyFor(sessionId), CommandFlags.None);
         }
-        catch (RedisException ex)
-        {
-            return FailOpen(sessionId, ex);
-        }
-        catch (RedisTimeoutException ex)
-        {
-            return FailOpen(sessionId, ex);
-        }
-        catch (RedisCommandException ex)
+        // The FOURTH shape matters most here, of all eight adapters. This read runs on every
+        // authenticated request, so an unclassified store failure is not a degraded session check -
+        // it is an unhandled exception on the whole authenticated surface, which is the opposite of
+        // the fail-open contract this method documents. RedisFailure owns the classification.
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             return FailOpen(sessionId, ex);
         }

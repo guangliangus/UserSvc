@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using StackExchange.Redis;
+using UserSvc.Infrastructure.Platform;
 
 namespace UserSvc.Api.Health;
 
@@ -32,15 +33,11 @@ public sealed class RedisHealthCheck(IConnectionMultiplexer connection) : IHealt
             var latency = await connection.GetDatabase().PingAsync();
             return HealthCheckResult.Healthy($"Redis responded in {latency.TotalMilliseconds:F0} ms.");
         }
-        catch (RedisException ex)
-        {
-            return HealthCheckResult.Unhealthy("Redis connectivity check failed.", ex);
-        }
-        catch (RedisTimeoutException ex)
-        {
-            return HealthCheckResult.Unhealthy("Redis connectivity check failed.", ex);
-        }
-        catch (RedisCommandException ex)
+        // Readiness reports unhealthy; what COUNTS as a Redis failure is RedisFailure's to say, for
+        // all eight adapters. An unclassified shape here would leave the probe throwing instead of
+        // answering, and a readiness endpoint that throws is indistinguishable from one that is
+        // simply down - which is the one thing a probe exists to tell apart.
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             return HealthCheckResult.Unhealthy("Redis connectivity check failed.", ex);
         }

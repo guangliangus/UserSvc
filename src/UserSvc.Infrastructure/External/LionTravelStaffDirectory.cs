@@ -633,7 +633,7 @@ public sealed class LionTravelAccessTokenCache(
         {
             await connection.GetDatabase().KeyDeleteAsync(Key).ConfigureAwait(false);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             logger.LogWarning(ex, "Could not drop the cached staff-directory token from Redis.");
         }
@@ -677,7 +677,7 @@ public sealed class LionTravelAccessTokenCache(
 
             return value.IsNullOrEmpty ? string.Empty : value.ToString();
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             logger.LogWarning(
                 ex, "Could not read the shared staff-directory token; falling back to a local one.");
@@ -694,19 +694,12 @@ public sealed class LionTravelAccessTokenCache(
                 .StringSetAsync(Key, token, expiry: ttl, keepTtl: false, when: When.Always, flags: CommandFlags.None)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             logger.LogWarning(ex, "Could not share the staff-directory token through Redis.");
         }
     }
 
-    /// <summary>
-    /// The StackExchange.Redis hierarchy is not what it looks like: <c>RedisTimeoutException</c>
-    /// derives from <see cref="TimeoutException"/> and <c>RedisCommandException</c> straight from
-    /// <see cref="Exception"/>, so catching <c>RedisException</c> alone misses every timeout.
-    /// </summary>
-    private static bool IsRedisFailure(Exception ex) =>
-        ex is RedisException or RedisTimeoutException or RedisCommandException;
 }
 
 /// <summary>

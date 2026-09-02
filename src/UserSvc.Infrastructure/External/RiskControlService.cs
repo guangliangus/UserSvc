@@ -277,7 +277,7 @@ public sealed class RiskControlService(
                 [TokenKey(captchaToken)],
                 [binding]).ConfigureAwait(false);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             // Fail-closed, and the only place in this class where a Redis outage refuses rather
             // than degrades. The alternative is honouring a bypass credential nothing validated.
@@ -538,7 +538,7 @@ public sealed class RiskControlService(
 
             return DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             // Warning per affected request, on purpose: the rate of these lines is what tells an
             // operator how much traffic is currently skipping the cooldown check.
@@ -576,7 +576,7 @@ public sealed class RiskControlService(
         {
             return await Database.KeyExistsAsync(PassedKey(targetHash)).ConfigureAwait(false);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             // Fail-open towards the *milder* answer: "has not passed" produces CaptchaRequired,
             // which a real user can clear, rather than a five-minute cooldown they cannot.
@@ -625,7 +625,7 @@ public sealed class RiskControlService(
                 return;
             }
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             throw TokenNotStored(ex);
         }
@@ -700,7 +700,7 @@ public sealed class RiskControlService(
         {
             await operation().ConfigureAwait(false);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             logger.LogWarning(ex, "Risk control could not {Description}; continuing without it.", description);
         }
@@ -746,14 +746,6 @@ public sealed class RiskControlService(
     private static string HashSecret(string value) =>
         Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
 
-    /// <summary>
-    /// The StackExchange.Redis hierarchy is not what it looks like: <c>RedisTimeoutException</c>
-    /// derives from <see cref="TimeoutException"/> and <c>RedisCommandException</c> derives straight
-    /// from <see cref="Exception"/>, so catching <c>RedisException</c> alone misses every timeout -
-    /// which is precisely the failure these guards exist for.
-    /// </summary>
-    private static bool IsRedisFailure(Exception exception) =>
-        exception is RedisException or RedisTimeoutException or RedisCommandException;
 
     /// <summary>
     /// Reads the script's integer reply. The conversion throws rather than returning null on an

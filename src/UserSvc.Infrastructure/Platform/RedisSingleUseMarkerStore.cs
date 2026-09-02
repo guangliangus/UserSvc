@@ -94,7 +94,7 @@ public sealed class RedisSingleUseMarkerStore(
                 when: When.NotExists,
                 flags: CommandFlags.None);
         }
-        catch (Exception ex) when (IsStoreFailure(ex, cancellationToken))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             throw CannotTell(purpose, ex);
         }
@@ -102,13 +102,6 @@ public sealed class RedisSingleUseMarkerStore(
 
     private string KeyFor(string purpose, string id) => $"{KeyPrefix}consumed:{purpose}:{id}";
 
-    private static bool IsStoreFailure(Exception exception, CancellationToken cancellationToken) =>
-        exception switch
-        {
-            RedisException or RedisTimeoutException or RedisCommandException => true,
-            OperationCanceledException => !cancellationToken.IsCancellationRequested,
-            _ => false,
-        };
 
     /// <summary>
     /// 502, not 500 and not 401: the caller did nothing wrong, and this is not evidence that their

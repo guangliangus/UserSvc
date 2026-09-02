@@ -96,7 +96,7 @@ public sealed class RedisAuthzSnapshotCache(
         {
             raw = await connection.GetDatabase().StringGetAsync(key);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             logger.LogWarning(ex, "Authorization snapshot read failed at {Key}; recomputing.", key);
             return null;
@@ -147,7 +147,7 @@ public sealed class RedisAuthzSnapshotCache(
             await database.SetAddAsync(IndexKeyFor(userId), key);
             await database.KeyExpireAsync(IndexKeyFor(userId), Ttl);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             logger.LogWarning(
                 ex, "Authorization snapshot for account {UserId} could not be cached.", userId);
@@ -180,7 +180,7 @@ public sealed class RedisAuthzSnapshotCache(
 
                 await database.KeyDeleteAsync(keys);
             }
-            catch (Exception ex) when (IsRedisFailure(ex))
+            catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
             {
                 // Not an error: the entries expire on their own within the TTL, and the token
                 // version bump that accompanies every narrowing change is the real convergence
@@ -203,12 +203,10 @@ public sealed class RedisAuthzSnapshotCache(
         {
             await connection.GetDatabase().KeyDeleteAsync(key);
         }
-        catch (Exception ex) when (IsRedisFailure(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, CancellationToken.None))
         {
             logger.LogWarning(ex, "Corrupt authorization snapshot at {Key} could not be evicted.", key);
         }
     }
 
-    private static bool IsRedisFailure(Exception ex) =>
-        ex is RedisException or RedisTimeoutException or RedisCommandException;
 }

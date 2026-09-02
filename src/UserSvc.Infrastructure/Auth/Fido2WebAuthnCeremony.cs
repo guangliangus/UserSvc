@@ -247,7 +247,7 @@ public sealed class RedisPasskeyFlowStore(
                 when: When.Always,
                 flags: CommandFlags.None);
         }
-        catch (Exception ex) when (IsRedisFault(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             throw Unavailable("store", ex);
         }
@@ -265,7 +265,7 @@ public sealed class RedisPasskeyFlowStore(
             // see the challenge. A GET followed by a DEL would leave exactly that gap.
             stored = await connection.GetDatabase().StringGetDeleteAsync(KeyFor(flowId), CommandFlags.None);
         }
-        catch (Exception ex) when (IsRedisFault(ex))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             throw Unavailable("read", ex);
         }
@@ -290,14 +290,6 @@ public sealed class RedisPasskeyFlowStore(
     }
 
     private string KeyFor(string flowId) => $"{_keyPrefix}passkey:flow:{flowId}";
-
-    /// <summary>
-    /// The StackExchange.Redis hierarchy is not what it looks like: <c>RedisTimeoutException</c>
-    /// derives from <see cref="TimeoutException"/> and <c>RedisCommandException</c> straight from
-    /// <see cref="Exception"/>, so catching <c>RedisException</c> alone misses every timeout.
-    /// </summary>
-    private static bool IsRedisFault(Exception ex) =>
-        ex is RedisException or RedisTimeoutException or RedisCommandException;
 
     private UpstreamException Unavailable(string operation, Exception cause)
     {
