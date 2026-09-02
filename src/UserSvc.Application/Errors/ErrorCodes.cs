@@ -45,6 +45,14 @@ public static class ErrorCodes
     public const string RiskControlCooldown = "RISK_CONTROL_COOLDOWN";
     public const string NotImplemented = "NOT_IMPLEMENTED";
 
+    /// <summary>
+    /// A capability whose configuration this deployment does not carry - a provider credential, a
+    /// storage connection string. Distinct from <see cref="InternalError"/> so an operator reading
+    /// the response knows to look at the secrets rather than at the code, and distinct from
+    /// <see cref="NotImplemented"/> because the code exists and is only waiting for a value.
+    /// </summary>
+    public const string NotConfigured = "NOT_CONFIGURED";
+
     // --- Back-office accounts ---
 
     /// <summary>The address is not on the corporate domain allow-list. Back-office only.</summary>
@@ -103,4 +111,47 @@ public static class ErrorCodes
     public const string RoleGrantsExceedParent = "ROLE_GRANTS_EXCEED_PARENT";
     public const string MenuNotGranted = "MENU_NOT_GRANTED";
     public const string MenuHasChildren = "MENU_HAS_CHILDREN";
+
+    // --- Passkeys / WebAuthn ---
+    public const string PasskeyFlowExpired = "PASSKEY_FLOW_EXPIRED";
+    public const string PasskeyInvalidRequest = "PASSKEY_INVALID_REQUEST";
+    public const string PasskeyVerificationFailed = "PASSKEY_VERIFICATION_FAILED";
+    public const string PasskeyCredentialNotFound = "PASSKEY_CREDENTIAL_NOT_FOUND";
+    public const string PasskeyNotFound = "PASSKEY_NOT_FOUND";
+    public const string PasskeyAlreadyRegistered = "PASSKEY_ALREADY_REGISTERED";
+
+    /// <summary>The authenticator reported a signature counter no higher than the one we stored,
+    /// which is the one thing that cannot happen to a genuine credential. Refusing here is the
+    /// security property passkeys buy over a password.</summary>
+    public const string PasskeyPossibleClone = "PASSKEY_POSSIBLE_CLONE";
+
+    /// <summary>Removing this credential would leave the account with no way to sign in.</summary>
+    public const string PasskeyLastLoginMethod = "PASSKEY_LAST_LOGIN_METHOD";
+
+    // --- Third-party identity providers ---
+    public const string WechatLoginFailed = "WECHAT_LOGIN_FAILED";
+    public const string LineLoginFailed = "LINE_LOGIN_FAILED";
+    public const string InvalidState = "INVALID_STATE";
+    public const string BindFailed = "BIND_FAILED";
+    public const string BindingTokenInvalid = "BINDING_TOKEN_INVALID";
+    public const string AccountNotActivated = "ACCOUNT_NOT_ACTIVATED";
+    public const string FirebaseProviderRequired = "FIREBASE_PROVIDER_REQUIRED";
+    public const string FirebaseProviderNotAllowed = "FIREBASE_PROVIDER_NOT_ALLOWED";
+    public const string FirebaseProviderMismatch = "FIREBASE_PROVIDER_MISMATCH";
+    public const string FirebaseIdentityAlreadyBound = "FIREBASE_IDENTITY_ALREADY_BOUND";
+    public const string FirebaseIdTokenInvalid = "FIREBASE_ID_TOKEN_INVALID";
+    public const string FirebaseIdTokenExpired = "FIREBASE_ID_TOKEN_EXPIRED";
+    public const string FirebaseProjectMismatch = "FIREBASE_PROJECT_MISMATCH";
+    public const string FirebaseConfigUnavailable = "FIREBASE_CONFIG_UNAVAILABLE";
+    public const string FirebaseUserLookupFailed = "FIREBASE_USER_LOOKUP_FAILED";
+
+    // --- Uploads ---
+    /// <summary>413, not 400: the request was well formed and simply too big.</summary>
+    public const string FileTooLarge = "FILE_TOO_LARGE";
+
+    /// <summary>415, not 400: the bytes are not a media type this endpoint accepts. Decided from
+    /// the magic bytes, never from the declared content type or the file name.</summary>
+    public const string InvalidFileType = "INVALID_FILE_TYPE";
+
+    public const string TooManyFiles = "TOO_MANY_FILES";
 }

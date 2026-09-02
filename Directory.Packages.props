@@ -7,7 +7,7 @@
 
   <ItemGroup Label="AspNetCore">
     <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.11" />
-    <PackageVersion Include="Scalar.AspNetCore" Version="2.17.2" />
+    <PackageVersion Include="Swashbuckle.AspNetCore.SwaggerUI" Version="10.2.3" />
     <PackageVersion Include="Asp.Versioning.Mvc" Version="10.2.1" />
     <PackageVersion Include="Asp.Versioning.Mvc.ApiExplorer" Version="10.2.1" />
     <PackageVersion Include="Asp.Versioning.OpenApi" Version="10.2.3" />
@@ -44,6 +44,17 @@
        this service has no use for. -->
   <ItemGroup Label="Cryptography">
     <PackageVersion Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
+  </ItemGroup>
+
+  <ItemGroup Label="Identity providers and storage">
+    <!-- WebAuthn / FIDO2 ceremony engine. No external service: it verifies attestations and
+         assertions locally against our own credential rows. -->
+    <PackageVersion Include="Fido2" Version="4.0.1" />
+    <!-- Verifies Firebase ID tokens against Google's rotating public keys. -->
+    <PackageVersion Include="FirebaseAdmin" Version="3.6.0" />
+    <!-- Object storage behind IObjectStorage. The port is what the service depends on; this is one
+         adapter for it. -->
+    <PackageVersion Include="Azure.Storage.Blobs" Version="12.29.2" />
   </ItemGroup>
 
   <ItemGroup Label="Caching">

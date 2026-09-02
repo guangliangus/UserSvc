@@ -7,6 +7,14 @@ public static class UserStatuses
     public const string Active = "ACTIVE";
     public const string Disabled = "DISABLED";
     public const string Deleted = "DELETED";
+
+    /// <summary>
+    /// <b>A login identity only</b>, never an account: the identity was deliberately detached, so
+    /// it drops out of the partial unique index and the same phone number or provider account can
+    /// later be attached elsewhere. The row survives, which is what makes an account-takeover
+    /// investigation possible.
+    /// </summary>
+    public const string Unbound = "UNBOUND";
 }
 
 /// <summary>Sources a login identity can come from.</summary>

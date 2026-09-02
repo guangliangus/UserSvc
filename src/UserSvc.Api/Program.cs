@@ -3,7 +3,6 @@ using Asp.Versioning;
 using FluentValidation;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
-using Scalar.AspNetCore;
 using Serilog;
 using UserSvc.Api.Auth;
 using UserSvc.Api.Errors;
@@ -13,7 +12,12 @@ using UserSvc.Application.Errors;
 using UserSvc.Application.Features.BackOffice.Accounts;
 using UserSvc.Application.Features.BackOffice.Rbac;
 using UserSvc.Application.Features.BackOffice.Tenants;
+using UserSvc.Application.Features.Account;
+using UserSvc.Application.Features.Feedback;
+using UserSvc.Application.Features.Passkeys;
 using UserSvc.Application.Features.Profile;
+using UserSvc.Application.Features.RiskControl;
+using UserSvc.Application.Features.SocialIdentity;
 using UserSvc.Application.Features.Registration;
 using UserSvc.Application.Features.Sessions;
 using UserSvc.Application.Features.Verification;
@@ -79,6 +83,14 @@ builder.Services.AddUserSvcInfrastructure(builder.Configuration);
 builder.Services.AddScoped<ProfileAppService>();
 builder.Services.AddScoped<SessionAppService>();
 builder.Services.AddScoped<VerificationAppService>();
+builder.Services.AddScoped<CaptchaAppService>();
+builder.Services.AddScoped<PasskeyAppService>();
+builder.Services.AddScoped<SocialIdentityAppService>();
+builder.Services.AddScoped<AvatarAppService>();
+builder.Services.AddScoped<FeedbackAppService>();
+builder.Services.AddScoped<AccountAppService>();
+builder.Services.AddSingleton<OAuthStateService>();
+builder.Services.AddSingleton<SocialBindingTokenService>();
 builder.Services.AddScoped<RegistrationAppService>();
 
 // --- Back office -----------------------------------------------------------------------------
@@ -149,15 +161,22 @@ builder.Services
     .AddOpenApi();
 
 // Decision 09: RFC 9457 is the only error contract. There is no envelope.
-// AppExceptionHandler fills errorCode and traceId for thrown errors; this callback covers the
-// responses it never sees - the ones a middleware produces by setting a status code and returning,
-// such as an authentication challenge - so every error body carries the same two members.
+// This callback is the last thing to touch the body on every path - the ones AppExceptionHandler
+// maps and the ones it never sees, such as an authentication challenge a middleware answers by
+// setting a status code and returning - which is why both members are filled here and nowhere else.
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
 {
     context.ProblemDetails.Extensions.TryAdd("errorCode", ErrorCodeFor(context.HttpContext.Response.StatusCode));
-    context.ProblemDetails.Extensions.TryAdd(
-        "traceId",
-        Activity.Current?.TraceId.ToString() ?? context.HttpContext.TraceIdentifier);
+
+    // Assigned rather than TryAdd'd, and deliberately the bare 32-hex trace id. ASP.NET Core's own
+    // ProblemDetails writers stamp traceId with Activity.Current.Id - the entire
+    // "00-<trace>-<span>-01" traceparent - before this callback runs, so a TryAdd is silently
+    // dropped and the published contract becomes a string no trace backend's search box accepts.
+    // The bare id is also exactly what Serilog writes as {TraceId}, which is what lets one value
+    // off a support ticket both grep the logs and open the trace.
+    context.ProblemDetails.Extensions["traceId"] =
+        Activity.Current?.TraceId.ToString() ?? context.HttpContext.TraceIdentifier;
+
     context.ProblemDetails.Instance ??= context.HttpContext.Request.Path;
 });
 builder.Services.AddExceptionHandler<AppExceptionHandler>();
@@ -210,7 +229,25 @@ app.MapHealthChecks("/health/ready", new() { Predicate = check => check.Tags.Con
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi().WithDocumentPerVersion();
-    app.MapScalarApiReference();
+
+    // Only the UI half of Swashbuckle is referenced. Its generator (AddSwaggerGen) stays out on
+    // purpose: it would describe the same controllers a second time, configured separately from
+    // Microsoft.AspNetCore.OpenApi above, and the two descriptions would drift. SwaggerUI is a
+    // standalone package - it wants nothing but the URL of a document someone else produced.
+    app.UseSwaggerUI(options =>
+    {
+        // Driven off the versions the API explorer actually found, so a future v2 appears in the
+        // picker on its own. GroupName is the same "v1" MapOpenApi publishes the document under:
+        // both read the 'v'VVV format configured on AddApiExplorer.
+        foreach (var description in app.DescribeApiVersions().OrderBy(d => d.GroupName, StringComparer.Ordinal))
+        {
+            var label = description.IsDeprecated
+                ? description.GroupName + " (deprecated)"
+                : description.GroupName;
+
+            options.SwaggerEndpoint($"/openapi/{description.GroupName}.json", label);
+        }
+    });
 }
 
 await app.RunAsync();

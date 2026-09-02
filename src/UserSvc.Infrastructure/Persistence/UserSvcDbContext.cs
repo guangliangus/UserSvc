@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using UserSvc.Domain.Auth;
 using UserSvc.Domain.BackOffice;
+using UserSvc.Domain.Feedback;
 using UserSvc.Domain.Iam;
 using UserSvc.Domain.Tenancy;
 using UserSvc.Domain.Users;
@@ -28,6 +29,12 @@ public sealed class UserSvcDbContext(DbContextOptions<UserSvcDbContext> options)
     public DbSet<User> Users => Set<User>();
 
     public DbSet<UserIdentity> UserIdentities => Set<UserIdentity>();
+
+    public DbSet<UserPasskey> UserPasskeys => Set<UserPasskey>();
+
+    public DbSet<FeedbackSubmission> Feedback => Set<FeedbackSubmission>();
+
+    public DbSet<FeedbackType> FeedbackTypes => Set<FeedbackType>();
 
     public DbSet<UserSession> UserSessions => Set<UserSession>();
 

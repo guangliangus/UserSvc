@@ -51,6 +51,7 @@ Api ──────► Infrastructure ──────► Application ─�
 
 - 成功响应就是 DTO 本身，没有 `{ success, data }`
 - 失败是 ProblemDetails + **真实 HTTP 状态码**，`errorCode` / `traceId` 走扩展成员
+- `traceId` 是**裸 W3C trace id**（32 位 hex），不是完整 traceparent —— 和日志里的 `{TraceId}`、trace 后端的查询框是同一个值。框架默认会填成 `00-<trace>-<span>-01`，由 `Program.cs` 的 `CustomizeProblemDetails` 统一覆盖
 - Controller 里不写 try/catch，异常冒泡到 `AppExceptionHandler`
 - 状态码按**客户端该做什么反应**分组：400 改一下重提交 · 401 去重新认证 ·
   403 别再试了 · 404 不存在 · 409 状态冲突 · 422 违反业务规则 · 429 限流 · 502 上游挂了
@@ -133,6 +134,30 @@ refresh token 会返回 `400 invalid_grant` **并撤销该 authorization 下的�
    都会把我们自己的 4xx 读成我们自己的宕机。
 2. **`RevokedSessionMiddleware` 必须在认证之后、授权之前。** 之前没有 `sid` 可读；之后
    一个已撤销的会话可能已经通过了某条授权策略。
+
+## 一个缺失的能力只能弄坏它自己
+
+这条规则被违反了三次，每次的表现都不一样，所以值得写下来：
+
+1. **拒绝式占位放在了「顺带查询」的读路径上**——它在每次租户上下文解析都要经过的地方抛异常，
+   于是整个租户后台不可用。占位实现要在**能力缺失处**失败，不是在被顺带碰到处。
+2. **`ValidateOnStart` 用在了没人配的配置段上**——一个没有微信 AppId 的部署（也就是今天的每个部署）
+   直接起不来，24 个和微信毫无关系的集成测试全在启动时死掉。
+3. **构造期读 `IOptions<T>.Value`**——`.Value` 才是跑 DataAnnotations 校验的地方。在构造函数里读它，
+   意味着这个类**仅仅被构造**就会抛；而一个 app service 把四家提供商都放进构造函数，
+   于是任一家缺凭证就让四家的端点全部 500，报的还是别人家的密钥。
+
+三条对应三个做法：
+
+| | 做法 |
+|---|---|
+| 占位实现 | 在能力真正被调用处拒绝，不在被解析处 |
+| 配置段 | `ValidateDataAnnotations()` 但**不** `ValidateOnStart()`——校验推迟到第一次读，也就是第一个用到它的请求 |
+| `IOptions<T>` | 在**使用点**读 `.Value`，不在构造期。`.Value` 有缓存，没有重复代价 |
+| 多能力共处一个服务 | 注入 `Func<T>` 而不是 `T`，让构造一个不牵连其余 |
+
+配置缺失映射为 500 `NOT_CONFIGURED`（不是 `INTERNAL_ERROR`），`detail` 里带上缺失的段名——
+运维读到它就知道去看密钥，而不是去读代码。
 
 ## 测试宿主不要向操作系统要密钥
 

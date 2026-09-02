@@ -11,13 +11,17 @@ using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Ports.Users;
+using UserSvc.Application.Ports.Feedback;
 using UserSvc.Application.Ports.Verification;
+using UserSvc.Application.Features.RiskControl;
 using UserSvc.Infrastructure.Auth;
 using UserSvc.Infrastructure.BackOffice;
 using UserSvc.Infrastructure.External;
 using UserSvc.Infrastructure.Persistence;
 using UserSvc.Infrastructure.Persistence.Repositories;
 using UserSvc.Infrastructure.Platform;
+
+using UserSvc.Application.Features.SocialIdentity;
 
 namespace UserSvc.Infrastructure;
 
@@ -58,6 +62,9 @@ public static class DependencyInjection
         services.AddScoped<IUnitOfWork, UnitOfWork>();
         services.AddScoped<IUserRepository, UserRepository>();
         services.AddScoped<IUserIdentityRepository, UserIdentityRepository>();
+        services.AddScoped<IUserPasskeyRepository, UserPasskeyRepository>();
+        services.AddScoped<IPasskeyIdentityLink, PasskeyIdentityLink>();
+        services.AddScoped<IFeedbackRepository, FeedbackRepository>();
         services.AddScoped<IUserSessionRepository, UserSessionRepository>();
         services.AddScoped<IVerificationCodeRepository, VerificationCodeRepository>();
         services.AddScoped<IVerificationTicketConsumer, VerificationCodeRepository>();
@@ -75,9 +82,12 @@ public static class DependencyInjection
         services.AddScoped<IUserTenantRoleRepository, UserTenantRoleRepository>();
         services.AddSingleton<IClock, SystemClock>();
 
+        AddObjectStorage(services, configuration);
         AddRedis(services, configuration);
+        AddPasskeys(services, configuration);
+        AddSocialIdentityProviders(services, configuration);
         AddNotificationClient(services, configuration);
-        AddRiskControl(services);
+        AddRiskControl(services, configuration);
         AddStaffDirectory(services);
         AddCrossSliceDirectories(services);
         AddTenantMasterData(services);
@@ -108,13 +118,54 @@ public static class DependencyInjection
     }
 
     /// <summary>
-    /// Risk control ships as a port with a refusing placeholder until a CAPTCHA provider is
-    /// configured (see <see cref="PlaceholderRiskControlService"/>). Replacing this one line with
-    /// the real adapter is the whole cutover - no calling code changes.
+    /// Adaptive send-code throttling and the CAPTCHA escalation (slice 05).
+    /// <para>
+    /// <b>Scoped, not singleton.</b> <see cref="RiskControlService"/> depends on a typed
+    /// <c>HttpClient</c>, which is transient; a singleton capturing it would pin one
+    /// <c>HttpMessageHandler</c> for the process lifetime and stop the factory rotating
+    /// connections - the DNS-staleness bug typed clients exist to avoid.
+    /// </para>
+    /// <para>
+    /// <b>The reCAPTCHA secret is deliberately not required at startup.</b> One endpoint out of the
+    /// whole service needs it; login, registration, sessions, the back office and the send-code
+    /// throttle itself all work without it. Making the host refuse to start would put the failure
+    /// on a path everything crosses in order to guard one that almost nothing does - the same
+    /// mistake as a placeholder that throws from a read every request makes.
+    /// </para>
     /// </summary>
-    private static void AddRiskControl(IServiceCollection services)
+    private static void AddRiskControl(IServiceCollection services, IConfiguration configuration)
     {
-        services.AddSingleton<IRiskControlService, PlaceholderRiskControlService>();
+        services.AddOptions<RiskControlOptions>()
+            .Bind(configuration.GetSection(RiskControlOptions.SectionName))
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        services.AddOptions<RecaptchaOptions>()
+            .Bind(configuration.GetSection(RecaptchaOptions.SectionName))
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        services.AddHttpClient<ICaptchaVerifier, RecaptchaClient>((provider, client) =>
+                client.BaseAddress = new Uri(
+                    provider.GetRequiredService<IOptions<RecaptchaOptions>>().Value.BaseAddress,
+                    UriKind.Absolute))
+            .AddStandardResilienceHandler()
+            .Configure((options, provider) =>
+            {
+                var recaptcha = provider.GetRequiredService<IOptions<RecaptchaOptions>>().Value;
+                options.AttemptTimeout.Timeout = recaptcha.AttemptTimeout;
+                options.TotalRequestTimeout.Timeout = recaptcha.TotalRequestTimeout;
+                options.Retry.MaxRetryAttempts = recaptcha.MaxRetryAttempts;
+
+                // Somebody is waiting on this call to finish signing in. Honouring a throttled
+                // provider's Retry-After would park the request for as long as it asks.
+                options.Retry.ShouldRetryAfterHeader = false;
+
+                options.CircuitBreaker.SamplingDuration = MaxOf(
+                    TimeSpan.FromSeconds(30), recaptcha.AttemptTimeout * 2);
+            });
+
+        services.AddScoped<IRiskControlService, RiskControlService>();
     }
 
     /// <summary>
@@ -242,4 +293,184 @@ public static class DependencyInjection
     }
 
     private static TimeSpan MaxOf(TimeSpan left, TimeSpan right) => left > right ? left : right;
+
+    /// <summary>
+    /// Where avatars are stored. The adapter is the real Azure Blob client; what it may be missing
+    /// is a connection string, and it refuses per request rather than at startup when it is - see
+    /// <see cref="AzureBlobObjectStorage"/> for why one endpoint's secret must not gate the boot.
+    /// <para>
+    /// No <c>ValidateOnStart</c> chained onto a <c>[Required]</c> connection string, therefore, but
+    /// the section is still validated: <see cref="AzureBlobOptions.Validate"/> checks the container
+    /// name and, when a connection string is supplied at all, that it parses.
+    /// </para>
+    /// <para>
+    /// Singleton: <see cref="Azure.Storage.Blobs.BlobServiceClient"/> owns a pooled HTTP pipeline
+    /// and is thread-safe, so one instance serves the process. Swapping this single line for an S3
+    /// adapter is the whole of a move to EKS.
+    /// </para>
+    /// </summary>
+    private static void AddObjectStorage(IServiceCollection services, IConfiguration configuration)
+    {
+        services.AddOptions<AzureBlobOptions>()
+            .Bind(configuration.GetSection(AzureBlobOptions.SectionName))
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        services.AddSingleton<IObjectStorage, AzureBlobObjectStorage>();
+    }
+
+    /// <summary>
+    /// WebAuthn. Unlike its neighbours in this file there is no external dependency to configure:
+    /// the FIDO2 library verifies attestations and assertions locally against the credential rows
+    /// in our own table, so this adapter is complete the moment the relying-party identity is set.
+    /// <para>
+    /// Both registrations are singletons. <see cref="Fido2WebAuthnCeremony"/> holds one immutable
+    /// <c>Fido2</c> instance built from validated options, and the flow store holds the shared
+    /// multiplexer and the key prefix - neither touches the request's DbContext.
+    /// </para>
+    /// </summary>
+    private static void AddPasskeys(IServiceCollection services, IConfiguration configuration)
+    {
+        // ValidateDataAnnotations, but deliberately NOT ValidateOnStart, which every other options
+        // type in this file uses.
+        //
+        // ValidateOnStart would make an unconfigured relying-party identity refuse to boot the
+        // whole service - and a passkey RP id is not something every deployment has yet. Measured
+        // while writing this slice: adding it took down the integration-test host and every test
+        // that starts one, none of which has anything to do with passkeys. That is the same
+        // mistake as a placeholder that throws from a read every request crosses; the capability
+        // that is missing here is passkeys, so passkeys are what must fail.
+        //
+        // Validation still happens, on the first resolution of IOptions<PasskeyOptions> - which is
+        // the construction of the ceremony below, which is the first passkey request. That request
+        // gets a 500 naming the missing keys; nothing else in the service notices.
+        services.AddOptions<PasskeyOptions>()
+            .Bind(configuration.GetSection(PasskeyOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        // The ceremony state shares the multiplexer and the key prefix with the revocation set -
+        // same Redis, different key space - but fails CLOSED on both read and write, where the
+        // revocation set fails open on read. See RedisPasskeyFlowStore for why the direction is
+        // opposite: there is no fallback underneath a challenge.
+        services.AddSingleton<IPasskeyFlowStore, RedisPasskeyFlowStore>();
+        services.AddSingleton<IWebAuthnCeremony, Fido2WebAuthnCeremony>();
+    }
+
+    /// <summary>
+    /// The third-party identity providers: WeChat web OAuth, the WeChat mini program, Firebase and
+    /// LINE.
+    /// <para>
+    /// <b>Every one of these is a real adapter, not a placeholder.</b> The protocols are public, so
+    /// the code exists and is complete; what a deployment supplies is the credentials. The options
+    /// are <c>[Required]</c> and validated on start, so a host routed at these endpoints without
+    /// them refuses to boot rather than answering "invalid code" to every user - a failure that
+    /// looks like the provider's fault and is not.
+    /// </para>
+    /// <para>
+    /// <b>Retries are switched off on the two WeChat clients and left on for LINE</b>, which is the
+    /// one non-obvious line in here. A WeChat authorization code and a mini-program js_code are
+    /// single-use: a retry after a timeout is answered with "code already consumed", so it cannot
+    /// succeed, and all it buys is a slower failure and a log line that reads like a replay attack.
+    /// A LINE id_token is verifiable as many times as you like, so a transient 503 there genuinely
+    /// is worth another attempt.
+    /// </para>
+    /// </summary>
+    private static void AddSocialIdentityProviders(IServiceCollection services, IConfiguration configuration)
+    {
+        // ValidateDataAnnotations, but deliberately NOT ValidateOnStart on any of these.
+        //
+        // MEASURED, not assumed: with ValidateOnStart, a deployment that has no WeChat AppId - which
+        // is every deployment today, and the integration-test host - fails to boot, and all 24
+        // integration tests die at startup with a WeChat credential error. None of them has
+        // anything to do with WeChat. That is the same mistake as a placeholder that throws from a
+        // read every request crosses: the capability missing here is third-party sign-in, so
+        // third-party sign-in is what must fail.
+        //
+        // Validation still happens - on the first resolution of the options, which is the first
+        // request to one of these endpoints. That request gets a 500 naming the missing keys, and
+        // nothing else in the service notices.
+        services.AddOptions<SocialIdentityOptions>()
+            .Bind(configuration.GetSection(SocialIdentityOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        services.AddOptions<WechatOptions>()
+            .Bind(configuration.GetSection(WechatOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        services.AddOptions<WechatMiniOptions>()
+            .Bind(configuration.GetSection(WechatMiniOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        services.AddOptions<LineOptions>()
+            .Bind(configuration.GetSection(LineOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        services.AddOptions<FirebaseOptions>()
+            .Bind(configuration.GetSection(FirebaseOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        // Singleton: it holds the in-process half of the token cache and the semaphore that
+        // collapses concurrent refreshes. A scoped instance would hold neither across requests,
+        // which is the whole point of it.
+        services.AddSingleton<WechatMiniAccessTokenCache>();
+
+        // Factories, so SocialIdentityAppService does not construct all four providers to serve one.
+        // Each typed client reads its own validated options when it is built, so building the lot
+        // made every provider's endpoint depend on every provider's credentials.
+        services.AddTransient<Func<IWechatClient>>(p => p.GetRequiredService<IWechatClient>);
+        services.AddTransient<Func<IWechatMiniClient>>(p => p.GetRequiredService<IWechatMiniClient>);
+        services.AddTransient<Func<ILineClient>>(p => p.GetRequiredService<ILineClient>);
+        services.AddTransient<Func<IFirebaseTokenVerifier>>(p => p.GetRequiredService<IFirebaseTokenVerifier>);
+
+        // Singleton: FirebaseApp is process-global and caches Google's public signing certificates.
+        services.AddSingleton<IFirebaseTokenVerifier, FirebaseTokenVerifier>();
+
+        services
+            .AddHttpClient<IWechatClient, WechatHttpClient>((provider, client) =>
+                client.BaseAddress = new Uri(
+                    provider.GetRequiredService<IOptions<WechatOptions>>().Value.BaseAddress,
+                    UriKind.Absolute))
+            .AddStandardResilienceHandler()
+            .Configure(NoRetryForSingleUseCredentials);
+
+        services
+            .AddHttpClient<IWechatMiniClient, WechatMiniHttpClient>((provider, client) =>
+                client.BaseAddress = new Uri(
+                    provider.GetRequiredService<IOptions<WechatMiniOptions>>().Value.BaseAddress,
+                    UriKind.Absolute))
+            .AddStandardResilienceHandler()
+            .Configure(NoRetryForSingleUseCredentials);
+
+        services
+            .AddHttpClient<ILineClient, LineHttpClient>((provider, client) =>
+                client.BaseAddress = new Uri(
+                    provider.GetRequiredService<IOptions<LineOptions>>().Value.BaseAddress,
+                    UriKind.Absolute))
+            .AddStandardResilienceHandler()
+            .Configure(options =>
+            {
+                options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(5);
+                options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(15);
+                options.Retry.MaxRetryAttempts = 2;
+
+                // Somebody is waiting on a sign-in. Honouring a Retry-After from LINE would park
+                // the request for as long as LINE asked, bounded only by the total budget.
+                options.Retry.ShouldRetryAfterHeader = false;
+            });
+    }
+    /// <summary>
+    /// Timeouts and a circuit breaker, but no retries: the credential being exchanged is
+    /// single-use, so a second attempt is guaranteed to be refused. See
+    /// <see cref="AddSocialIdentityProviders"/>.
+    /// <para>
+    /// The retry strategy rejects <c>MaxRetryAttempts = 0</c> at startup, so it is disabled by
+    /// telling it nothing is retryable rather than by asking for zero attempts.
+    /// </para>
+    /// </summary>
+    private static void NoRetryForSingleUseCredentials(HttpStandardResilienceOptions options)
+    {
+        options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(5);
+        options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(10);
+        options.Retry.ShouldHandle = _ => ValueTask.FromResult(false);
+    }
 }

@@ -39,9 +39,34 @@ public sealed class ErrorContractTests(ServiceFixture fixture) : IntegrationTest
             + "UseStatusCodePages is what keeps 'every failure is ProblemDetails' true for the two "
             + $"statuses clients hit most. Body was: {problem.Raw}");
         problem.ErrorCode.ShouldBe(ErrorCodes.Unauthorized);
-        problem.TraceId.ShouldNotBeNullOrEmpty(
-            "traceId is how a support ticket becomes a log query; it must be on every failure, "
-            + "including the ones no exception handler ever saw.");
+        problem.TraceId.ShouldMatch(
+            "^[0-9a-f]{32}$",
+            "traceId is how a support ticket becomes a log query, so the shape is part of the "
+            + "contract, not just its presence: the bare W3C trace id, which is what a trace "
+            + "backend's search box and Serilog's {TraceId} both take. ASP.NET Core's own "
+            + "ProblemDetails writer would otherwise leave the whole '00-<trace>-<span>-01' "
+            + $"traceparent here. Body was: {problem.Raw}");
+    }
+
+    [RequiresDockerFact]
+    public async Task TheTraceIdContinuesTheCallersTraceRatherThanStartingANewOne()
+    {
+        const string callerTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+        using var client = Fixture.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, ProfilePath);
+        request.Headers.TryAddWithoutValidation(
+            "traceparent", $"00-{callerTraceId}-00f067aa0ba902b7-01");
+
+        using var response = await client.SendAsync(request);
+        var problem = await ProblemDetailsBody.ReadAsync(response);
+
+        problem.TraceId.ShouldBe(
+            callerTraceId,
+            "A traceId that is ours alone is worth little: the point of W3C trace context is that "
+            + "the gateway, this service and everything downstream report one id for one user "
+            + "action. Losing the inbound traceparent breaks a cross-service investigation into "
+            + $"unlinkable halves. Body was: {problem.Raw}");
     }
 
     [RequiresDockerFact]

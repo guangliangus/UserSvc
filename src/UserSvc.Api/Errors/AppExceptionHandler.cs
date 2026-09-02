@@ -1,6 +1,6 @@
-using System.Diagnostics;
 using System.Globalization;
 using FluentValidation;
+using Microsoft.Extensions.Options;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using UserSvc.Application.Errors;
@@ -55,7 +55,10 @@ public sealed class AppExceptionHandler(
         };
 
         problem.Extensions["errorCode"] = mapped.ErrorCode;
-        problem.Extensions["traceId"] = Activity.Current?.TraceId.ToString() ?? httpContext.TraceIdentifier;
+
+        // traceId is not set here. The framework's own ProblemDetails writer overwrites whatever
+        // this handler puts there, so the value only ever came from CustomizeProblemDetails in
+        // Program.cs - which runs after that writer. Filling it in two places hid that for a while.
 
         if (mapped.Errors is not null)
         {
@@ -105,6 +108,16 @@ public sealed class AppExceptionHandler(
                 .GroupBy(e => e.PropertyName, StringComparer.Ordinal)
                 .ToDictionary(g => g.Key, g => g.Select(e => e.ErrorMessage).ToArray(), StringComparer.Ordinal),
             null),
+
+        // A configuration section this deployment does not carry. It is a 500 because it is our
+        // misconfiguration, not the caller's - but it gets its own code, because "the request could
+        // not be completed" sends an operator to read code when the answer is a missing secret. The
+        // section NAMES travel in the detail; no value does, and the exception's own message (which
+        // quotes only member names) is what carries them.
+        OptionsValidationException options => new(
+            StatusCodes.Status500InternalServerError, ErrorCodes.NotConfigured,
+            "This capability is not configured on this deployment.",
+            options.Message, null, null),
 
         // Fallback: internal detail goes to the logs and never into the response body.
         _ => new(

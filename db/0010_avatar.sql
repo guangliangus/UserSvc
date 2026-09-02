@@ -1,0 +1,12 @@
+-- None. This slice adds no table and no column.
+--
+-- The avatar URL lands on identity.users.avatar, which already exists in the target repo's own
+-- db/0001_identity.sql as:
+--     avatar TEXT NOT NULL DEFAULT ''
+-- No new numbered script, no seed, and therefore no sequence to advance with setval.
+--
+-- Caveat recorded under specConflicts: neither live ground-truth dump contains the consumer
+-- users table (rest_ground_truth.md and rbac_ground_truth.md between them cover uam.user_passkeys,
+-- uam.feedback, the tenancy/RBAC tables and uam.backend_users - whose own `avatar text` column is
+-- NULLABLE). The consumer table's live nullability could not be re-verified from the ground truth,
+-- so db/0001_identity.sql was taken as authority and the port writes a non-null string.

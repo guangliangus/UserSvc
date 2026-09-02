@@ -53,7 +53,7 @@ dotnet run --project src/UserSvc.Api        # http://localhost:5080
 和 `Notification:BaseAddress`**——它们是 `[Required]` 且启动时校验，缺失会拒绝启动，而一个
 `localhost` 默认值会让生产静默连错机器。
 
-API 文档：<http://localhost:5080/scalar/v1>　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>
+API 文档：<http://localhost:5080/swagger>　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>
 
 ### 拿一个令牌
 
@@ -90,10 +90,10 @@ dotnet test  UserSvc.slnx      # 单元 + 架构守卫
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | 骨架 + CI 门禁 + 架构守卫 | ✅ |
-| 1 | 用户档案 + 注册 | 🟡 注册已通，缺头像（需 Blob 存储凭证） |
+| 1 | 用户档案 + 注册 + 头像 | ✅ |
 | 2 | 验证码（Redis 限流、调通知服务） | ✅ |
 | 3 | 认证核心（OpenIddict、设备会话、令牌轮换） | ✅ |
-| 4 | 第三方身份（微信 / Firebase / LINE / Passkey） | ⬜ |
+| 4 | 第三方身份（微信 / Firebase / LINE / Passkey） | ✅ Passkey 完整可用；三家社交为真适配器，等凭证 |
 | 5 | 后台账号 + RBAC + 租户 | 🟡 端点已服务并实测；缺后台登录流程（依赖 OTP 上游） |
 
 阶段 3 已端到端验证：设备登录 → 刷新轮换 → **重放已赎回的 token 触发整链撤销**，会话行标记
@@ -102,8 +102,9 @@ dotnet test  UserSvc.slnx      # 单元 + 架构守卫
 
 ## 还没接的东西
 
-- **头像**：需要 Azure Blob / S3 凭证
-- **风控 / reCAPTCHA**：端口与调用逻辑已写全，适配器是拒绝式占位——没有 reCAPTCHA 密钥
+- **凭证**：微信 AppId/Secret、Firebase ProjectId、LINE ChannelId、reCAPTCHA Secret、
+  Azure Blob 连接串。**代码全部写好了**——协议是公开的，缺的是密钥。缺哪个只影响哪个端点，
+  返回 500 `NOT_CONFIGURED` 并指名缺失的配置段
 - **授权快照与网关注入**：RBAC 表尚不存在，网关产品未定——现在建等于建了要重写
 - **Outbox 投递器**：事件已原子落表，但没有消费者也没有 broker（Go 服务不用 RabbitMQ）。
   等真正的集成机制定下来再加，业务代码不受影响

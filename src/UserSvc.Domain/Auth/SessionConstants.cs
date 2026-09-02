@@ -24,4 +24,7 @@ public static class RevocationReasons
     public const string Admin = "ADMIN";
     /// <summary>A rotated refresh token was presented again — treated as a leak.</summary>
     public const string TokenReplay = "TOKEN_REPLAY";
+    /// <summary>The account was closed by its owner. Distinct from SELF and ADMIN on purpose: the
+    /// session did not end, the account it belonged to stopped existing.</summary>
+    public const string Deregistered = "DEREGISTERED";
 }

@@ -61,4 +61,20 @@ public sealed class User : Entity
     /// </summary>
     public void RecordRegistration(string identityType, string identifierHash, DateTimeOffset now) =>
         Raise(new UserRegistered(identityType, identifierHash, now));
+
+    /// <summary>
+    /// Records that the person closed this account, so the fact reaches the outbox in the same
+    /// transaction as the status change and the identity rows it releases.
+    /// <para>
+    /// Called once, by the deregistration use case, and only when the account was still active -
+    /// re-running a completed deregistration must not publish a second event.
+    /// </para>
+    /// <para>
+    /// The unbound identities are passed in rather than read from <see cref="Identities"/> because
+    /// the caller has just decided which rows it is unbinding, and only the ones it actually
+    /// changed belong in the event.
+    /// </para>
+    /// </summary>
+    public void RecordDeregistration(IReadOnlyList<UnboundIdentity> unboundIdentities, DateTimeOffset now) =>
+        Raise(new UserDeregistered(Id, unboundIdentities, now));
 }
