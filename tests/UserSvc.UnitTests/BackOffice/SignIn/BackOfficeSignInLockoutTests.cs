@@ -409,6 +409,98 @@ public sealed class BackOfficeSignInLockoutTests
             + $"{unknownAddress:F1} / {noLocalPassword:F1} / {wrongPassword:F1} ms");
     }
 
+    /// <summary>
+    /// The residual the legacy bcrypt branch left behind, pinned so it cannot widen unnoticed.
+    /// <para>
+    /// A row still carrying a <c>$2a$10$</c> hash verifies with bcrypt, and bcrypt at cost 10 is
+    /// not the same price as Argon2id at <c>m=19456,t=2,p=1</c> - measured in isolation on the
+    /// machine these numbers come from, 49.3 ms against 36.9 ms, a ratio of 1.34. So a wrong
+    /// password against an unmigrated row <i>is</i> distinguishable from every other refusal, and
+    /// this test does not pretend otherwise. What it asserts is the bound: the separation stays
+    /// well inside one extra verification.
+    /// </para>
+    /// <para>
+    /// <b>Why bound it rather than close it.</b> The cost of a row is fixed by the row, so nothing
+    /// here can equalise the two - an extra Argon2id verify on the bcrypt path would make it 86 ms
+    /// against 37, which is worse, and padding is the technique
+    /// <see cref="BackOfficePasswordTiming"/> exists to avoid. The set is at most the 17 rows the
+    /// Go service left behind and each leaves it permanently at its owner's first sign-in.
+    /// </para>
+    /// <para>
+    /// <b>What this does NOT catch, measured.</b> It does not catch a cheaper Argon2id, and an
+    /// earlier version of this comment claimed it did. The statistic is
+    /// <c>max/min</c> of two end-to-end sign-ins, and that is <b>not monotonic</b> in the Argon2id
+    /// cost: at the shipped parameters the Argon2id path is the slower of the two (measured here,
+    /// 69.6 ms against bcrypt 50.1, ratio 1.39), so making Argon2id cheaper first moves the ratio
+    /// <i>towards</i> 1.0 and only then back up as bcrypt becomes the outlier. Halving
+    /// <c>MemoryKibibytes</c> was measured at 34.4 ms against 51.1 - ratio 1.49, comfortably
+    /// green. Both figures also carry the fixed cost of a whole sign-in, which compresses any
+    /// ratio towards 1. The guard that actually catches that regression is
+    /// <c>PasswordHasherTests.TheLegacyBranchStaysWithinOneVerifyOfTheAlgorithmWeWrite</c>, which
+    /// is directional and measures the two verifications alone.
+    /// </para>
+    /// <para>
+    /// What this one is still worth: it bounds the <i>observable</i> separation, end to end and
+    /// through the real flow, which is the number an attacker with a stopwatch actually sees.
+    /// </para>
+    /// <para>
+    /// <b>Why 2.5 and not the 1.34 that was measured.</b> Measured alone, this ratio is 1.34 and
+    /// stable. Measured inside the suite it is not: a first draft compared the median of three
+    /// samples against a bound of 2.0 and failed roughly one full run in four, because a thousand
+    /// other tests are running in parallel and every one of them that hashes holds 19 MiB. A guard
+    /// that fails at random is worse than no guard - it teaches people to re-run rather than to
+    /// look - so this takes the <b>minimum</b> of five interleaved samples, which is the one
+    /// statistic contention can only move the wrong way, and leaves the bound far enough out to
+    /// survive a loaded machine while still catching a halving of the cost.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ALegacyRowsRefusalStaysWithinOneVerifyOfTheEqualisedPaths()
+    {
+        _harness.WithPasswordAccount();
+        _harness.AddIdentity(59, BackendIdentityTypes.Email, "legacy.hash@liontravel.com");
+        _harness.AccountRows.Add(new BackendUser
+        {
+            Id = 59,
+            PasswordHash = SignInTestHarness.LegacyBcryptHashOfPassword,
+            Nickname = "legacy",
+            Status = BackendUserStatuses.Active,
+            Origin = BackendUserOrigins.Internal,
+        });
+
+        PasswordHasher.Identify(SignInTestHarness.LegacyBcryptHashOfPassword)
+            .ShouldBe(StoredPasswordAlgorithms.Bcrypt, "the fixture must be a legacy row");
+
+        // Interleaved so that a burst of load lands on both paths rather than on one, and five
+        // deep so that the minimum has a chance of catching an uncontended moment. The first
+        // derivation of the process also pays for a cold JIT, which alone would decide a
+        // single-sample ratio.
+        var argon2id = new List<double>();
+        var bcrypt = new List<double>();
+
+        for (var round = 0; round < 5; round++)
+        {
+            argon2id.Add(await ElapsedAsync(Request(password: "not-the-password")));
+            bcrypt.Add(await ElapsedAsync(
+                Request(email: "legacy.hash@liontravel.com", password: "not-the-password")));
+        }
+
+        var argonBest = argon2id.Min();
+        var bcryptBest = bcrypt.Min();
+
+        argonBest.ShouldBeGreaterThan(
+            15, $"an Argon2id refusal must still cost a derivation; it was {argonBest:F1} ms");
+
+        bcryptBest.ShouldBeGreaterThan(
+            15, $"a bcrypt refusal must still cost a derivation; it was {bcryptBest:F1} ms");
+
+        (Math.Max(argonBest, bcryptBest) / Math.Min(argonBest, bcryptBest)).ShouldBeLessThan(
+            2.5,
+            $"the legacy branch may not cost more than 2.5 of an equalised refusal, or the "
+            + $"existence oracle is readable again; Argon2id {argonBest:F1} ms against bcrypt "
+            + $"{bcryptBest:F1} ms");
+    }
+
     private async Task<double> ElapsedAsync(BackOfficePasswordSignInRequest request)
     {
         var started = Stopwatch.GetTimestamp();

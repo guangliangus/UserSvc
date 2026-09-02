@@ -32,11 +32,16 @@ public sealed class BackOfficeAccountAppServiceTests
     private const string Ticket = "ticket-abc";
     private const string Password = "correct-horse-9";
 
+    /// <summary>Where the reset came from, as the API layer reads it off the socket and the
+    /// correlation header.</summary>
+    private static readonly BackOfficeResetContext Origin = new("203.0.113.9", "req-77");
+
     private readonly IBackendUserRepository _users = Substitute.For<IBackendUserRepository>();
     private readonly IBackendIdentityRepository _identities = Substitute.For<IBackendIdentityRepository>();
     private readonly IVerificationTicketConsumer _tickets = Substitute.For<IVerificationTicketConsumer>();
     private readonly IUnitOfWork _unitOfWork = Substitute.For<IUnitOfWork>();
     private readonly IIamAuditLogRepository _auditLog = Substitute.For<IIamAuditLogRepository>();
+    private readonly IRateLimiter _rateLimiter = Substitute.For<IRateLimiter>();
     private readonly TestClock _clock = new(new DateTimeOffset(2026, 9, 2, 9, 0, 0, TimeSpan.Zero));
 
     private readonly IdentifierProtector _protector = new(Options.Create(new IdentifierProtectionOptions
@@ -68,6 +73,11 @@ public sealed class BackOfficeAccountAppServiceTests
                 Arg.Any<int>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(true);
 
+        _rateLimiter
+            .TryAcquireAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(new RateLimitDecision(true, 99, TimeSpan.Zero));
+
         // The substitute has to run the body, or every assertion below would pass against a
         // transaction that never opened.
         _unitOfWork
@@ -88,6 +98,7 @@ public sealed class BackOfficeAccountAppServiceTests
         _tickets,
         new BackOfficeResetTargetGate(_users, _identities, _protector),
         _auditLog,
+        _rateLimiter,
         _protector,
         _passwordHasher,
         _unitOfWork,
@@ -265,7 +276,7 @@ public sealed class BackOfficeAccountAppServiceTests
         var account = ExistingAccount(passwordHash: "$argon2id$old");
         GivenExistingIdentityFor(account);
 
-        await Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None);
+        await Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None);
 
         await _users.Received(1).UpdatePasswordHashAsync(
             account.Id,
@@ -290,7 +301,7 @@ public sealed class BackOfficeAccountAppServiceTests
         GivenExistingIdentityFor(account);
 
         var ex = await Should.ThrowAsync<ForbiddenException>(
-            () => Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None));
+            () => Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None));
 
         ex.ErrorCode.ShouldBe(ErrorCodes.AccountDisabled);
         ex.StatusCode.ShouldBe(403);
@@ -308,7 +319,7 @@ public sealed class BackOfficeAccountAppServiceTests
         account.Status = BackendUserStatuses.Pending;
         GivenExistingIdentityFor(account);
 
-        await Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None);
+        await Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None);
 
         await _users.Received(1).UpdatePasswordHashAsync(
             account.Id, Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
@@ -318,7 +329,7 @@ public sealed class BackOfficeAccountAppServiceTests
     public async Task RefusesAResetForAnAddressWithNoAccount()
     {
         var ex = await Should.ThrowAsync<BadRequestException>(
-            () => Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None));
+            () => Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None));
 
         ex.ErrorCode.ShouldBe(ErrorCodes.Unregistered);
     }
@@ -329,7 +340,7 @@ public sealed class BackOfficeAccountAppServiceTests
     public async Task RefusesAResetTargetThatIsNotAnAddress()
     {
         var ex = await Should.ThrowAsync<BadRequestException>(
-            () => Sut.ResetPasswordAsync(ResetRequest(email: "+886912345678"), CancellationToken.None));
+            () => Sut.ResetPasswordAsync(ResetRequest(email: "+886912345678"), Origin, CancellationToken.None));
 
         ex.ErrorCode.ShouldBe(ErrorCodes.BadRequest);
     }
@@ -345,7 +356,7 @@ public sealed class BackOfficeAccountAppServiceTests
         var account = ExistingAccount(passwordHash: "$argon2id$old");
         GivenExistingIdentityFor(account);
 
-        await Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None);
+        await Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None);
 
         await _unitOfWork.Received(1).ExecuteInTransactionAsync(
             Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<CancellationToken>());
@@ -370,7 +381,7 @@ public sealed class BackOfficeAccountAppServiceTests
         account.LastName = "Chen";
         GivenExistingIdentityFor(account);
 
-        await Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None);
+        await Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None);
 
         await _auditLog.Received(1).AppendAsync(
             Arg.Is<IamAuditLog>(entry =>
@@ -400,10 +411,99 @@ public sealed class BackOfficeAccountAppServiceTests
         _auditLog.AppendAsync(Arg.Any<IamAuditLog>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromException(new InvalidOperationException("the audit table is gone")));
 
-        await Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None);
+        await Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None);
 
         await _users.Received(1).UpdatePasswordHashAsync(
             account.Id, Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// There is no signed-in actor on this path and the ticket names a mailbox rather than a
+    /// person, so the source address and the correlation id are the only facts the trail can hold
+    /// about where a credential change came from.
+    /// </summary>
+    [Fact]
+    public async Task TheAuditEntryRecordsWhereTheResetCameFrom()
+    {
+        var account = ExistingAccount(passwordHash: "$argon2id$old");
+        GivenExistingIdentityFor(account);
+
+        await Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None);
+
+        await _auditLog.Received(1).AppendAsync(
+            Arg.Is<IamAuditLog>(entry => entry.Ip == "203.0.113.9" && entry.RequestId == "req-77"),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The budget is charged before the ticket is spent. Charging it afterwards would leave the
+    /// only cheap part of this endpoint - opening a write transaction per request - unbounded for
+    /// an anonymous caller, which is the whole thing the budget is for.
+    /// </summary>
+    [Fact]
+    public async Task ASpentSourceBudgetRefusesTheResetBeforeTheTicketIsTouched()
+    {
+        var account = ExistingAccount(passwordHash: "$argon2id$old");
+        GivenExistingIdentityFor(account);
+
+        _rateLimiter
+            .TryAcquireAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(new RateLimitDecision(false, 0, TimeSpan.FromSeconds(30)));
+
+        var ex = await Should.ThrowAsync<RateLimitedException>(
+            () => Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None));
+
+        ex.ErrorCode.ShouldBe(ErrorCodes.RateLimitExceeded);
+        ex.StatusCode.ShouldBe(429);
+        ex.RetryAfter.ShouldBe(TimeSpan.FromSeconds(30));
+
+        await _tickets.DidNotReceive().TryConsumeAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await _users.DidNotReceive().UpdatePasswordHashAsync(
+            Arg.Any<int>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// IRateLimiter requires a caller holding two policies to stop at the first refusal: every call
+    /// counts, so charging the hour window after the minute window has said no bills the caller for
+    /// a request it never received an answer to - and a client retrying into a one-minute block
+    /// would spend its whole hour that way.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedMinuteWindowDoesNotAlsoChargeTheHourWindow()
+    {
+        _rateLimiter
+            .TryAcquireAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(new RateLimitDecision(false, 0, TimeSpan.FromSeconds(30)));
+
+        await Should.ThrowAsync<RateLimitedException>(
+            () => Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None));
+
+        await _rateLimiter.Received(1).TryAcquireAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// A request the server could not attribute to a peer shares one named bucket rather than
+    /// passing a blank subject the limiter refuses - the same trade the send-code endpoint makes,
+    /// and the opposite of the sign-in door's, where the budget is a lockout on failures.
+    /// </summary>
+    [Fact]
+    public async Task AResetWithNoPeerAddressIsChargedToOneNamedBucket()
+    {
+        var account = ExistingAccount(passwordHash: "$argon2id$old");
+        GivenExistingIdentityFor(account);
+
+        await Sut.ResetPasswordAsync(
+            ResetRequest(), BackOfficeResetContext.None, CancellationToken.None);
+
+        await _rateLimiter.Received(2).TryAcquireAsync(
+            "backoffice-password-reset-ip",
+            "unknown-source",
+            Arg.Any<RateLimitPolicy>(),
+            Arg.Any<CancellationToken>());
     }
 
     /// <summary>A refused reset writes no audit row - the trail records what happened, and nothing
@@ -416,7 +516,7 @@ public sealed class BackOfficeAccountAppServiceTests
         GivenExistingIdentityFor(account);
 
         await Should.ThrowAsync<ForbiddenException>(
-            () => Sut.ResetPasswordAsync(ResetRequest(), CancellationToken.None));
+            () => Sut.ResetPasswordAsync(ResetRequest(), Origin, CancellationToken.None));
 
         await _auditLog.DidNotReceive().AppendAsync(Arg.Any<IamAuditLog>(), Arg.Any<CancellationToken>());
     }

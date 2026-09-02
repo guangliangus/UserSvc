@@ -56,6 +56,26 @@ public sealed record BackOfficePasswordResetRequest
     public string VerificationTicket { get; init; } = string.Empty;
 }
 
+/// <summary>
+/// The request facts the self-service reset needs and cannot discover for itself.
+/// <para>
+/// Passed in from the API layer rather than read from an ambient accessor, for the reason every
+/// other context record in this service gives: the budget it charges and the audit row it writes
+/// are part of this use case's behaviour, and a unit test has to be able to state the address that
+/// ends up on one.
+/// </para>
+/// </summary>
+/// <param name="IpAddress">The peer address, as the socket reports it. Empty when there is none to
+/// attribute to - the use case then charges one shared bucket rather than handing a limiter a blank
+/// subject.</param>
+/// <param name="RequestId">Correlation id, so the audit row of a credential change nobody signed
+/// in for joins to the request log.</param>
+public sealed record BackOfficeResetContext(string IpAddress = "", string RequestId = "")
+{
+    /// <summary>No address and no correlation id - the shape a caller outside HTTP passes.</summary>
+    public static BackOfficeResetContext None { get; } = new();
+}
+
 /// <summary>The back-office directory query, as bound from the query string.</summary>
 public sealed record BackOfficeUserListRequest
 {

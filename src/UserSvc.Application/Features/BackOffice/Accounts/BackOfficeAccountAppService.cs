@@ -39,6 +39,7 @@ public sealed class BackOfficeAccountAppService(
     IVerificationTicketConsumer tickets,
     BackOfficeResetTargetGate resetTargets,
     IIamAuditLogRepository auditLog,
+    IRateLimiter rateLimiter,
     IdentifierProtector protector,
     PasswordHasher passwordHasher,
     IUnitOfWork unitOfWork,
@@ -46,6 +47,20 @@ public sealed class BackOfficeAccountAppService(
     IOptions<BackOfficeAccountOptions> options,
     ILogger<BackOfficeAccountAppService> logger)
 {
+    /// <summary>
+    /// The dimension the self-service reset's per-source budget is counted in. Its own dimension,
+    /// so it shares no counter with the sign-in doors or with the send-code endpoint: a spent reset
+    /// budget must not lock anybody out of signing in.
+    /// </summary>
+    private const string ResetRateLimitDimension = "backoffice-password-reset-ip";
+
+    /// <summary>
+    /// The bucket a request with no attributable peer address is charged to. A literal rather than
+    /// the empty string, because the limiter refuses a blank subject and because a named bucket is
+    /// greppable in the key space when someone asks why one counter is hot.
+    /// </summary>
+    private const string UnknownSource = "unknown-source";
+
     /// <summary>
     /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
     /// capability may only break itself"). A field initializer runs during construction, and
@@ -196,12 +211,28 @@ public sealed class BackOfficeAccountAppService(
     /// Every access token the account holds dies with the old password, through the token-version
     /// bump in the same transaction.
     /// </para>
+    /// <para>
+    /// <b>Anonymous, so it carries its own per-source budget.</b> The ticket is the credential here
+    /// and it is 256 bits, so nothing is being guessed; what the budget bounds is the cheap part -
+    /// an unbounded anonymous caller opening one write transaction per request. It is charged
+    /// before the ticket is spent, and it counts attempts rather than failures: unlike the sign-in
+    /// door, where a lockout on failures is right because a correct password must not spend budget,
+    /// every arrival here costs a transaction whether or not the ticket was real.
+    /// </para>
     /// </summary>
+    /// <param name="request">The address, the ticket minted against it, and the new password.</param>
+    /// <param name="context">Where the request came from. It feeds the per-source budget and the
+    /// audit row, which is the only record of a credential change nobody signed in for.</param>
+    /// <param name="cancellationToken">Cancels the flow.</param>
     public async Task ResetPasswordAsync(
         BackOfficePasswordResetRequest request,
+        BackOfficeResetContext context,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(context);
+
+        await ChargeResetBudgetAsync(context, cancellationToken);
 
         // Captured from inside the transaction so the audit entry, which is written after the
         // commit, names the account the reset actually landed on.
@@ -218,8 +249,14 @@ public sealed class BackOfficeAccountAppService(
                         "The verification ticket is invalid, expired or already used.");
                 }
 
-                // The same gate the send-code step ran, repeated because the account may have been
-                // disabled in the minutes between the code being mailed and the ticket being spent.
+                // The second of the gate's two runs (BackOfficeResetTargetGate). The send step ran
+                // the same rule through EvaluateAsync and swallowed its refusals into a uniform
+                // success answer, so this run is the first that may say what it found - and it is
+                // the only one that can, because the account may have been disabled, or its
+                // identity revoked, in the minutes between the code being mailed and the ticket
+                // being spent. The caller holds a ticket for this mailbox by now, so UNREGISTERED
+                // and ACCOUNT_DISABLED here tell its owner about their own account and nobody else
+                // about anything.
                 var account = await resetTargets.ResolveAsync(request.Email, ct);
 
                 var hashed = passwordHasher.Hash(request.NewPassword);
@@ -245,7 +282,69 @@ public sealed class BackOfficeAccountAppService(
             "Back-office account {BackendUserId} reset its own password; token version bumped.",
             reset!.Id);
 
-        await WriteSelfPasswordResetAuditAsync(reset, cancellationToken);
+        await WriteSelfPasswordResetAuditAsync(reset, context, cancellationToken);
+    }
+
+    /// <summary>
+    /// Spends one token from the per-minute budget for this source address and, only if that call
+    /// allowed the request, one from the per-hour budget.
+    /// <para>
+    /// <b>Stopping at the first refusal is what <see cref="IRateLimiter"/> requires</b> of a caller
+    /// holding two policies on one subject: every call counts, so charging the hour window after
+    /// the minute window has refused bills the caller for a request it never received an answer
+    /// to, and a client retrying into a one-minute block would spend its whole hour that way.
+    /// </para>
+    /// <para>
+    /// <b>The numbers are this service's own, not the ones the Go service used.</b> That service
+    /// allowed three password resets per hour per address, which would be an outage here rather
+    /// than a throttle: nothing in this host registers the forwarded-headers middleware, so behind
+    /// a gateway every request shares one peer address (docs/architecture.md says so in the
+    /// rate-limiting section) and three per hour would be three resets per hour for the entire
+    /// operator population. The budget is therefore sized like the anonymous verification door in
+    /// front of it, which is the flow's other half and is measured against the same shared address.
+    /// </para>
+    /// <para>
+    /// <b>A request with no attributable address shares one named bucket</b> rather than disabling
+    /// the budget. That is the opposite of the sign-in door's choice, and for the reason that door
+    /// gives: there the budget is a lockout counting failures, so the first few unattributable
+    /// callers would lock out the rest. This one counts attempts against a large limit, so sharing
+    /// is the safe direction - the same trade <c>VerificationAppService</c> makes for the same
+    /// reason.
+    /// </para>
+    /// </summary>
+    private async Task ChargeResetBudgetAsync(
+        BackOfficeResetContext context,
+        CancellationToken cancellationToken)
+    {
+        var source = string.IsNullOrWhiteSpace(context.IpAddress) ? UnknownSource : context.IpAddress;
+
+        RateLimitPolicy[] budget =
+        [
+            RateLimitPolicy.PerMinute(_options.PasswordResetPerSourcePerMinute),
+            RateLimitPolicy.PerHour(_options.PasswordResetPerSourcePerHour),
+        ];
+
+        foreach (var policy in budget)
+        {
+            var decision = await rateLimiter.TryAcquireAsync(
+                ResetRateLimitDimension, source, policy, cancellationToken);
+
+            if (decision.Allowed)
+            {
+                continue;
+            }
+
+            logger.LogWarning(
+                "A back-office password reset from {Source} was refused: the per-source budget is "
+                + "spent, retry in {RetryAfter}.",
+                source,
+                decision.RetryAfter);
+
+            throw new RateLimitedException(
+                ErrorCodes.RateLimitExceeded,
+                "Too many password reset attempts from this address. Try again later.",
+                decision.RetryAfter);
+        }
     }
 
     /// <summary>
@@ -266,6 +365,7 @@ public sealed class BackOfficeAccountAppService(
     /// </summary>
     private async Task WriteSelfPasswordResetAuditAsync(
         BackendUser account,
+        BackOfficeResetContext context,
         CancellationToken cancellationToken)
     {
         var entry = new IamAuditLog
@@ -285,6 +385,13 @@ public sealed class BackOfficeAccountAppService(
 
             // No before/after snapshot, deliberately: the only thing that changed is a password
             // hash, and neither spelling of it belongs anywhere near an audit row.
+            //
+            // The address and the correlation id are the only facts about WHO did this that exist
+            // on this path: there is no signed-in actor, and the ticket names a mailbox rather than
+            // a person. Without them the trail records that a credential changed and nothing about
+            // where the change came from - which is precisely the question asked after one.
+            Ip = context.IpAddress,
+            RequestId = context.RequestId,
             CreatedAt = clock.UtcNow,
         };
 

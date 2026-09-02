@@ -19,6 +19,54 @@ namespace UserSvc.Application.Features.BackOffice.SignIn;
 /// under load, which is a number nobody knows, and it would make every wrong password slower for
 /// no gain.
 /// </para>
+/// <para>
+/// <b>The legacy bcrypt branch adds a fourth cost, and it does not equalise.</b> A row still
+/// carrying a <c>$2a$10$</c> hash from the Go service verifies with bcrypt, not Argon2id, and the
+/// two are not the same price. Measured twice, and the two agree. In isolation, n=40 each:
+/// Argon2id at <c>m=19456,t=2,p=1</c> has a median of 36.9 ms, bcrypt at cost 10 has 49.3 ms.
+/// Over real HTTP against the running service, 30 interleaved samples per path after fifty warm-up
+/// attempts, medians:
+/// </para>
+/// <list type="table">
+/// <item><description>unknown mailbox - 43.0 ms</description></item>
+/// <item><description>account with no local password - 45.6 ms</description></item>
+/// <item><description>wrong password, Argon2id row - 45.4 ms</description></item>
+/// <item><description>wrong password, <b>bcrypt row</b> - <b>57.6 ms</b></description></item>
+/// </list>
+/// <para>
+/// <b>The three wave-7 paths are still equalised</b> - 2.6 ms apart, against the 48.7 ms spread
+/// that made the original oracle obvious. The fourth is 12.5 ms above them, 1.27x, and its samples
+/// do not overlap theirs.
+/// </para>
+/// <para>
+/// <b>So account existence is readable again, for the legacy rows only, and this says so rather
+/// than rounding it off.</b> The unknown-mailbox path is one of the equalised three, so an
+/// unmigrated row costing more than it means "this address exists" is back on the clock for those
+/// addresses - not merely "this address has not migrated". Three things bound it, and none of them
+/// is a fix: the separation is a quarter of one verify rather than fourteen times it; the set is at
+/// most the 17 rows the Go service left behind; and every one of them leaves the set permanently
+/// the first time its owner signs in, because that sign-in rewrites the row. It closes itself,
+/// which is the property that made this the better trade than 17 operators locked out.
+/// </para>
+/// <para>
+/// <b>One measurement artefact worth knowing on cutover day.</b> The first readings of the bcrypt
+/// path in a freshly started process were 95-100 ms, not 57 - roughly 2.0x, not 1.27x - because
+/// tiered compilation had not yet promoted a code path that only a handful of requests had
+/// reached. So the separation is at its widest exactly when the legacy set is at its largest: the
+/// minutes after a deployment. Nothing here warms it, and the cheap fix if it ever matters is one
+/// throwaway verify against a dummy bcrypt string at startup, which belongs in the host and not in
+/// this type.
+/// </para>
+/// <para>
+/// <b>It was left rather than padded, and the alternative was worse.</b> Nothing can equalise the
+/// two: the cost of a row is fixed by the row, an extra Argon2id verify on the bcrypt path makes
+/// it 86 ms instead of 49, and padding is the technique this type exists to avoid. The trade taken
+/// is a 12.5 ms separation on at most 17 self-clearing addresses against 17 operators who cannot
+/// sign in at all.
+/// <c>ALegacyRowsRefusalStaysWithinOneVerifyOfTheEqualisedPaths</c> pins the ratio, so a future
+/// change to the Argon2id constants that widens it fails the build instead of quietly restoring
+/// the oracle.
+/// </para>
 /// </summary>
 public static class BackOfficePasswordTiming
 {
@@ -63,6 +111,13 @@ public static class BackOfficePasswordTiming
     /// <see cref="PasswordHasher.Verify"/> refuses one before deriving. The two paths therefore
     /// still agree, which is the property this type is about - and the request validator refuses an
     /// empty password long before either.
+    /// </para>
+    /// <para>
+    /// <b><see cref="DummyHash"/> stays an Argon2id string even though the door can now read
+    /// bcrypt.</b> It has to match the cost of the branch a real account is most likely to take,
+    /// and that is Argon2id for every account this service wrote and for every legacy account after
+    /// its first sign-in. A bcrypt dummy would equalise against a set that is designed to empty
+    /// itself.
     /// </para>
     /// </summary>
     public static void SpendVerifyCost(PasswordHasher hasher, string password)

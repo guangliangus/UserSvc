@@ -4,11 +4,14 @@ using NSubstitute;
 using NSubstitute.ExceptionExtensions;
 using Shouldly;
 using UserSvc.Application.Errors;
+using UserSvc.Application.Features.BackOffice.Accounts;
 using UserSvc.Application.Features.Verification;
+using UserSvc.Application.Ports.BackOffice;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Ports.Users;
 using UserSvc.Application.Ports.Verification;
+using UserSvc.Domain.BackOffice;
 using UserSvc.Domain.Users;
 using UserSvc.Domain.Verification;
 using Xunit;
@@ -37,6 +40,15 @@ public sealed class VerificationAppServiceTests
     private readonly IRateLimiter _rateLimiter = Substitute.For<IRateLimiter>();
     private readonly IRiskControlService _riskControl = Substitute.For<IRiskControlService>();
     private readonly IUnitOfWork _unitOfWork = Substitute.For<IUnitOfWork>();
+
+    // The back-office plane, reached only by the backoffice_reset_password purpose. Its own two
+    // repositories, because the two identity planes are separate tables that must never gate each
+    // other - a consumer identity showing up here would be the bug the split exists to prevent.
+    private readonly IBackendUserRepository _backendUsers = Substitute.For<IBackendUserRepository>();
+
+    private readonly IBackendIdentityRepository _backendIdentities =
+        Substitute.For<IBackendIdentityRepository>();
+
     private readonly TestClock _clock = new(Now);
 
     private VerificationOptions _options = new();
@@ -70,6 +82,7 @@ public sealed class VerificationAppServiceTests
         _notifications,
         _rateLimiter,
         _riskControl,
+        new BackOfficeResetTargetGate(_backendUsers, _backendIdentities, TestProtector.Create()),
         TestProtector.Create(),
         _unitOfWork,
         _clock,
@@ -232,16 +245,139 @@ public sealed class VerificationAppServiceTests
         ex.StatusCode.ShouldBe(500, "reporting our own malformed payload as 502 would page the wrong team");
     }
 
+    // ------------------------------------------- the back-office reset purpose
+
     [Fact]
-    public async Task BackOfficePasswordResetSaysSoRatherThanClaimingTheAccountIsUnknown()
+    public async Task ABackOfficeResetCodeGoesOutForAnAccountThatCouldUseIt()
     {
-        var ex = await Should.ThrowAsync<AppException>(() => Sut.SendVerificationCodeAsync(
+        GivenBackOfficeAccount(BackendUserStatuses.Active);
+        _codes.CreateAsync(Arg.Any<NewVerificationCode>(), Arg.Any<CancellationToken>()).Returns(31);
+
+        var response = await Sut.SendVerificationCodeAsync(
             SendRequest(purpose: VerificationPurposes.BackOfficeResetPassword),
+            Context,
+            CancellationToken.None);
+
+        response.ExpiresAt.ShouldBe(Now + _options.CodeExpires);
+        _sent.ShouldNotBeNull();
+        _sent.Type.ShouldBe("backend_vc_reset_pwd_email");
+        _sent.IdempotencyKey.ShouldBe("email-vc:backoffice_reset_password:31");
+    }
+
+    /// <summary>
+    /// The whole point of the purpose answering uniformly: an anonymous caller must not be able to
+    /// tell a corporate address that owns an operator account from one that does not. The response
+    /// is compared field by field against the eligible case, because a difference in any of them -
+    /// a missing deadline, a different sentence - would be the same oracle wearing a hat.
+    /// </summary>
+    [Theory]
+    [InlineData(BackendUserStatuses.Disabled)]
+    [InlineData(null)]
+    public async Task ABackOfficeResetForATargetThatCannotResetAnswersExactlyAsIfACodeHadGoneOut(
+        string? status)
+    {
+        if (status is not null)
+        {
+            GivenBackOfficeAccount(status);
+        }
+
+        var response = await Sut.SendVerificationCodeAsync(
+            SendRequest(purpose: VerificationPurposes.BackOfficeResetPassword),
+            Context,
+            CancellationToken.None);
+
+        response.Message.ShouldBe("Verification code sent successfully");
+        response.ExpiresAt.ShouldBe(Now + _options.CodeExpires);
+
+        // Nothing was written, so there is no code to verify and no ticket to be minted - the
+        // refusal is real, it is only silent.
+        await _codes.DidNotReceive().CreateAsync(
+            Arg.Any<NewVerificationCode>(), Arg.Any<CancellationToken>());
+        await _notifications.DidNotReceive().SendDirectAsync(
+            Arg.Any<SendDirectRequest>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// A PENDING account is mid-onboarding and setting a password is how onboarding finishes, so it
+    /// gets a code like any other eligible account.
+    /// </summary>
+    [Fact]
+    public async Task ABackOfficeResetCodeGoesOutForAPendingAccount()
+    {
+        GivenBackOfficeAccount(BackendUserStatuses.Pending);
+
+        await Sut.SendVerificationCodeAsync(
+            SendRequest(purpose: VerificationPurposes.BackOfficeResetPassword),
+            Context,
+            CancellationToken.None);
+
+        await _codes.Received(1).CreateAsync(
+            Arg.Any<NewVerificationCode>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The uniform answer must not become a free pass. The per-IP budget and risk control run
+    /// before the lookup and are charged whichever way the verdict goes, so probing the directory
+    /// costs a prober exactly what sending a real code costs.
+    /// </summary>
+    [Fact]
+    public async Task ASilentlyRefusedBackOfficeResetStillSpendsTheBudgetAndPassesRiskControl()
+    {
+        await Sut.SendVerificationCodeAsync(
+            SendRequest(purpose: VerificationPurposes.BackOfficeResetPassword),
+            Context,
+            CancellationToken.None);
+
+        await _rateLimiter.Received(2).TryAcquireAsync(
+            "verification-send-ip",
+            Context.ClientIp,
+            Arg.Any<RateLimitPolicy>(),
+            Arg.Any<CancellationToken>());
+        await _riskControl.Received(1).EvaluateSendCodeAsync(
+            Arg.Any<SendCodeRiskContext>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The one refusal this purpose still states out loud, because it is decided by the shape of
+    /// the string and not by the directory: a phone number could never be a back-office reset
+    /// target, whether or not any account exists.
+    /// </summary>
+    [Fact]
+    public async Task ABackOfficeResetToAPhoneNumberIsRefusedOutright()
+    {
+        var ex = await Should.ThrowAsync<BadRequestException>(() => Sut.SendVerificationCodeAsync(
+            SendRequest(
+                target: "+886912345678",
+                targetType: VerificationTargetTypes.Phone,
+                purpose: VerificationPurposes.BackOfficeResetPassword),
             Context,
             CancellationToken.None));
 
-        ex.StatusCode.ShouldBe(501);
-        ex.ErrorCode.ShouldBe(ErrorCodes.NotImplemented);
+        ex.ErrorCode.ShouldBe(ErrorCodes.BadRequest);
+        ex.StatusCode.ShouldBe(400);
+
+        // It never reached the directory, which is what makes the refusal safe to state.
+        await _backendIdentities.DidNotReceive().FindActiveAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The consumer identity table must not answer a back-office question. The two planes number
+    /// their accounts independently, so a consumer row matching this address would resolve to a
+    /// different person entirely.
+    /// </summary>
+    [Fact]
+    public async Task ABackOfficeResetNeverConsultsTheConsumerIdentityTable()
+    {
+        GivenBackOfficeAccount(BackendUserStatuses.Active);
+
+        await Sut.SendVerificationCodeAsync(
+            SendRequest(purpose: VerificationPurposes.BackOfficeResetPassword),
+            Context,
+            CancellationToken.None);
+
+        await _identities.DidNotReceive().FindActiveAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 
     // ------------------------------------------------------- notification routing
@@ -598,6 +734,31 @@ public sealed class VerificationAppServiceTests
         await _codes.DidNotReceive().VerifyCodeAndIssueTicketAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(),
             Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// Puts an active email identity and its account in the back-office tables, spelled the way the
+    /// gate will look them up: normalized through the back-office rule and hashed with the same
+    /// protector the service under test holds.
+    /// </summary>
+    private void GivenBackOfficeAccount(string status)
+    {
+        var hash = TestProtector.Create().Hash(
+            BackOfficeIdentifiers.Normalize(BackendIdentityTypes.Email, Email));
+
+        _backendIdentities
+            .FindActiveAsync(BackendIdentityTypes.Email, hash, Arg.Any<CancellationToken>())
+            .Returns(new BackendIdentity
+            {
+                Id = 5,
+                UserId = 41,
+                IdentityType = BackendIdentityTypes.Email,
+                IdentifierHash = hash,
+                Status = BackendIdentityStatuses.Active,
+            });
+
+        _backendUsers.FindByIdAsync(41, Arg.Any<CancellationToken>())
+            .Returns(new BackendUser { Id = 41, Status = status, Origin = BackendUserOrigins.Internal });
     }
 
     private static SendVerificationCodeRequest SendRequest(

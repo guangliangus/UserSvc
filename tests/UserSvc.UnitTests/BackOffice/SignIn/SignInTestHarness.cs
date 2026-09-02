@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NSubstitute;
@@ -15,6 +16,48 @@ using UserSvc.Domain.BackOffice;
 using UserSvc.Domain.Tenancy;
 
 namespace UserSvc.UnitTests.BackOffice.SignIn;
+
+/// <summary>
+/// An <see cref="ILogger{TCategoryName}"/> that keeps what it was told, for the handful of
+/// assertions where the log line <i>is</i> the behaviour.
+/// <para>
+/// Most of the sign-in suite has no business reading logs, and this exists for the cases where a
+/// refusal deliberately says nothing to the caller: an account whose stored hash is in no readable
+/// format answers an ordinary 401, so the Error line is the only place that fact appears anywhere.
+/// A substitute would not do - <c>ILogger.Log</c> is generic over its state, so what a matcher
+/// could see is a <c>TState</c> and not the rendered message.
+/// </para>
+/// </summary>
+/// <typeparam name="T">The category, as the logger's consumer names it.</typeparam>
+internal sealed class RecordingLogger<T> : ILogger<T>
+{
+    private readonly List<(LogLevel Level, string Message)> _entries = [];
+
+    public IReadOnlyList<(LogLevel Level, string Message)> Entries => _entries;
+
+    /// <summary>No scopes are asserted on, so there is nothing to hand back.</summary>
+    public IDisposable? BeginScope<TState>(TState state)
+        where TState : notnull => null;
+
+    /// <summary>Everything is enabled, so a filter cannot make a test pass by hiding a line.</summary>
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        ArgumentNullException.ThrowIfNull(formatter);
+
+        _entries.Add((logLevel, formatter(state, exception)));
+    }
+
+    /// <summary>The messages logged at this level, rendered as the log sink would see them.</summary>
+    public IReadOnlyList<string> MessagesAt(LogLevel level) =>
+        [.. _entries.Where(entry => entry.Level == level).Select(entry => entry.Message)];
+}
 
 /// <summary>
 /// The sign-in slice wired up with substituted ports.
@@ -175,6 +218,10 @@ internal sealed class SignInTestHarness
 
     public PasswordHasher PasswordHasher { get; } = new();
 
+    /// <summary>What the service under test logged. See <see cref="RecordingLogger{T}"/> for why a
+    /// real recorder rather than a substitute.</summary>
+    public RecordingLogger<BackOfficeSignInAppService> Log { get; } = new();
+
     public BackOfficeSignInOptions SignInOptions { get; set; } = new() { SignInTicketKey = TicketKey };
 
     public BackOfficeAccountOptions AccountOptions { get; set; } = new();
@@ -236,7 +283,21 @@ internal sealed class SignInTestHarness
             Clock,
             Options.Create(AccountOptions),
             Options.Create(SignInOptions),
-            NullLogger<BackOfficeSignInAppService>.Instance);
+            Log);
+
+    /// <summary>
+    /// A bcrypt hash of <see cref="Password"/> in the exact shape the Go service left behind:
+    /// revision <c>2a</c>, cost 10, 60 characters - the format all 17 rows of
+    /// <c>uam.backend_users</c> carry, verified against the live database.
+    /// <para>
+    /// <b>A literal rather than a call to the bcrypt library</b>, unlike the Argon2id hashes above,
+    /// and unlike them for a reason: this string stands for data this service does not and must not
+    /// be able to produce. <c>PasswordHasher</c> writes Argon2id only, so a test that generated its
+    /// own legacy fixture would be exercising a code path the product does not have.
+    /// </para>
+    /// </summary>
+    public const string LegacyBcryptHashOfPassword =
+        "$2a$10$SD2DkXvCARawdcAG4DJll.su/y55oB9APbjU9Ka1BWCqAmPEkokgm";
 
     /// <summary>Adds an account with a password and an e-mail identity, the way the password door
     /// finds one.</summary>
@@ -263,6 +324,23 @@ internal sealed class SignInTestHarness
 
         AccountRows.Add(account);
         AddIdentity(id, BackendIdentityTypes.Email, email);
+
+        return account;
+    }
+
+    /// <summary>
+    /// The same account, except that its stored hash is the bcrypt one the Go service wrote. This
+    /// is the cutover-day starting position: a real operator, a real password, and a row this
+    /// service could not read until the legacy branch existed.
+    /// </summary>
+    public BackendUser WithLegacyBcryptPasswordAccount(
+        int id = 57,
+        string email = CorporateEmail,
+        string status = BackendUserStatuses.Active,
+        string origin = BackendUserOrigins.Internal)
+    {
+        var account = WithPasswordAccount(id, email, Password, status, origin);
+        account.PasswordHash = LegacyBcryptHashOfPassword;
 
         return account;
     }

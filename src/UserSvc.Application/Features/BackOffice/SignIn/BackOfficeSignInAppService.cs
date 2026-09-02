@@ -104,7 +104,14 @@ public sealed class BackOfficeSignInAppService(
     /// already identical; the clock was not. Measured live, an unknown mailbox came back in a
     /// median of 3.6 ms, a wrong password in 52.3 ms and an account with no local password in
     /// 6.0 ms - three states of an account, readable by anybody with a stopwatch and no credential
-    /// at all. See <see cref="BackOfficePasswordTiming"/>.
+    /// at all. See <see cref="BackOfficePasswordTiming"/>, which also records what the legacy
+    /// bcrypt branch costs relative to those.
+    /// </para>
+    /// <para>
+    /// <b>An account still carrying a bcrypt hash from the Go service signs in and is migrated by
+    /// doing so.</b> The rewrite happens after the sign-in has succeeded, not inside the verify -
+    /// see <see cref="MigrateStoredPasswordAsync"/> for why it is best effort and why it may not
+    /// fail the sign-in.
     /// </para>
     /// </summary>
     /// <exception cref="RateLimitedException">Too many failures on this mailbox, or from this
@@ -153,11 +160,23 @@ public sealed class BackOfficeSignInAppService(
             throw await RefuseCredentialAsync(budgets, request.Password, cancellationToken);
         }
 
-        await VerifyPasswordAsync(account, request.Password, budgets, requestContext, cancellationToken);
+        var storedHashIsLegacy = await VerifyPasswordAsync(
+            account, request.Password, budgets, requestContext, cancellationToken);
+
         await RequireSignInAllowedAsync(account, requestContext, password: true, cancellationToken);
         await EnforceCorporateDomainAsync(account, request.Email, requestContext, cancellationToken);
 
         var response = await FinishAsync(account, requestContext, canSave: true, cancellationToken);
+
+        // After FinishAsync and not before it: the password verified two gates ago, but the account
+        // may still have been refused as disabled or off-domain, and a refused request has no
+        // business writing to the row it refused. The credential itself is unchanged either way -
+        // only its storage encoding moves - so the migration waits for the next attempt rather than
+        // riding on a 401.
+        if (storedHashIsLegacy)
+        {
+            await MigrateStoredPasswordAsync(account, request.Password, cancellationToken);
+        }
 
         // Specification 3.2 step 7. Only the per-address budget: the per-source one counts failures
         // from an address across every mailbox it tries, and clearing it on a success would hand
@@ -595,7 +614,7 @@ public sealed class BackOfficeSignInAppService(
 
     /// <summary>
     /// Checks the password, and says so out loud when the stored value is not one this service can
-    /// read.
+    /// read. Answers whether the row that just verified is a legacy one and should be rewritten.
     /// <para>
     /// <see cref="PasswordHasher.Verify"/> answers false for a malformed stored hash exactly as it
     /// does for a wrong password, which is the right answer to give a caller and the wrong one to
@@ -603,8 +622,23 @@ public sealed class BackOfficeSignInAppService(
     /// owner ever discovers. The hasher holds no logger because it is pure computation, so this is
     /// the place that has to notice.
     /// </para>
+    /// <para>
+    /// <b>The "not an Argon2id string" log line is now about unreadable rows only.</b> It used to
+    /// fire for every bcrypt row, which was correct when there was no bcrypt branch and is wrong
+    /// now - a bcrypt row verifies. <see cref="PasswordHasher.IsReadable"/> is what separates
+    /// "a value some algorithm here can read" from "a value nothing can read", and the second is
+    /// the only one worth an Error. It is deliberately not
+    /// <see cref="PasswordHasher.Identify"/>: that answers which algorithm a value <i>names</i>,
+    /// and a damaged bcrypt row names bcrypt while being unverifiable forever.
+    /// </para>
+    /// <para>
+    /// <b>It returns a flag rather than performing the rewrite.</b> Two gates still stand between
+    /// here and a successful sign-in, and the caller is the only place that knows they passed.
+    /// </para>
     /// </summary>
-    private async Task VerifyPasswordAsync(
+    /// <returns>True when the stored hash verified through the legacy bcrypt branch, which means
+    /// the row should be rewritten with Argon2id once the sign-in has actually succeeded.</returns>
+    private async Task<bool> VerifyPasswordAsync(
         BackendUser account,
         string password,
         PasswordBudget budgets,
@@ -632,16 +666,21 @@ public sealed class BackOfficeSignInAppService(
         }
 
         var stored = account.PasswordHash!;
+        var algorithm = PasswordHasher.Identify(stored);
 
         if (!passwordHasher.Verify(password, stored))
         {
-            if (!stored.StartsWith("$argon2id$", StringComparison.Ordinal))
+            // IsReadable rather than Identify: a truncated $2a$ row, or one whose work factor is
+            // above the ceiling, still names bcrypt. Asking Identify would call it readable and say
+            // nothing, which is the same silent lockout this log line exists to break - measured
+            // against a 29-character $2a$10$ row that answered 401 with no diagnostic at all.
+            if (!PasswordHasher.IsReadable(stored))
             {
                 logger.LogError(
-                    "The stored password of back-office account {BackendUserId} is not an Argon2id "
-                    + "PHC string, so no password can ever verify against it. This row needs "
-                    + "rehashing; until then its owner is locked out and every attempt reads as a "
-                    + "wrong password.",
+                    "The stored password of back-office account {BackendUserId} is in no format "
+                    + "this service can read - neither an Argon2id PHC string nor a bcrypt hash - "
+                    + "so no password can ever verify against it. This row needs rehashing; until "
+                    + "then its owner is locked out and every attempt reads as a wrong password.",
                     account.Id);
             }
 
@@ -655,6 +694,8 @@ public sealed class BackOfficeSignInAppService(
 
             throw InvalidCredentials();
         }
+
+        return algorithm == StoredPasswordAlgorithms.Bcrypt;
     }
 
     /// <summary>
@@ -1066,6 +1107,75 @@ public sealed class BackOfficeSignInAppService(
                 + "written. The trail is missing this event.",
                 entry.Action,
                 entry.ActorUserId);
+        }
+    }
+
+    /// <summary>
+    /// Rewrites a legacy bcrypt row with Argon2id, and tolerates not being able to.
+    /// <para>
+    /// <b>The migration is the sign-in.</b> Nobody holds the plaintext of the 17 bcrypt rows the Go
+    /// service left in <c>uam.backend_users</c>, so the only moment this service ever sees one is
+    /// the instant its owner types it correctly - which is exactly here. Each successful sign-in
+    /// converts one row, the legacy set only shrinks, and no reset campaign is needed. What it
+    /// costs is one extra Argon2id hash on the first sign-in of a migrated account (measured at
+    /// 36 ms, once per account, ever).
+    /// </para>
+    /// <para>
+    /// <b>A failure here may not fail the sign-in</b>, which is the same trade
+    /// <see cref="TouchLastSeenAsync"/> makes and for a stronger reason: the operator's password
+    /// was correct, they are already signed in, and a rehash that cannot be persisted is a
+    /// migration that happens at the next sign-in rather than a failed login. Refusing the sign-in
+    /// would turn a cosmetic storage detail into the outage this whole branch exists to prevent.
+    /// </para>
+    /// <para>
+    /// <b>It writes through the repository's single-column statement rather than through the
+    /// tracked entity.</b> The audit repository saves the whole change tracker whenever it appends
+    /// a row, so a tracked <c>PasswordHash</c> would be flushed by whichever audit write came next
+    /// and its failure would be reported as a missing audit row. One statement, written here,
+    /// fails as itself.
+    /// </para>
+    /// <para>
+    /// <b>The token version is deliberately left alone.</b> Bumping it is how a password
+    /// <i>change</i> invalidates outstanding tokens; this is not a change. The credential is the
+    /// same secret, and logging the operator straight back out of the session they have just
+    /// created would be indistinguishable from the bug this fixes.
+    /// </para>
+    /// </summary>
+    private async Task MigrateStoredPasswordAsync(
+        BackendUser account, string password, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var rehashed = passwordHasher.Hash(password);
+
+            if (await users.UpdatePasswordHashAsync(
+                    account.Id, rehashed, SystemActor, cancellationToken))
+            {
+                logger.LogInformation(
+                    "Migrated the legacy password hash of back-office account {BackendUserId} to "
+                    + "{Algorithm} after a successful sign-in.",
+                    account.Id,
+                    PasswordHasher.AlgorithmName);
+            }
+            else
+            {
+                // The row was read moments ago, so this means somebody deleted the account between
+                // the verify and here. Warning rather than Error: the sign-in stands, and the next
+                // request on this account will fail for the real reason.
+                logger.LogWarning(
+                    "The legacy password hash of back-office account {BackendUserId} could not be "
+                    + "migrated because no row matched.",
+                    account.Id);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(
+                ex,
+                "Could not migrate the legacy password hash of back-office account "
+                + "{BackendUserId}. The sign-in itself stands, and the migration lands at the next "
+                + "successful sign-in.",
+                account.Id);
         }
     }
 

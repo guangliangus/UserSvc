@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using UserSvc.Application.Errors;
+using UserSvc.Application.Features.BackOffice.Accounts;
 using UserSvc.Application.Features.Registration;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Platform;
@@ -26,7 +27,7 @@ namespace UserSvc.Application.Features.Verification;
 /// tell them whether an address exists. Only then does anything touch the database.
 /// </para>
 /// <para>
-/// <b>The purpose preconditions are an enumeration oracle and are known to be one.</b>
+/// <b>Two of the purpose preconditions are an enumeration oracle and are known to be one.</b>
 /// <c>reset_password</c> answers <c>UNREGISTERED</c> for an address nobody has registered and
 /// <c>bind</c> answers <c>IDENTITY_ALREADY_BOUND</c> for one that is taken, so a patient caller can
 /// map the user base one address at a time. They are kept because they are the contract the mobile
@@ -36,6 +37,16 @@ namespace UserSvc.Application.Features.Verification;
 /// uniform "if that address is registered, a code is on its way" answer across every flow that
 /// takes an address - a contract change for every client, tracked separately.
 /// </para>
+/// <para>
+/// <b><c>backoffice_reset_password</c> is deliberately not the third one.</b> It is the newest of
+/// the purposes, it has no client branching on it yet, and the plane it asks about is the operator
+/// directory rather than the customer base - so it answers the uniform sentence instead: a target
+/// with no back-office account, or one whose account is disabled, gets the same 200 and the same
+/// <see cref="SentMessage"/> as an eligible one, and no code is issued or mailed. The reasoning,
+/// and the two channels that still separate the cases (elapsed time, and a notification outage
+/// turning an eligible target into a 502), are in
+/// <see cref="BackOfficeResetTargetGate"/> and in docs/architecture.md.
+/// </para>
 /// </summary>
 public sealed class VerificationAppService(
     IVerificationCodeRepository codes,
@@ -43,6 +54,7 @@ public sealed class VerificationAppService(
     INotificationClient notifications,
     IRateLimiter rateLimiter,
     IRiskControlService riskControl,
+    BackOfficeResetTargetGate backOfficeResetTargets,
     IdentifierProtector protector,
     IUnitOfWork unitOfWork,
     IClock clock,
@@ -101,7 +113,20 @@ public sealed class VerificationAppService(
         await ChargeSendBudgetAsync(context, cancellationToken);
         VerificationRequestRules.Validate(request);
         await ApplyRiskControlAsync(request, context, cancellationToken);
-        await EnsureTargetSuitsPurposeAsync(request, cancellationToken);
+
+        if (await EnsureTargetSuitsPurposeAsync(request, cancellationToken) == SendVerdict.AnswerAsIfIssued)
+        {
+            // The uniform answer: byte-identical to a real one, including a deadline the client can
+            // count down, because a response that differed in any field would be the oracle this
+            // branch exists to close. Nothing is written and nothing is mailed - the budget and the
+            // risk-control counters above have already been charged, so probing still costs the
+            // caller what a real send costs.
+            return new SendVerificationCodeResponse
+            {
+                Message = SentMessage,
+                ExpiresAt = clock.UtcNow + _options.CodeExpires,
+            };
+        }
 
         var code = GenerateCode();
 
@@ -316,6 +341,21 @@ public sealed class VerificationAppService(
     }
 
     /// <summary>
+    /// What the purpose precondition decided. A third state beside "proceed" and "throw", because
+    /// one purpose refuses a target <b>without saying so</b>: the caller is told the same thing a
+    /// successful send tells them, and this is how the send path learns to skip the work while
+    /// still answering that way.
+    /// </summary>
+    private enum SendVerdict
+    {
+        /// <summary>Issue a code and deliver it.</summary>
+        Issue = 0,
+
+        /// <summary>Issue nothing, deliver nothing, and answer exactly as if both had happened.</summary>
+        AnswerAsIfIssued = 1,
+    }
+
+    /// <summary>
     /// Each purpose owns its precondition, and the two identity planes are physically separate
     /// tables that must never gate each other.
     /// <para>
@@ -323,8 +363,12 @@ public sealed class VerificationAppService(
     /// time we cannot know whether the target is supposed to exist - and refusing an unknown target
     /// would break registration.
     /// </para>
+    /// <para>
+    /// Two of them refuse out loud and one refuses silently; which is which, and why, is the class
+    /// remarks' second and third paragraphs.
+    /// </para>
     /// </summary>
-    private async Task EnsureTargetSuitsPurposeAsync(
+    private async Task<SendVerdict> EnsureTargetSuitsPurposeAsync(
         SendVerificationCodeRequest request,
         CancellationToken cancellationToken)
     {
@@ -332,7 +376,7 @@ public sealed class VerificationAppService(
         {
             case VerificationPurposes.Auth:
             case VerificationPurposes.BackOfficeAuth:
-                return;
+                return SendVerdict.Issue;
 
             case VerificationPurposes.ResetPassword:
                 if (await FindIdentityAsync(request, cancellationToken) is null)
@@ -342,7 +386,7 @@ public sealed class VerificationAppService(
                         "That email address or phone number is not registered.");
                 }
 
-                return;
+                return SendVerdict.Issue;
 
             case VerificationPurposes.Bind:
                 if (await FindIdentityAsync(request, cancellationToken) is not null)
@@ -352,23 +396,54 @@ public sealed class VerificationAppService(
                         "That email address or phone number is already linked to an account.");
                 }
 
-                return;
+                return SendVerdict.Issue;
 
-            // The back-office plane lives in tables this service has not ported yet. 501 is the
-            // honest answer: the request is well formed and the purpose is part of the contract,
-            // but nothing here can gate it, and answering UNREGISTERED would tell a back-office
-            // user their account does not exist when the truth is that we cannot look.
             case VerificationPurposes.BackOfficeResetPassword:
-                throw new AppException(
-                    ErrorCodes.NotImplemented,
-                    "Back-office password reset is not available yet.",
-                    501);
+                return await DecideBackOfficeResetAsync(request, cancellationToken);
 
             default:
                 throw new BadRequestException(
                     ErrorCodes.BadRequest,
                     "The verification purpose is not one this service issues codes for.");
         }
+    }
+
+    /// <summary>
+    /// The back-office plane's precondition: the same gate the reset submission runs, asked in the
+    /// form that does not answer the caller.
+    /// <para>
+    /// A target that could not complete a reset gets <see cref="SendVerdict.AnswerAsIfIssued"/>
+    /// rather than <c>UNREGISTERED</c> or <c>ACCOUNT_DISABLED</c> - see
+    /// <see cref="BackOfficeResetTargetGate"/> for why this plane in particular must not answer
+    /// that question to a stranger. A target that is not an address at all is still refused
+    /// outright by the gate, because that verdict comes from the string rather than from the
+    /// directory.
+    /// </para>
+    /// <para>
+    /// <b>The log line is the only trace, and it is the point.</b> Silence towards the caller means
+    /// support has nothing to go on when an operator reports that no mail arrived, so the masked
+    /// address and the reason are recorded here - at Information, because a mistyped address is a
+    /// normal event and a stream of warnings would train people to ignore it.
+    /// </para>
+    /// </summary>
+    private async Task<SendVerdict> DecideBackOfficeResetAsync(
+        SendVerificationCodeRequest request,
+        CancellationToken cancellationToken)
+    {
+        var verdict = await backOfficeResetTargets.EvaluateAsync(request.Target, cancellationToken);
+
+        if (verdict.Eligibility == BackOfficeResetEligibility.Eligible)
+        {
+            return SendVerdict.Issue;
+        }
+
+        logger.LogInformation(
+            "A back-office password reset was requested for {MaskedTarget}, which is {Eligibility}. "
+            + "No code was sent and the caller was told the same thing an eligible address is told.",
+            verdict.MaskedTarget,
+            verdict.Eligibility);
+
+        return SendVerdict.AnswerAsIfIssued;
     }
 
     /// <summary>

@@ -33,7 +33,6 @@ public sealed class VerificationController(VerificationAppService verification) 
     /// <response code="403">A verification challenge has to be completed before this will be accepted.</response>
     /// <response code="409">The target is already linked to an account (bind only).</response>
     /// <response code="429">The per-IP budget or the per-target cooldown is spent; see <c>Retry-After</c>.</response>
-    /// <response code="501">The purpose is part of the contract but its identity plane is not ported yet.</response>
     /// <response code="502">The notification service could not be reached.</response>
     [HttpPost("send")]
     [ProducesResponseType<SendVerificationCodeResponse>(StatusCodes.Status200OK)]
@@ -41,7 +40,6 @@ public sealed class VerificationController(VerificationAppService verification) 
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
     [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType(StatusCodes.Status501NotImplemented)]
     [ProducesResponseType(StatusCodes.Status502BadGateway)]
     public Task<SendVerificationCodeResponse> Send(
         SendVerificationCodeRequest request,

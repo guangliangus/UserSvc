@@ -26,6 +26,23 @@ public sealed class BackOfficeAccountOptions
     public int DefaultPageSize { get; set; } = 20;
 
     /// <summary>
+    /// Self-service password resets one source address may submit per minute.
+    /// <para>
+    /// Sized for a shared egress address rather than for one person, exactly like the send-code
+    /// budget in front of this flow: nothing in this host trusts a forwarded-headers hop, so behind
+    /// a gateway this counter counts the gateway. A tight number here would not throttle an
+    /// attacker, it would cap how many operators can reset a password at all.
+    /// </para>
+    /// </summary>
+    [Range(1, 100_000)]
+    public int PasswordResetPerSourcePerMinute { get; set; } = 100;
+
+    /// <summary>Self-service password resets one source address may submit per hour, for the slow
+    /// flood the per-minute budget never notices.</summary>
+    [Range(1, 1_000_000)]
+    public int PasswordResetPerSourcePerHour { get; set; } = 500;
+
+    /// <summary>
     /// Where the back office signs in, sent as the <c>login_path</c> variable of every credential
     /// e-mail.
     /// <para>
