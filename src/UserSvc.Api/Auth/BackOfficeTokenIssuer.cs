@@ -254,6 +254,17 @@ public sealed class BackOfficeTokenIssuer(
 
         var deviceId = (string?)request.GetParameter(Parameters.DeviceId) ?? string.Empty;
 
+        // Checked here rather than beside the session insert below, which is where it reads
+        // naturally: everything from the authorization row onwards writes, and refusing after the
+        // write would leave one orphaned ad-hoc authorization per malformed request - a table any
+        // holder of one ticket could grow, cleared only by the pruning job.
+        if (!grant.IsPreTenant && string.IsNullOrWhiteSpace(deviceId))
+        {
+            return BackOfficeTokenResult.Rejected(
+                OpenIddictConstants.Errors.InvalidRequest,
+                $"'{Parameters.DeviceId}' is required for a full back-office token.");
+        }
+
         if (grant.IsPreTenant)
         {
             identity.SetScopes(BackOfficeScopes.PreTenant);
@@ -289,13 +300,6 @@ public sealed class BackOfficeTokenIssuer(
 
         if (!grant.IsPreTenant)
         {
-            if (string.IsNullOrWhiteSpace(deviceId))
-            {
-                return BackOfficeTokenResult.Rejected(
-                    OpenIddictConstants.Errors.InvalidRequest,
-                    $"'{Parameters.DeviceId}' is required for a full back-office token.");
-            }
-
             var sessionId = Guid.CreateVersion7().ToString("n");
             identity.SetClaim(AuthenticationSchemes.SessionIdClaimType, sessionId);
 

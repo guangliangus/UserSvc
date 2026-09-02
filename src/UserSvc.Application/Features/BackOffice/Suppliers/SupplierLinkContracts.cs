@@ -70,10 +70,11 @@ public sealed record UpdateSupplierLinkRequest
 /// <summary>
 /// The permission points the mounting endpoints require.
 /// <para>
-/// Both are seeded against the "approved suppliers" menu, whose audience is the platform, so in
-/// practice only a platform role carries them. The gate is still the permission code and not the
-/// caller's acting context: a whole-dimension operator legitimately holds it, and the code is the
-/// one thing that says so.
+/// Both are seeded against the "approved suppliers" menu, whose audience is the platform. That is
+/// the intended holder and <b>not</b> a guarantee: the menu-audience rule is switched off across
+/// this service, so a tenant-owned role can be granted this menu and these codes. Holding one is
+/// therefore necessary and not sufficient - the service also refuses a session acting as a single
+/// company or supplier.
 /// </para>
 /// </summary>
 public static class SupplierLinkPermissions

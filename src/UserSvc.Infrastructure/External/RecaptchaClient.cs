@@ -282,7 +282,9 @@ public sealed class RecaptchaClient(
         "bad-request",
     ];
 
-    private const string NotConfiguredMessage = "Captcha verification is not available on this deployment.";
+    private const string NotConfiguredMessage =
+        "Captcha verification is not configured on this deployment: a Recaptcha secret "
+        + "(Recaptcha:Secret, or one of Recaptcha:SecretWeb / SecretAndroid / SecretIos) must be supplied.";
 
     private const string UpstreamUnavailableMessage =
         "The verification challenge could not be checked because the provider is unavailable.";
@@ -312,9 +314,13 @@ public sealed class RecaptchaClient(
                 request.Platform,
                 RecaptchaOptions.SectionName);
 
-            // 500, not 502: nothing upstream failed, because nothing upstream was asked. Calling it
-            // a bad gateway would point the investigation at an innocent third party.
-            throw new AppException(ErrorCodes.InternalError, NotConfiguredMessage, 500);
+            // 500 NOT_CONFIGURED, not INTERNAL_ERROR: nothing upstream failed (nothing upstream was
+            // asked, so it is not a 502 either) and this is our missing secret rather than a code
+            // defect. NOT_CONFIGURED with the section named in the detail is the contract every
+            // other optional capability answers with (see ErrorCodes.NotConfigured and the failure-
+            // isolation rule in docs/architecture.md) - it points the operator at the key store
+            // instead of at the source, which INTERNAL_ERROR does not.
+            throw new AppException(ErrorCodes.NotConfigured, NotConfiguredMessage, 500);
         }
 
         var payload = await PostAsync(secret, request, cancellationToken).ConfigureAwait(false);

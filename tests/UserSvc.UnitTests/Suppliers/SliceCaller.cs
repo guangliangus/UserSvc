@@ -37,4 +37,14 @@ internal sealed class SliceCaller : IBackOfficeCaller
 
     /// <summary>A caller whose face carries nothing at all - the fail-closed default.</summary>
     public static SliceCaller HoldingNothing() => new();
+
+    /// <summary>A caller acting as one company, holding these permission codes - the shape a
+    /// company administrator can grant themselves while the menu audience rule is off.</summary>
+    public static SliceCaller InCompanyContext(string companyCode, params string[] permissions) => new()
+    {
+        ActType = ActTypes.Company,
+        ActCode = companyCode,
+        ActDim = TenantTypes.Company,
+        Authz = new EffectiveAuthz([], permissions, [], new Dictionary<string, ScopeClaim>(StringComparer.Ordinal)),
+    };
 }

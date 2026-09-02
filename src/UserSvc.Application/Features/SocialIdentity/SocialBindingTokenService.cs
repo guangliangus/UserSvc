@@ -33,14 +33,19 @@ public sealed class SocialBindingTokenService(IOptions<SocialIdentityOptions> op
 {
     private const string Context = "usersvc/firebase-binding/v1";
 
-    private readonly byte[] _key = Convert.FromHexString(options.Value.SigningKey);
-    private readonly TimeSpan _lifetime = options.Value.BindingTokenLifetime;
+    // Read at the point of use, NOT in a field initializer - see the identical note in
+    // OAuthStateService. IOptions<T>.Value runs DataAnnotations validation, so an eager read made
+    // this type throw merely by being constructed, and it is a constructor dependency of
+    // SocialIdentityAppService, so it took down unbind too. Lazy defers it; Value caches after first.
+    private readonly Lazy<byte[]> _key = new(() => Convert.FromHexString(options.Value.SigningKey));
+
+    private TimeSpan Lifetime => options.Value.BindingTokenLifetime;
 
     public string Issue(FirebaseBindingProposal proposal)
     {
         ArgumentNullException.ThrowIfNull(proposal);
 
-        var payload = proposal with { ExpiresAt = (clock.UtcNow + _lifetime).ToUnixTimeSeconds() };
+        var payload = proposal with { ExpiresAt = (clock.UtcNow + Lifetime).ToUnixTimeSeconds() };
         var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, SocialJson.Default.FirebaseBindingProposal);
 
         return Base64Url.EncodeToString(bytes) + "." + Base64Url.EncodeToString(Sign(bytes));
@@ -106,7 +111,7 @@ public sealed class SocialBindingTokenService(IOptions<SocialIdentityOptions> op
         Encoding.ASCII.GetBytes(Context, buffer);
         payload.CopyTo(buffer, Context.Length);
 
-        return HMACSHA256.HashData(_key, buffer);
+        return HMACSHA256.HashData(_key.Value, buffer);
     }
 
     private static UnauthorizedException Invalid() => new(

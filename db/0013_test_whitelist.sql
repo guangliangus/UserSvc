@@ -1,5 +1,5 @@
 -- =============================================================================
--- 00NN · identity.test_whitelist_users: the consumer accounts allowed to additionally see, and
+-- 0013 · identity.test_whitelist_users: the consumer accounts allowed to additionally see, and
 --        order, the test company's tour products. Plus the back-office menu row for the page that
 --        maintains it.
 --
@@ -90,6 +90,18 @@ CREATE INDEX IF NOT EXISTS ix_test_whitelist_users_user_id
 -- ON CONFLICT names the columns rather than the constraint, because uk_menus_code is a unique INDEX
 -- in this schema and not a table constraint - ON CONFLICT ON CONSTRAINT would not resolve it.
 -- -----------------------------------------------------------------------------
+-- The prerequisite, asserted rather than assumed. The insert below is an INSERT ... SELECT over the
+-- parent row, so without db/0007_iam_seed.sql it quietly writes NOTHING: no menu row, no error, and
+-- a maintenance page that never appears for the one person it is for. Fail loudly instead.
+--
+-- Written as DO with a plain string body rather than dollar quoting, because this script is also
+-- applied statement-by-statement by the integration harness.
+DO 'BEGIN
+    IF NOT EXISTS (SELECT 1 FROM iam.menus WHERE code = ''system'' AND parent_id IS NULL) THEN
+        RAISE EXCEPTION ''db/0013 needs the seeded top-level ''''system'''' menu: run db/0005_iam_rbac.sql and db/0007_iam_seed.sql first'';
+    END IF;
+END';
+
 INSERT INTO iam.menus (code, parent_id, name, path, icon, sort_order, audience, status, created_by, updated_by)
 SELECT 'system-test-whitelist',
        parent.id,

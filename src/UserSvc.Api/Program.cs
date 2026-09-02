@@ -81,6 +81,18 @@ builder.Services.AddOptions<VerificationOptions>()
 builder.Services.AddOptions<BackOfficeAccountOptions>()
     .Bind(builder.Configuration.GetSection(BackOfficeAccountOptions.SectionName));
 
+// Bound, and deliberately WITHOUT ValidateOnStart: the one value with no working default -
+// BackOfficeSignIn:SignInTicketKey - is checked at the point of use, so a deployment with no back
+// office refuses the two sign-in endpoints and boots everything else. ValidateDataAnnotations
+// stays, because the ranges below it are read only on those same paths: a bad lifetime fails
+// back-office sign-in and nothing that consumer sign-in, sessions or the device grant depend on.
+// Without this Bind the section is unreachable - IOptions hands out the defaults, SignInTicketKey
+// is empty, and every back-office sign-in answers 500 NOT_CONFIGURED no matter what the
+// environment supplies.
+builder.Services.AddOptions<BackOfficeSignInOptions>()
+    .Bind(builder.Configuration.GetSection(BackOfficeSignInOptions.SectionName))
+    .ValidateDataAnnotations();
+
 // ---------------------------------------------------------------- Infrastructure (ports -> adapters)
 builder.Services.AddUserSvcInfrastructure(builder.Configuration);
 

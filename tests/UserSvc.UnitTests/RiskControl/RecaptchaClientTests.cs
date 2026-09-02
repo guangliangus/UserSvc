@@ -75,7 +75,10 @@ public sealed class RecaptchaClientTests
     /// The typed failure a deployment without a Google account gets. It is a 500 rather than a 502
     /// because nothing upstream failed - nothing upstream was asked - and it is thrown here, at the
     /// one endpoint that needs a provider, rather than at startup where it would take the whole
-    /// service down over a capability almost nothing uses.
+    /// service down over a capability almost nothing uses. The code is <see cref="ErrorCodes.NotConfigured"/>
+    /// and not <see cref="ErrorCodes.InternalError"/>: this is a missing secret, so the response
+    /// must point the operator at the key store rather than at the source, exactly as every other
+    /// optional capability does (docs/architecture.md, "a missing capability may only break itself").
     /// </summary>
     [Fact]
     public async Task WithNoSecretAnAssessmentFailsTypedRatherThanQuietlyPassing()
@@ -85,7 +88,8 @@ public sealed class RecaptchaClientTests
         var ex = await Should.ThrowAsync<AppException>(() => client.AssessAsync(Request, CancellationToken.None));
 
         ex.StatusCode.ShouldBe(500);
-        ex.ErrorCode.ShouldBe(ErrorCodes.InternalError);
+        ex.ErrorCode.ShouldBe(ErrorCodes.NotConfigured);
+        ex.Message.ShouldContain("Recaptcha");
     }
 
     [Fact]

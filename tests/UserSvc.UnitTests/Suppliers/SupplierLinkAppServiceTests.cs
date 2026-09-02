@@ -125,6 +125,42 @@ public sealed class SupplierLinkAppServiceTests
     }
 
     [Fact]
+    public async Task ListRefusesASingleTenantSessionEvenWhenItHoldsTheReadPermission()
+    {
+        // The permission points sit on a platform-audience menu, but the audience rule that would
+        // keep that menu off a company-owned role is off service-wide - so a company administrator
+        // can grant themselves this code. The answer here spans tenants and has no per-tenant
+        // narrowing to fall back on, so the acting context has to be part of the gate.
+        var caller = SliceCaller.InCompanyContext("C9", SupplierLinkPermissions.Read);
+
+        await Should.ThrowAsync<ForbiddenException>(
+            Sut.ListAsync(caller, ["S1"], null, CancellationToken.None));
+
+        await _links.DidNotReceive().ListActiveBySuppliersAsync(
+            Arg.Any<IReadOnlyList<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpdateRefusesASingleTenantSessionEvenWhenItHoldsTheManagePermission()
+    {
+        // Worse than the read: with the manage point a company session could mount another
+        // company's supplier onto its own, which hands its own members data scope over that
+        // supplier downstream.
+        var caller = SliceCaller.InCompanyContext("C9", SupplierLinkPermissions.Manage);
+        MasterData();
+
+        await Should.ThrowAsync<ForbiddenException>(
+            Sut.UpdateLinkAsync(
+                caller, "S1", new UpdateSupplierLinkRequest { CompanyCode = "C9" }, CancellationToken.None));
+
+        _added.ShouldBeEmpty();
+        await _masterData.DidNotReceive().ValidateAsync(
+            Arg.Any<IReadOnlyCollection<string>>(),
+            Arg.Any<IReadOnlyCollection<string>>(),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task ListWithNeitherFilterAnswersEmptyRatherThanEveryMountingOnThePlatform()
     {
         var response = await Sut.ListAsync(Caller(), [], "  ", CancellationToken.None);
@@ -170,6 +206,21 @@ public sealed class SupplierLinkAppServiceTests
 
         // Grouped rather than overwritten: keying one member per tenant code would silently keep
         // only the last administrator.
+        response.Items[0].Admins.Select(admin => admin.UserId).ShouldBe([11, 12]);
+        response.Items[0].Admin!.UserId.ShouldBe(11);
+    }
+
+    [Fact]
+    public async Task TheLegacyFirstAdministratorDoesNotDependOnWhatOrderTheDatabaseReturned()
+    {
+        // The port does not order, so a row order is not something this response may inherit: the
+        // Admin field is Admins[0], and it must name the same person on the next page load.
+        _members.FindAdminsByTenantsAsync(
+                TenantTypes.Supplier, Arg.Any<IReadOnlyCollection<string>>(), Arg.Any<CancellationToken>())
+            .Returns([Admin(12, "S1"), Admin(11, "S1")]);
+
+        var response = await Sut.ListAsync(Caller(), ["S1"], null, CancellationToken.None);
+
         response.Items[0].Admins.Select(admin => admin.UserId).ShouldBe([11, 12]);
         response.Items[0].Admin!.UserId.ShouldBe(11);
     }

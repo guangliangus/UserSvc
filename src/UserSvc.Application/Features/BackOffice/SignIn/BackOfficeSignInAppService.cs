@@ -585,6 +585,22 @@ public sealed class BackOfficeSignInAppService(
         }
     }
 
+    /// <summary>
+    /// Whether this account may hold a session at all, on either door.
+    /// <para>
+    /// <b>Both doors run the same gate, and both audit the refusal.</b> The service being replaced
+    /// checked only DISABLED on the one-time-password path and wrote no row for it - but a blocked
+    /// staff member still presenting a valid corporate code is exactly the event an operator wants
+    /// to find, and it cannot be used to flood the table: the code was verified upstream before
+    /// this runs, so an attacker cannot produce a row without a working credential. The status
+    /// codes stay different per door, which is the asymmetry the specification does state.
+    /// </para>
+    /// <para>
+    /// PENDING passes here on both doors on purpose. What refuses a PENDING account is not this
+    /// gate but the decision tree, which hands it a session with no authority so onboarding can
+    /// finish - locking it out of the door it was told to use would be the older, worse behaviour.
+    /// </para>
+    /// </summary>
     private async Task RequireSignInAllowedAsync(
         BackendUser account,
         BackOfficeSignInContext requestContext,
@@ -738,6 +754,14 @@ public sealed class BackOfficeSignInAppService(
     /// <summary>
     /// Records a refusal, with the reason and nothing else - see
     /// <see cref="BackOfficeSignInFailureReasons"/> for why the credential itself never appears.
+    /// <para>
+    /// <b>The tenant columns are left empty rather than stamped "platform".</b> A refused sign-in
+    /// happened before any context existed, so it belongs to no tenant at all - which is the same
+    /// answer <see cref="WriteSignInAsync"/> writes for a platform, whole-dimension or
+    /// no-authority arrival. Stamping the literal would put failed sign-ins into the result of
+    /// every "what happened at platform level" query, beside the administrative actions that are
+    /// genuinely scoped there.
+    /// </para>
     /// </summary>
     private Task WriteFailureAsync(
         BackendUser account,
@@ -750,7 +774,7 @@ public sealed class BackOfficeSignInAppService(
                 ActorUserId = account.Id,
                 ActorName = Accounts.BackOfficeNames.DisplayName(
                     account.FirstName, account.LastName, account.Nickname),
-                TenantType = Domain.Iam.IamAuditTenantTypes.Platform,
+                TenantType = string.Empty,
                 TenantCode = string.Empty,
                 Action = BackOfficeSignInAuditActions.SignInFailed,
                 TargetType = Domain.Iam.IamAuditTargetTypes.User,

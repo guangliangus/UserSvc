@@ -326,18 +326,40 @@ public static class DependencyInjection
     }
 
     /// <summary>
-    /// The two directories that read master data owned by another service. Both ship as refusing
-    /// placeholders - see <see cref="UnavailableTenantMasterDataDirectory"/> and
-    /// <see cref="UnavailableSupplierCompanyLinkDirectory"/> for what each refusal costs and why
-    /// the two refuse in different shapes. Replacing these two lines is the whole cutover.
+    /// The two directories that answer "what does the platform say about this tenant". One is real
+    /// now and one is not, and the asymmetry is the whole content of this method.
+    /// <para>
+    /// The supplier-to-company mountings live in <b>this</b> service's own table, so the second
+    /// registration is the real adapter. It replaced
+    /// <see cref="UnavailableSupplierCompanyLinkDirectory"/>, which answered "no mountings" to
+    /// everything because the table did not exist yet; that class is now unreferenced here and is
+    /// kept only for the test that pins what a fail-quiet placeholder must look like.
+    /// </para>
+    /// <para>
+    /// The company and supplier registers are somebody else's tables, so the first registration is
+    /// still <see cref="UnavailableTenantMasterDataDirectory"/> - the last refusing placeholder in
+    /// the service. It answers null, which every caller reads as "not reached" and falls open on;
+    /// see that class for why a throw would be the wrong shape. Replacing that <b>one</b> line is
+    /// the remaining cutover.
+    /// </para>
     /// </summary>
     private static void AddTenantMasterData(IServiceCollection services)
     {
         services.AddSingleton<ITenantMasterDataDirectory, UnavailableTenantMasterDataDirectory>();
-        // Was UnavailableSupplierCompanyLinkDirectory, which answered "no mountings" to everything
-        // because the table did not exist. It does now, so this is the real adapter - and it is
-        // SCOPED, not singleton: it reads the request's own DbContext, and a singleton over a
-        // scoped context is the classic way to capture a disposed one.
+
+        // The real adapter, and SCOPED rather than singleton: it reads the request's own DbContext,
+        // and a singleton over a scoped context is the classic way to capture a disposed one. It is
+        // the same instance the supplier-link endpoints resolve, so both halves of the table agree
+        // about which rows count as a mounting.
+        //
+        // Its reads are on the shared DbContext, which is what bounds the blast radius of this
+        // cutover: the tenant-context resolution that crosses it already reads that context several
+        // times over, so this adds no failure source the caller did not already have. The one new
+        // way to break it is deployment order - code released before db/0012 is applied answers
+        // 'relation does not exist' on every company or supplier context resolution, taking the
+        // whole authority face down. DDL first, then code (decision 14); that ordering is the
+        // guard, and deliberately not a catch here, because swallowing that error would silently
+        // narrow every scope envelope in the service instead.
         services.AddScoped<ISupplierCompanyLinkDirectory>(
             provider => provider.GetRequiredService<SupplierCompanyLinkRepository>());
     }

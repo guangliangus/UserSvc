@@ -84,6 +84,30 @@ public sealed class BackOfficePasswordSignInTests
     }
 
     /// <summary>
+    /// A refused sign-in belongs to no tenant, so its audit row states none - not the literal
+    /// "platform", which would drop failed sign-ins into every query for platform-scoped
+    /// administrative actions.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedSignInIsAuditedAgainstNoTenant()
+    {
+        _harness.WithPasswordAccount();
+
+        await Should.ThrowAsync<UnauthorizedException>(() =>
+            _harness.Sut.SignInWithPasswordAsync(
+                Request(password: "not-the-password"),
+                BackOfficeSignInContext.None,
+                CancellationToken.None));
+
+        await _harness.AuditLog.Received(1).AppendAsync(
+            Arg.Is<UserSvc.Domain.Iam.IamAuditLog>(entry =>
+                entry.Action == BackOfficeSignInAuditActions.SignInFailed
+                && entry.TenantType == string.Empty
+                && entry.TenantCode == string.Empty),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
     /// An account provisioned through the staff directory has no local password. It is refused as
     /// invalid credentials rather than with a code of its own, which would tell an anonymous caller
     /// which door to use for any address they can guess.

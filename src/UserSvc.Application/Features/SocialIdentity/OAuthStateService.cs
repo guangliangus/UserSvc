@@ -37,8 +37,16 @@ public sealed class OAuthStateService(IOptions<SocialIdentityOptions> options, I
     /// </summary>
     private const string Context = "usersvc/oauth-state/v1";
 
-    private readonly byte[] _key = Convert.FromHexString(options.Value.SigningKey);
-    private readonly TimeSpan _lifetime = options.Value.StateLifetime;
+    // Read at the point of use, NOT in a field initializer. IOptions<T>.Value is what runs the
+    // DataAnnotations validation, so binding it into a constructor-time field makes this type throw
+    // OptionsValidationException merely by being CONSTRUCTED - and this service is a constructor
+    // dependency of SocialIdentityAppService, so an eager read here took down every social endpoint
+    // including unbind, which needs no signing key at all (docs/architecture.md, "a missing
+    // capability may only break itself", the constructor-.Value way). Lazy keeps the read-once cost;
+    // Value caches after the first read, so this is free thereafter.
+    private readonly Lazy<byte[]> _key = new(() => Convert.FromHexString(options.Value.SigningKey));
+
+    private TimeSpan Lifetime => options.Value.StateLifetime;
 
     /// <summary>
     /// Issue a state for a flow that is about to leave for the provider.
@@ -56,7 +64,7 @@ public sealed class OAuthStateService(IOptions<SocialIdentityOptions> options, I
             Nonce = Guid.NewGuid().ToString("n"),
             DeviceId = deviceId ?? string.Empty,
             IssuedAt = issuedAt.ToUnixTimeSeconds(),
-            ExpiresAt = (issuedAt + _lifetime).ToUnixTimeSeconds(),
+            ExpiresAt = (issuedAt + Lifetime).ToUnixTimeSeconds(),
         };
 
         var payloadBytes = JsonSerializer.SerializeToUtf8Bytes(payload, SocialJson.Default.StatePayload);
@@ -141,7 +149,7 @@ public sealed class OAuthStateService(IOptions<SocialIdentityOptions> options, I
         Encoding.ASCII.GetBytes(Context, buffer);
         payload.CopyTo(buffer, Context.Length);
 
-        return HMACSHA256.HashData(_key, buffer);
+        return HMACSHA256.HashData(_key.Value, buffer);
     }
 
     private static BadRequestException Invalid() => new(

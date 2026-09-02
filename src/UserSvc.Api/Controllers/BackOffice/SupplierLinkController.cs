@@ -15,10 +15,13 @@ namespace UserSvc.Api.Controllers.BackOffice;
 /// request rather than at the holder's next sign-in.
 /// </para>
 /// <para>
-/// Both points are seeded against the platform-audience "approved suppliers" menu, so in practice
-/// only a platform role carries them. The gate is still the code and not the caller's acting
-/// context - a whole-dimension operator legitimately holds it, and the code is the one thing that
-/// says so.
+/// <b>Two things gate every route here</b>, not one. The permission code is the first, and the
+/// caller's acting context is the second: a session acting as one company or one supplier is
+/// refused whatever codes it holds. Both points are seeded against the platform-audience "approved
+/// suppliers" menu, but the audience rule that would keep that menu off a tenant-owned role is
+/// switched off service-wide, so the code alone does not establish that the holder is on the
+/// platform plane. PLATFORM and GLOBAL pass - a whole-dimension operator legitimately administers
+/// mountings across their dimension.
 /// </para>
 /// </summary>
 [ApiController]

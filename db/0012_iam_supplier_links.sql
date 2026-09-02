@@ -1,5 +1,5 @@
 -- =============================================================================
--- 00NN · iam.supplier_company_links: which approved suppliers hang off which company.
+-- 0012 · iam.supplier_company_links: which approved suppliers hang off which company.
 --
 -- Run by hand (decision 14): DDL first, code second. Idempotent and re-runnable.
 -- Column order, types, constraint names and index names are byte-matched to what
@@ -16,8 +16,14 @@
 -- deliberate difference: created_by / updated_by are NOT NULL DEFAULT '' here, where the Go table
 -- leaves them nullable. The Go writer always stamps a value (falling back to 'system'), and this
 -- service's convention maps a nullable text audit column onto a non-null .NET string - so the
--- default is the same value the code would have written anyway. There are no rows to migrate: this
--- is a new table in the iam schema, and the Go table keeps its own.
+-- default is the same value the code would have written anyway.
+--
+-- THERE ARE ROWS TO MIGRATE, and an earlier version of this header claimed there were none. Read
+-- 2026-09-02, uam.supplier_company_links holds one ACTIVE mounting (ZZ90000008 -> LION) while
+-- iam.supplier_company_links holds nothing. That row is not bookkeeping either: without it every
+-- member of company LION resolves to no mounted suppliers here, and every member of supplier
+-- ZZ90000008 resolves as independent - narrower than the truth, silently, with no warning line
+-- anywhere to say so. The backfill at the end of this script copies it.
 --
 -- The column ORDER also differs from the Go table (which interleaves created_by after created_at):
 -- it follows the model instead, because gate 04 diffs this file against the generated script and a
@@ -65,3 +71,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_supplier_links_active
 -- resolution, so it is not optional.
 CREATE INDEX IF NOT EXISTS idx_supplier_links_company
     ON iam.supplier_company_links (company_code);
+
+-- -----------------------------------------------------------------------------
+-- BACKFILL from the Go table, when it is reachable from this database.
+--
+-- Guarded on the uam schema existing, so this is a no-op in CI (a fresh container carries only
+-- db/*.sql) and in any deployment where the Go service owns a separate database - there it becomes
+-- a manual export, and the header above says what would otherwise be lost.
+--
+-- Two deliberate narrowings make it safe to run repeatedly, including at the cutover itself:
+--   * ACTIVE rows only. UNLINKED rows are history, they carry no authority, and the Go table keeps
+--     its own copy of them - copying them would only invite the second rule to mis-fire.
+--   * a supplier this table has ALREADY heard of is skipped entirely. That is what stops a re-run
+--     from resurrecting a mounting somebody unmounted here in the meantime, and what stops two
+--     ACTIVE rows for one supplier from ever being attempted (uk_supplier_links_active would refuse
+--     the second, taking the whole script down with it).
+--
+-- What it cannot do: close the dual-write window. While both services run, a mounting the Go side
+-- changes after this has copied it has to be changed here too - by the endpoint, so that the audit
+-- row and the token retirement happen with it. This backfill is the starting state, not a sync.
+--
+-- No setval: the ids are assigned by supplier_company_links_id_seq, not supplied here.
+-- -----------------------------------------------------------------------------
+-- Dynamic SQL, and it has to be: PostgreSQL analyses a whole statement before it runs, so a plain
+-- INSERT naming uam.supplier_company_links would fail on a database without that schema even inside
+-- a branch that is never taken. EXECUTE is what defers the name resolution to the guarded path.
+DO $backfill$
+BEGIN
+    IF EXISTS (SELECT 1
+               FROM information_schema.tables
+               WHERE table_schema = 'uam' AND table_name = 'supplier_company_links') THEN
+        EXECUTE $sql$
+            INSERT INTO iam.supplier_company_links
+                (supplier_code, company_code, status, created_at, updated_at, created_by, updated_by)
+            SELECT go_link.supplier_code,
+                   go_link.company_code,
+                   'ACTIVE',
+                   go_link.created_at,
+                   go_link.updated_at,
+                   -- The Go columns are nullable and this table's are not; 'system' is the same
+                   -- fallback the Go writer uses when its context carries no user name.
+                   COALESCE(NULLIF(go_link.created_by, ''), 'system'),
+                   COALESCE(NULLIF(go_link.updated_by, ''), 'system')
+            FROM uam.supplier_company_links AS go_link
+            WHERE go_link.status = 'ACTIVE'
+              AND NOT EXISTS (SELECT 1
+                              FROM iam.supplier_company_links AS mounted
+                              WHERE mounted.supplier_code = go_link.supplier_code)
+        $sql$;
+    END IF;
+END
+$backfill$;

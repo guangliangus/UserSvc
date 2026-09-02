@@ -375,20 +375,21 @@ public sealed class LionTravelStaffDirectory(
     {
         var settings = options.Value;
 
-        var missing = new List<string>();
-        AddIfBlank(missing, nameof(LionTravelOptions.TokenBaseAddress), settings.TokenBaseAddress);
-        AddIfBlank(missing, nameof(LionTravelOptions.OtpBaseAddress), settings.OtpBaseAddress);
-        AddIfBlank(missing, nameof(LionTravelOptions.HrBaseAddress), settings.HrBaseAddress);
-        AddIfBlank(missing, nameof(LionTravelOptions.ApiKey), settings.ApiKey);
-        AddIfBlank(missing, nameof(LionTravelOptions.ApiSecret), settings.ApiSecret);
+        var unusable = new List<string>();
+        AddIfNotAbsolute(unusable, nameof(LionTravelOptions.TokenBaseAddress), settings.TokenBaseAddress);
+        AddIfNotAbsolute(unusable, nameof(LionTravelOptions.OtpBaseAddress), settings.OtpBaseAddress);
+        AddIfNotAbsolute(unusable, nameof(LionTravelOptions.HrBaseAddress), settings.HrBaseAddress);
+        AddIfBlank(unusable, nameof(LionTravelOptions.ApiKey), settings.ApiKey);
+        AddIfBlank(unusable, nameof(LionTravelOptions.ApiSecret), settings.ApiSecret);
 
-        if (missing.Count > 0)
+        if (unusable.Count > 0)
         {
             throw new AppException(
                 ErrorCodes.NotConfigured,
                 "The corporate staff directory is not configured on this deployment: "
-                + string.Join(", ", missing.Select(key => $"{LionTravelOptions.SectionName}:{key}"))
-                + " must be supplied.",
+                + string.Join(", ", unusable.Select(key => $"{LionTravelOptions.SectionName}:{key}"))
+                + " must be supplied as an absolute http(s) URL, an application key and an "
+                + "application secret.",
                 500);
         }
 
@@ -397,6 +398,20 @@ public sealed class LionTravelStaffDirectory(
         static void AddIfBlank(List<string> into, string name, string value)
         {
             if (string.IsNullOrWhiteSpace(value))
+            {
+                into.Add(name);
+            }
+        }
+
+        // Blank and "auth.example.com" land in the same bucket on purpose. A host with no scheme
+        // is not something Absolute() can build a URI from, and left to it the OTP door answered
+        // 500 INTERNAL_ERROR out of a UriFormatException - a stack trace about a Uri constructor,
+        // for a deployment whose only mistake was omitting "https://". It is a configuration
+        // fault, so it is reported as one, named, by the same gate that reports an absent value.
+        static void AddIfNotAbsolute(List<string> into, string name, string value)
+        {
+            if (!Uri.TryCreate(value, UriKind.Absolute, out var parsed)
+                || (parsed.Scheme != Uri.UriSchemeHttp && parsed.Scheme != Uri.UriSchemeHttps))
             {
                 into.Add(name);
             }
@@ -543,10 +558,22 @@ public sealed class LionTravelAccessTokenCache(
     private const string CacheKeySuffix = "liontravel:access_token";
 
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
-    private readonly string _key = redisOptions.Value.KeyPrefix + CacheKeySuffix;
 
     private string _token = string.Empty;
     private DateTimeOffset _expiresAt = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// The Redis key, read at the point of use rather than in a field initializer.
+    /// <para>
+    /// A field initializer runs in the constructor, so reading
+    /// <see cref="IOptions{TOptions}.Value"/> there makes merely <i>constructing</i> this cache
+    /// throw on a deployment whose Redis section will not validate - the failure mode
+    /// docs/architecture.md records, and one that would take this singleton's whole dependency
+    /// graph with it. Today <c>RedisOptions</c> is validated at startup so the host would refuse
+    /// to boot first; the point is not to leave the shape lying around for the day that changes.
+    /// </para>
+    /// </summary>
+    private string Key => redisOptions.Value.KeyPrefix + CacheKeySuffix;
 
     /// <param name="forceRefresh">Skip both layers. Set only after the upstream has rejected a
     /// token this cache handed out, never speculatively - the rate limit the cache exists for comes
@@ -605,7 +632,7 @@ public sealed class LionTravelAccessTokenCache(
 
         try
         {
-            await connection.GetDatabase().KeyDeleteAsync(_key).ConfigureAwait(false);
+            await connection.GetDatabase().KeyDeleteAsync(Key).ConfigureAwait(false);
         }
         catch (Exception ex) when (IsRedisFailure(ex))
         {
@@ -620,7 +647,7 @@ public sealed class LionTravelAccessTokenCache(
     {
         try
         {
-            var value = await connection.GetDatabase().StringGetAsync(_key).ConfigureAwait(false);
+            var value = await connection.GetDatabase().StringGetAsync(Key).ConfigureAwait(false);
 
             return value.IsNullOrEmpty ? string.Empty : value.ToString();
         }
@@ -638,7 +665,7 @@ public sealed class LionTravelAccessTokenCache(
         try
         {
             await connection.GetDatabase()
-                .StringSetAsync(_key, token, expiry: ttl, keepTtl: false, when: When.Always, flags: CommandFlags.None)
+                .StringSetAsync(Key, token, expiry: ttl, keepTtl: false, when: When.Always, flags: CommandFlags.None)
                 .ConfigureAwait(false);
         }
         catch (Exception ex) when (IsRedisFailure(ex))

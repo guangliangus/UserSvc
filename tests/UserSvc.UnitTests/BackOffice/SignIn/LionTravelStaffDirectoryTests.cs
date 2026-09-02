@@ -445,4 +445,33 @@ public sealed class LionTravelStaffDirectoryTests
         _transport.Requests[1].RequestUri!.ToString()
             .ShouldBe("https://inc.example.com/api/V2/OTPLogin");
     }
+
+    /// <summary>
+    /// A host supplied without a scheme is a configuration fault reported as one, not a 500 out of
+    /// a <see cref="Uri"/> constructor - the deployment's only mistake was omitting "https://" and
+    /// the message has to say which key to go and fix.
+    /// </summary>
+    [Theory]
+    [InlineData("inc.example.com")]
+    [InlineData("ftp://inc.example.com")]
+    [InlineData("/api")]
+    public async Task ABaseAddressThatIsNotAnAbsoluteHttpUrlIsAConfigurationFault(string address)
+    {
+        _options = new LionTravelOptions
+        {
+            TokenBaseAddress = "https://auth.example.com",
+            OtpBaseAddress = address,
+            HrBaseAddress = "https://hr.example.com",
+            ApiKey = "key-1",
+            ApiSecret = "secret-1",
+        };
+
+        var failure = await Should.ThrowAsync<AppException>(() =>
+            Sut().VerifyOtpAsync("260022", "2449673", CancellationToken.None));
+
+        failure.ErrorCode.ShouldBe(ErrorCodes.NotConfigured);
+        failure.StatusCode.ShouldBe(500);
+        failure.Message.ShouldContain("StaffDirectory:OtpBaseAddress");
+        _transport.Requests.ShouldBeEmpty();
+    }
 }

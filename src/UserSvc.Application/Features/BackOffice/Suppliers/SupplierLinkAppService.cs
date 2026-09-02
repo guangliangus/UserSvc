@@ -67,6 +67,7 @@ public sealed class SupplierLinkAppService(
         string? companyCode,
         CancellationToken cancellationToken)
     {
+        AssertPlatformPlane(caller, "read the supplier mountings");
         await adminScopes.AssertHoldsAnyAsync(caller, [SupplierLinkPermissions.Read], cancellationToken);
 
         var company = (companyCode ?? string.Empty).Trim();
@@ -114,8 +115,19 @@ public sealed class SupplierLinkAppService(
             return new SupplierLinkListResponse();
         }
 
-        var admins = await members.FindAdminsByTenantsAsync(
-            TenantTypes.Supplier, codes, cancellationToken);
+        // Ordered by membership id, because the port deliberately does not order and this response
+        // depends on the order twice over: Admins is rendered in it, and Admin - the legacy
+        // single-value field - IS its first element. Without a sort, "the first administrator" of a
+        // supplier that has two is whichever row the database happened to hand back, so the field
+        // can change between two page loads with nothing having changed underneath.
+        //
+        // Sorted here rather than pushed into the port for two reasons: the key is an integer, so
+        // this has none of the collation dependence that keeps the code sorts in SQL, and the port
+        // is shared with callers whose own tests pin its natural order.
+        var admins = (await members.FindAdminsByTenantsAsync(
+                TenantTypes.Supplier, codes, cancellationToken))
+            .OrderBy(member => member.Id)
+            .ToList();
 
         // Several rows per tenant are normal now that the one-administrator unique index is gone,
         // so group rather than overwrite: keying a single member by tenant code would silently keep
@@ -179,6 +191,7 @@ public sealed class SupplierLinkAppService(
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        AssertPlatformPlane(caller, "change a supplier mounting");
         await adminScopes.AssertHoldsAnyAsync(caller, [SupplierLinkPermissions.Manage], cancellationToken);
 
         var supplier = (supplierCode ?? string.Empty).Trim();
@@ -552,6 +565,43 @@ public sealed class SupplierLinkAppService(
                     tenantCode);
             }
         }
+    }
+
+    /// <summary>
+    /// Refuses a caller who is acting as one company or one supplier, whatever permission codes
+    /// they hold.
+    /// <para>
+    /// <b>The permission code alone is not enough here, and the Go original's gate is.</b> Both
+    /// points are seeded against the platform-audience "approved suppliers" menu, so the intended
+    /// holder is a platform role - but the audience rule that would keep a platform menu off a
+    /// company-owned role is switched off service-wide (see the note in
+    /// <c>RoleGrantsAppService.ValidateGrantsAsync</c>). A company administrator who holds the role
+    /// page can therefore grant that menu, and these two points, to a role in their own company.
+    /// Without this guard, what that buys them is every supplier's administrators - user ids,
+    /// display names and <i>email addresses</i> - for any code they care to guess, and, with the
+    /// manage point, the ability to mount another company's supplier onto their own, which hands
+    /// their own members data scope over that supplier downstream. This endpoint has no per-tenant
+    /// narrowing to fall back on: it answers for exactly the codes it is asked about.
+    /// </para>
+    /// <para>
+    /// PLATFORM and GLOBAL pass, which is the whole intended audience: a whole-dimension operator
+    /// legitimately administers mountings across their dimension, and the platform super
+    /// administrator always acts as PLATFORM. Only a single-tenant session is refused, and for a
+    /// single-tenant session there is no correct answer to give - the question spans tenants.
+    /// </para>
+    /// </summary>
+    private static void AssertPlatformPlane(IBackOfficeCaller caller, string what)
+    {
+        var (tenantType, tenantCode, isTenant) = CallerFacts.Tenant(caller);
+        if (!isTenant)
+        {
+            return;
+        }
+
+        throw new ForbiddenException(
+            ErrorCodes.Forbidden,
+            $"A session acting as {tenantType} {tenantCode} may not {what}: the supplier mountings "
+            + "are a platform-wide plane, not one tenant's data.");
     }
 
     /// <summary>What goes into <c>created_by</c> / <c>updated_by</c>: the caller's display name, or
