@@ -16,7 +16,15 @@ public interface IAuthzConvergence
     /// authorization faces. Used when a change takes something away.</summary>
     Task BumpTokenVersionAsync(IReadOnlyCollection<int> userIds, CancellationToken cancellationToken);
 
-    /// <summary>Drop the cached authorization faces without touching the tokens. Used when a change
-    /// only adds - the next request recomputes and sees it.</summary>
+    /// <summary>
+    /// Drop the cached authorization faces without touching the tokens.
+    /// <para>
+    /// Two callers, one meaning. A change that only <b>adds</b> uses it because the new grant needs
+    /// no reissue. A change that already incremented <c>token_version</c> inside its own transaction
+    /// uses it because the tokens are retired already and only the cached faces are still owed -
+    /// calling <see cref="BumpTokenVersionAsync"/> there would increment the counter a second time,
+    /// outside that transaction.
+    /// </para>
+    /// </summary>
     Task InvalidateAuthzAsync(IReadOnlyCollection<int> userIds, CancellationToken cancellationToken);
 }

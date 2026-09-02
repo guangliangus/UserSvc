@@ -22,9 +22,20 @@ public sealed class IamAuditWriter(
     IClock clock,
     ILogger<IamAuditWriter> logger)
 {
+    /// <summary>
+    /// One naming convention for one column. <c>iam_audit_logs.before_data</c> and
+    /// <c>after_data</c> are written by this slice and by the tenancy slice, and the tenancy slice
+    /// names every key by hand - <c>status</c>, <c>is_admin</c>, <c>role_codes</c>, <c>dept_name</c>.
+    /// Without the policy below this writer used the CLR property names instead, so the same column
+    /// carried <c>{"role_codes": [...]}</c> on a member row and <c>{"RoleCodes": [...]}</c> on a
+    /// super-administrator row - measured on the live database, not inferred - and any reader of the
+    /// trail would have to know which slice wrote a row before it could read it. Spec 08 §3.13 and
+    /// 09 §3.0 both spell these keys in snake case, so that is the one this converges on.
+    /// </summary>
     private static readonly JsonSerializerOptions SnapshotOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
     };
 
     /// <summary>Record one action against a role, menu or account.</summary>

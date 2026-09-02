@@ -7,6 +7,10 @@ using Xunit;
 
 using UserSvc.Application.Errors;
 
+// The bindings port is owned by this slice but its row type is the tenant slice's entity, and
+// UserSvc.Domain.Tenancy also declares a TenantTypes this file already resolves from Domain.Iam.
+using UserTenantRole = UserSvc.Domain.Tenancy.UserTenantRole;
+
 namespace UserSvc.UnitTests.Iam;
 
 /// <summary>The delegation ceiling: what a caller may hand to somebody else.</summary>
@@ -40,7 +44,7 @@ public sealed class RoleDelegationServiceTests
         _members.FindAsync(5, TenantTypes.Company, "C1", Arg.Any<CancellationToken>())
             .Returns(Fixtures.Membership(1, 5, TenantTypes.Company, "C1", isAdmin: true));
         _bindings.ListByMemberIdAsync(1, Arg.Any<CancellationToken>())
-            .Returns([new UserTenantRoleBinding(1, 1, 89)]);
+            .Returns([new UserTenantRole { Id = 1, MemberId = 1, RoleId = 89 }]);
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns([SupplierAdmin]);
         _roles.ListDescendantsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
@@ -61,7 +65,7 @@ public sealed class RoleDelegationServiceTests
         _members.FindAsync(5, TenantTypes.Company, "C1", Arg.Any<CancellationToken>())
             .Returns(Fixtures.Membership(1, 5, TenantTypes.Company, "C1"));
         _bindings.ListByMemberIdAsync(1, Arg.Any<CancellationToken>())
-            .Returns([new UserTenantRoleBinding(1, 1, 91)]);
+            .Returns([new UserTenantRole { Id = 1, MemberId = 1, RoleId = 91 }]);
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns([ProductOp]);
 

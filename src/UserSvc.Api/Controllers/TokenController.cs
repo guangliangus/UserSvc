@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 using OpenIddict.Abstractions;
 using OpenIddict.Server.AspNetCore;
 using UserSvc.Api.Auth;
+using UserSvc.Api.Controllers.BackOffice;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.Sessions;
 using UserSvc.Domain.Auth;
@@ -140,6 +141,26 @@ public sealed class TokenController(
         if (application is null)
         {
             return Reject(OpenIddictConstants.Errors.InvalidClient, "The client application is not registered.");
+        }
+
+        // This grant authenticates a CONSUMER identity - the subject below is an identity.users id -
+        // and the back-office scopes describe a back-office one, whose subject is an
+        // iam.backend_users id. The two planes number their accounts independently, so a token that
+        // carried both would be read as two different people by two halves of this service.
+        // Measured before this check existed: a device login for consumer 2 that simply asked for
+        // scope=backoffice came back with a token that answered GET /api/v1/user/profile as consumer
+        // 2 AND GET /api/v1/auth/tenants with back-office account 2's tenant memberships. Refusing
+        // rather than quietly dropping the scope, because a client that asked for this is confused
+        // about which plane it is on and should be told so.
+        var backOfficeScopes = request.GetScopes()
+            .Where(scope => scope == BackOfficeScopes.BackOffice || scope == BackOfficeScopes.PreTenant)
+            .ToList();
+
+        if (backOfficeScopes.Count > 0)
+        {
+            return Reject(
+                OpenIddictConstants.Errors.InvalidScope,
+                "The device login grant issues consumer credentials and cannot grant a back-office scope.");
         }
 
         var sessionId = Guid.CreateVersion7().ToString("n");

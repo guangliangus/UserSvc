@@ -94,7 +94,7 @@ dotnet test  UserSvc.slnx      # 单元 + 架构守卫
 | 2 | 验证码（Redis 限流、调通知服务） | ✅ |
 | 3 | 认证核心（OpenIddict、设备会话、令牌轮换） | ✅ |
 | 4 | 第三方身份（微信 / Firebase / LINE / Passkey） | ⬜ |
-| 5 | 后台账号 + RBAC + 租户 | 🟡 实体/仓储/DDL/契约种子已落地，跨切片端口待归一 |
+| 5 | 后台账号 + RBAC + 租户 | 🟡 端点已服务并实测；缺后台登录流程（依赖 OTP 上游） |
 
 阶段 3 已端到端验证：设备登录 → 刷新轮换 → **重放已赎回的 token 触发整链撤销**，会话行标记
 `TOKEN_REPLAY`、两条 outbox 行在同一事务落表、Redis 撤销集写入、被撤销会话的 access token
@@ -110,3 +110,6 @@ dotnet test  UserSvc.slnx      # 单元 + 架构守卫
 - **通知服务的服务间认证**：不确定对方是否要令牌。DI 里 `IHttpClientBuilder` 特意留在局部变量，
   一个 `DelegatingHandler` 就能挂上去
 - **`SendDirectPath` 是猜的**：拿不到通知服务的 OpenAPI 文档
+- **后台登录流程**：策略、scope 注册、客户端权限都就位了，但没有流程能签发带
+  `backoffice` scope 的令牌——那一步依赖 LionTravel OTP 上游（切片 07）
+- **`ITenantMasterDataDirectory`**：租户主数据在本服务之外，是拒绝式占位

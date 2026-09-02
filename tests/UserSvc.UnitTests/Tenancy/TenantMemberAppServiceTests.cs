@@ -6,6 +6,7 @@ using UserSvc.Application.Errors;
 using UserSvc.Application.Features.BackOffice.Tenants;
 using UserSvc.Application.Features.Registration;
 using UserSvc.Application.Ports.Platform;
+using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Domain.Tenancy;
 using Xunit;
@@ -816,11 +817,11 @@ public sealed class TenantMemberAppServiceTests
             .Returns((TenantMember?)null);
 
     private void Bound(int memberId, params int[] roleIds) =>
-        _bindings.ListByMemberAsync(memberId, Arg.Any<CancellationToken>())
+        _bindings.ListByMemberIdAsync(memberId, Arg.Any<CancellationToken>())
             .Returns([.. roleIds.Select(id => new UserTenantRole { MemberId = memberId, RoleId = id })]);
 
     private void BoundAcrossMembers(params (int MemberId, int[] RoleIds)[] bindings) =>
-        _bindings.ListRoleIdsByMembersAsync(
+        _bindings.ListRoleIdsByMemberIdsAsync(
                 Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns(bindings.ToDictionary(
                 binding => binding.MemberId,

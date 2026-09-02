@@ -114,7 +114,15 @@ public sealed class SuperAdminAppService(
             },
             cancellationToken);
 
-        await convergence.BumpTokenVersionAsync([userId], cancellationToken);
+        // Invalidate, not bump. Every one of these three paths has already incremented
+        // token_version inside the transaction above, where it belongs; calling the bump here
+        // would increment the generation counter a second time, outside that transaction.
+        // Measured before this was corrected: one PUT /users/{id}/global-access moved the
+        // column from 2 to 4. What is still owed after the commit is the other half - dropping
+        // the cached authority faces, which the committed bump does not reach - and that is
+        // exactly what this call is (spec 08 §3.11: BumpCacheInvalidate after the commit,
+        // IncrementTokenVersion inside it).
+        await convergence.InvalidateAuthzAsync([userId], cancellationToken);
     }
 
     /// <summary>
@@ -185,7 +193,15 @@ public sealed class SuperAdminAppService(
             after: null,
             cancellationToken);
 
-        await convergence.BumpTokenVersionAsync([userId], cancellationToken);
+        // Invalidate, not bump. Every one of these three paths has already incremented
+        // token_version inside the transaction above, where it belongs; calling the bump here
+        // would increment the generation counter a second time, outside that transaction.
+        // Measured before this was corrected: one PUT /users/{id}/global-access moved the
+        // column from 2 to 4. What is still owed after the commit is the other half - dropping
+        // the cached authority faces, which the committed bump does not reach - and that is
+        // exactly what this call is (spec 08 §3.11: BumpCacheInvalidate after the commit,
+        // IncrementTokenVersion inside it).
+        await convergence.InvalidateAuthzAsync([userId], cancellationToken);
     }
 
     private async Task RevokeAsync(
@@ -231,6 +247,14 @@ public sealed class SuperAdminAppService(
             after: null,
             cancellationToken);
 
-        await convergence.BumpTokenVersionAsync([userId], cancellationToken);
+        // Invalidate, not bump. Every one of these three paths has already incremented
+        // token_version inside the transaction above, where it belongs; calling the bump here
+        // would increment the generation counter a second time, outside that transaction.
+        // Measured before this was corrected: one PUT /users/{id}/global-access moved the
+        // column from 2 to 4. What is still owed after the commit is the other half - dropping
+        // the cached authority faces, which the committed bump does not reach - and that is
+        // exactly what this call is (spec 08 §3.11: BumpCacheInvalidate after the commit,
+        // IncrementTokenVersion inside it).
+        await convergence.InvalidateAuthzAsync([userId], cancellationToken);
     }
 }

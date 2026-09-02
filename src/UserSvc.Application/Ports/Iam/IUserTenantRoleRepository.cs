@@ -1,17 +1,23 @@
+using UserSvc.Domain.Tenancy;
+
 namespace UserSvc.Application.Ports.Iam;
 
 /// <summary>
-/// Role bindings hanging off a tenant membership (spec 2.6). The table belongs to the tenant slice;
-/// the contract lives here because the whole of it is consumed by role management, and the tenant
-/// slice uses only the first three methods.
+/// Role bindings hanging off a tenant membership (spec 2.6). The table's DDL belongs to the tenant
+/// slice; the contract lives here because the whole of it is consumed by role management, and the
+/// tenant slice uses only the first three methods.
 /// <para>
-/// It deals in ids rather than in the tenant slice's entity on purpose: this port is the seam
-/// between two bounded contexts, and the row shape on the other side is not this module's business.
+/// It deals in <see cref="UserTenantRole"/> - the row as the database holds it - rather than in a
+/// projection of its own. An earlier draft of this port declared a separate binding record so that
+/// role management would not have to name the tenant slice's entity, which cost a mapping layer and
+/// a second name for one table and bought nothing: both slices reference the same domain assembly,
+/// and every other repository port here hands back its own entity.
 /// </para>
 /// </summary>
 public interface IUserTenantRoleRepository
 {
-    Task<IReadOnlyList<UserTenantRoleBinding>> ListByMemberIdAsync(
+    /// <summary>One membership's bindings, ordered by id.</summary>
+    Task<IReadOnlyList<UserTenantRole>> ListByMemberIdAsync(
         int memberId,
         CancellationToken cancellationToken);
 
@@ -21,12 +27,20 @@ public interface IUserTenantRoleRepository
         IReadOnlyCollection<int> memberIds,
         CancellationToken cancellationToken);
 
-    /// <summary>Delete-then-insert of one membership's whole role set. Must run inside the caller's
-    /// transaction.</summary>
+    /// <summary>
+    /// Delete-then-insert of one membership's whole role set. Must run inside the caller's
+    /// transaction.
+    /// <para>
+    /// The caller is responsible for having merged in the bindings it is not allowed to touch -
+    /// this method takes the final set at face value. <paramref name="now"/> is passed rather than
+    /// read from a clock here so that one write stamps every row it inserts identically.
+    /// </para>
+    /// </summary>
     Task ReplaceForMemberAsync(
         int memberId,
-        IReadOnlyCollection<int> roleIds,
-        string? createdBy,
+        IReadOnlyList<int> roleIds,
+        string actor,
+        DateTimeOffset now,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -40,6 +54,3 @@ public interface IUserTenantRoleRepository
     /// whose sessions have to converge after a grant change.</summary>
     Task<IReadOnlyList<int>> ListUserIdsByRoleIdAsync(int roleId, CancellationToken cancellationToken);
 }
-
-/// <summary>One binding row: a membership and the role it carries.</summary>
-public sealed record UserTenantRoleBinding(int Id, int MemberId, int RoleId);

@@ -10,10 +10,14 @@ using UserSvc.Api.Errors;
 using UserSvc.Api.Filters;
 using UserSvc.Api.Health;
 using UserSvc.Application.Errors;
+using UserSvc.Application.Features.BackOffice.Accounts;
+using UserSvc.Application.Features.BackOffice.Rbac;
+using UserSvc.Application.Features.BackOffice.Tenants;
 using UserSvc.Application.Features.Profile;
 using UserSvc.Application.Features.Registration;
 using UserSvc.Application.Features.Sessions;
 using UserSvc.Application.Features.Verification;
+using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Security;
 using UserSvc.Infrastructure;
@@ -60,6 +64,13 @@ builder.Services.AddOptions<VerificationOptions>()
     .ValidateDataAnnotations()
     .ValidateOnStart();
 
+// No ValidateDataAnnotations: every setting in this section has a working default, and the one
+// that does not - BackOffice:LoginUrl - is deliberately optional. A deployment with no back office
+// in front of it should boot; what it loses is credential mail, and the sender says so in its log
+// rather than refusing to start the whole service.
+builder.Services.AddOptions<BackOfficeAccountOptions>()
+    .Bind(builder.Configuration.GetSection(BackOfficeAccountOptions.SectionName));
+
 // ---------------------------------------------------------------- Infrastructure (ports -> adapters)
 builder.Services.AddUserSvcInfrastructure(builder.Configuration);
 
@@ -69,6 +80,33 @@ builder.Services.AddScoped<ProfileAppService>();
 builder.Services.AddScoped<SessionAppService>();
 builder.Services.AddScoped<VerificationAppService>();
 builder.Services.AddScoped<RegistrationAppService>();
+
+// --- Back office -----------------------------------------------------------------------------
+// Registered as one block because they are one graph: the RBAC services depend on each other and
+// on the cross-slice adapters in UserSvc.Infrastructure, and the container validates the whole
+// thing at Build(). Registering an app service whose adapters are missing does not merely leave
+// that endpoint broken - ValidateOnBuild refuses to construct the container at all, and the host
+// never starts. Anything added here needs its ports wired first.
+builder.Services.AddScoped<BackOfficeAccountAppService>();
+builder.Services.AddScoped<BackOfficeResetTargetGate>();
+builder.Services.AddScoped<BackOfficeSuperAdminAppService>();
+
+builder.Services.AddScoped<ActiveUserRoleReader>();
+builder.Services.AddScoped<AdminScopeService>();
+builder.Services.AddScoped<IamAuditWriter>();
+builder.Services.AddScoped<MenuAppService>();
+builder.Services.AddScoped<PermissionCatalogAppService>();
+builder.Services.AddScoped<RoleAppService>();
+builder.Services.AddScoped<RoleDelegationService>();
+builder.Services.AddScoped<RoleGrantsAppService>();
+builder.Services.AddScoped<RoleVisibilityService>();
+builder.Services.AddScoped<ScopeEnvelopeService>();
+builder.Services.AddScoped<SuperAdminAppService>();
+builder.Services.AddScoped<UserVisibilityService>();
+
+builder.Services.AddScoped<BackOfficeContextAppService>();
+builder.Services.AddScoped<TenantContextAppService>();
+builder.Services.AddScoped<TenantMemberAppService>();
 // Stateless and thread-safe; the Argon2 parameters are compile-time constants, so one instance
 // serves every request.
 builder.Services.AddSingleton<PasswordHasher>();
@@ -78,13 +116,17 @@ builder.Services.AddValidatorsFromAssemblyContaining<UpdateProfileRequestValidat
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<ICurrentUser, HttpContextCurrentUser>();
 
+// The back office's own caller. Identity comes from the validated token; authority is whatever
+// BackOfficeAuthzMiddleware resolved for this request, and an empty face when it resolved nothing.
+builder.Services.AddScoped<IBackOfficeCaller, HttpContextBackOfficeCaller>();
+
 // ---------------------------------------------------------------- Authentication (decision 10)
 // OpenIddict issues the tokens and validates them in the same process. Under Development a policy
 // scheme still falls back to DevAuthenticationHandler when no Authorization header is present, so
 // the existing curl and integration-test workflow keeps working.
 builder.Services.AddUserSvcAuthentication(builder.Configuration, builder.Environment.IsDevelopment());
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options => options.AddBackOfficePolicies());
 
 // ---------------------------------------------------------------- HTTP
 builder.Services.AddControllers(options => options.Filters.Add<ValidationFilter>());
@@ -148,6 +190,12 @@ app.UseAuthentication();
 // Between authentication and authorization: there is no sid before the first, and a revoked
 // session must not reach a policy that might approve it.
 app.UseMiddleware<RevokedSessionMiddleware>();
+
+// After the revocation check - a dead session must not have an authority face computed for it -
+// and before authorization, because the permission gates read that face. It never fails a request:
+// an unresolvable face is an empty one, which fails the gates closed and leaves the ungated
+// endpoints working.
+app.UseMiddleware<BackOfficeAuthzMiddleware>();
 
 app.UseAuthorization();
 

@@ -13,6 +13,7 @@ using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Ports.Users;
 using UserSvc.Application.Ports.Verification;
 using UserSvc.Infrastructure.Auth;
+using UserSvc.Infrastructure.BackOffice;
 using UserSvc.Infrastructure.External;
 using UserSvc.Infrastructure.Persistence;
 using UserSvc.Infrastructure.Persistence.Repositories;
@@ -71,17 +72,15 @@ public static class DependencyInjection
         services.AddScoped<IRolePermissionRepository, RolePermissionRepository>();
         services.AddScoped<IIamAuditLogRepository, IamAuditLogRepository>();
         services.AddScoped<ITenantMemberRepository, TenantMemberRepository>();
-        // Two slices each declared an IUserTenantRoleRepository over this one table - the RBAC
-        // slice's five-method version and the tenancy slice's three-method one. Only the latter has
-        // an implementation. Qualified rather than folded here, because reconciling them is a
-        // deliberate refactor and not something to smuggle into a registration line.
-        services.AddScoped<UserSvc.Application.Ports.Tenancy.IUserTenantRoleRepository, UserTenantRoleRepository>();
+        services.AddScoped<IUserTenantRoleRepository, UserTenantRoleRepository>();
         services.AddSingleton<IClock, SystemClock>();
 
         AddRedis(services, configuration);
         AddNotificationClient(services, configuration);
         AddRiskControl(services);
         AddStaffDirectory(services);
+        AddCrossSliceDirectories(services);
+        AddTenantMasterData(services);
 
         return services;
     }
@@ -187,6 +186,59 @@ public static class DependencyInjection
                     TimeSpan.FromSeconds(30),
                     notification.AttemptTimeout * 2);
             });
+    }
+
+    /// <summary>
+    /// The seams between the three back-office slices.
+    /// <para>
+    /// Each of these ports is one slice's narrow view of a neighbour's data, declared as a port
+    /// because the two were written by people who could not see each other. None of them is an
+    /// external dependency, and every adapter below is a projection over a repository or a service
+    /// that already exists in this process - which is why they are registered here beside the
+    /// repositories rather than in the placeholder helpers further down.
+    /// </para>
+    /// </summary>
+    private static void AddCrossSliceDirectories(IServiceCollection services)
+    {
+        // Read-only projections of the RBAC catalogue and the membership table.
+        services.AddScoped<IRoleDirectory, RoleDirectory>();
+        services.AddScoped<IRbacCatalog, RbacCatalog>();
+        services.AddScoped<ITenantMemberDirectory, TenantMemberDirectory>();
+        services.AddScoped<IBackOfficeUserDirectory, BackOfficeUserDirectory>();
+        services.AddScoped<IBackOfficeAccountDirectory, BackOfficeAccountDirectory>();
+
+        // Write seams. Each runs inside a transaction its caller opened.
+        services.AddScoped<IBackOfficeUserProvisioner, BackOfficeUserProvisioner>();
+        services.AddScoped<IGlobalAccessMemberships, GlobalAccessMemberships>();
+        services.AddScoped<IIamAuditLog, IamAuditLogWriter>();
+
+        // Standing and delegation, re-read from the database on every call.
+        services.AddScoped<IAdminStandingService, AdminStandingService>();
+        services.AddScoped<IRoleDelegationService, RoleDelegationDirectory>();
+
+        // The authority snapshot and the two ports that retire it. The cache is a singleton because
+        // it holds nothing but the multiplexer and the key prefix; everything that computes into it
+        // is scoped, because it reads the request's own DbContext.
+        services.AddSingleton<RedisAuthzSnapshotCache>();
+        services.AddScoped<IAuthzSnapshotProvider, AuthzSnapshotProvider>();
+        services.AddScoped<IAuthzConvergence, AuthzConvergence>();
+        services.AddSingleton<ITokenVersionCache, AuthzSnapshotTokenVersionCache>();
+
+        // Credential mail goes out through the notification client the rest of the service already
+        // uses - see NotificationCredentialEmailSender for why there is no second path out.
+        services.AddScoped<ICredentialEmailSender, NotificationCredentialEmailSender>();
+    }
+
+    /// <summary>
+    /// The two directories that read master data owned by another service. Both ship as refusing
+    /// placeholders - see <see cref="UnavailableTenantMasterDataDirectory"/> and
+    /// <see cref="UnavailableSupplierCompanyLinkDirectory"/> for what each refusal costs and why
+    /// the two refuse in different shapes. Replacing these two lines is the whole cutover.
+    /// </summary>
+    private static void AddTenantMasterData(IServiceCollection services)
+    {
+        services.AddSingleton<ITenantMasterDataDirectory, UnavailableTenantMasterDataDirectory>();
+        services.AddSingleton<ISupplierCompanyLinkDirectory, UnavailableSupplierCompanyLinkDirectory>();
     }
 
     private static TimeSpan MaxOf(TimeSpan left, TimeSpan right) => left > right ? left : right;

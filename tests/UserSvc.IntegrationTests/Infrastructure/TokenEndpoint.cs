@@ -38,8 +38,10 @@ internal static class TokenEndpoint
         string deviceId,
         string deviceName = "Test Device",
         string platform = "IOS",
-        string appVersion = "1.0.0") =>
-        PostAsync(client, new Dictionary<string, string>(StringComparer.Ordinal)
+        string appVersion = "1.0.0",
+        string? scope = null)
+    {
+        var form = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["grant_type"] = DeviceGrantType,
             ["client_id"] = ClientId,
@@ -48,7 +50,15 @@ internal static class TokenEndpoint
             ["device_name"] = deviceName,
             ["platform"] = platform,
             ["app_version"] = appVersion,
-        });
+        };
+
+        if (scope is not null)
+        {
+            form["scope"] = scope;
+        }
+
+        return PostAsync(client, form);
+    }
 
     public static Task<TokenResponse> RefreshAsync(HttpClient client, string refreshToken) =>
         PostAsync(client, new Dictionary<string, string>(StringComparer.Ordinal)

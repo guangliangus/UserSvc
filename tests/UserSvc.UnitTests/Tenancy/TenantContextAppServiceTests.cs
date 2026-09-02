@@ -2,6 +2,7 @@ using NSubstitute;
 using Shouldly;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.BackOffice.Tenants;
+using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Domain.Tenancy;
 using Xunit;
@@ -169,7 +170,7 @@ public sealed class TenantContextAppServiceTests
             Member(id: 2, userId: 7, tenantType: TenantTypes.Supplier, scopeAll: true,
                 tenantCode: TenantScopes.ScopeAllSentinelCode),
         ]);
-        _bindings.ListRoleIdsByMembersAsync(
+        _bindings.ListRoleIdsByMemberIdsAsync(
                 Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns(new Dictionary<int, IReadOnlyList<int>> { [1] = [5], [2] = [6] });
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
@@ -228,7 +229,7 @@ public sealed class TenantContextAppServiceTests
             Member(id: 2, userId: 7, tenantType: TenantTypes.Supplier, scopeAll: true,
                 tenantCode: TenantScopes.ScopeAllSentinelCode),
         ]);
-        _bindings.ListRoleIdsByMembersAsync(
+        _bindings.ListRoleIdsByMemberIdsAsync(
                 Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns(new Dictionary<int, IReadOnlyList<int>> { [2] = [6] });
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
@@ -238,7 +239,7 @@ public sealed class TenantContextAppServiceTests
             7, new ActClaim(ActTypes.Global, Dimension: TenantTypes.Supplier), CancellationToken.None);
 
         result.Roles.ShouldBe(["supplier_ops"]);
-        await _bindings.Received(1).ListRoleIdsByMembersAsync(
+        await _bindings.Received(1).ListRoleIdsByMemberIdsAsync(
             Arg.Is<IReadOnlyCollection<int>>(ids => ids.Count == 1 && ids.Contains(2)),
             Arg.Any<CancellationToken>());
     }
@@ -249,7 +250,7 @@ public sealed class TenantContextAppServiceTests
         _members.ListActiveByUserAsync(7, Arg.Any<CancellationToken>())
             .Returns([Member(id: 1, userId: 7, scopeAll: true,
                 tenantCode: TenantScopes.ScopeAllSentinelCode)]);
-        _bindings.ListRoleIdsByMembersAsync(
+        _bindings.ListRoleIdsByMemberIdsAsync(
                 Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns(new Dictionary<int, IReadOnlyList<int>> { [1] = [5] });
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
@@ -283,7 +284,7 @@ public sealed class TenantContextAppServiceTests
     {
         _members.FindByUserAndTenantAsync(57, TenantTypes.Company, "C1", Arg.Any<CancellationToken>())
             .Returns(Member(isAdmin: true));
-        _bindings.ListByMemberAsync(900, Arg.Any<CancellationToken>())
+        _bindings.ListByMemberIdAsync(900, Arg.Any<CancellationToken>())
             .Returns([new UserTenantRole { MemberId = 900, RoleId = 10 }]);
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns([Role(10, "company_admin", isAdmin: true)]);
@@ -315,7 +316,7 @@ public sealed class TenantContextAppServiceTests
     {
         _members.FindByUserAndTenantAsync(57, TenantTypes.Supplier, "S9", Arg.Any<CancellationToken>())
             .Returns(Member(tenantType: TenantTypes.Supplier, tenantCode: "S9"));
-        _bindings.ListByMemberAsync(900, Arg.Any<CancellationToken>())
+        _bindings.ListByMemberIdAsync(900, Arg.Any<CancellationToken>())
             .Returns([new UserTenantRole { MemberId = 900, RoleId = 20 }]);
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns([Role(20, "supplier_pm", category: RoleCategories.Supplier,
@@ -347,7 +348,7 @@ public sealed class TenantContextAppServiceTests
     {
         _members.FindByUserAndTenantAsync(57, TenantTypes.Supplier, "S9", Arg.Any<CancellationToken>())
             .Returns(Member(tenantType: TenantTypes.Supplier, tenantCode: "S9"));
-        _bindings.ListByMemberAsync(900, Arg.Any<CancellationToken>()).Returns([]);
+        _bindings.ListByMemberIdAsync(900, Arg.Any<CancellationToken>()).Returns([]);
         _links.FindCompanyCodeBySupplierAsync("S9", Arg.Any<CancellationToken>()).Returns((string?)null);
 
         var result = await Sut.ComputeAsync(
@@ -379,7 +380,7 @@ public sealed class TenantContextAppServiceTests
         _standing.IsPlatformSuperAdminAsync(57, Arg.Any<CancellationToken>()).Returns(true);
         _members.FindByUserAndTenantAsync(57, TenantTypes.Company, "C001", Arg.Any<CancellationToken>())
             .Returns(Member(tenantCode: "C001"));
-        _bindings.ListByMemberAsync(900, Arg.Any<CancellationToken>())
+        _bindings.ListByMemberIdAsync(900, Arg.Any<CancellationToken>())
             .Returns([new UserTenantRole { MemberId = 900, RoleId = 30 }]);
         _roles.FindByIdsAsync(Arg.Any<IReadOnlyCollection<int>>(), Arg.Any<CancellationToken>())
             .Returns([Role(30, "sales")]);

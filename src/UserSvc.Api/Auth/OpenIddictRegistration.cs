@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using OpenIddict.Abstractions;
 using OpenIddict.Server;
 using UserSvc.Api.Controllers;
+using UserSvc.Api.Controllers.BackOffice;
 using UserSvc.Application.Features.Sessions;
 using UserSvc.Infrastructure.Auth;
 using static OpenIddict.Abstractions.OpenIddictConstants;
@@ -55,7 +56,15 @@ public static class OpenIddictRegistration
 
                 options.AllowRefreshTokenFlow();
                 options.AllowCustomFlow(tokenOptions.DeviceGrantType);
-                options.RegisterScopes(Scopes.OfflineAccess);
+                // The back-office scopes are registered here so the server recognises them at all;
+                // BackOfficeAuthorization is what turns them into route policies. A pre-tenant
+                // token carries PreTenant alone, reaches exactly the two context-selection actions,
+                // and must additionally be short lived and free of offline_access - an unfinished
+                // sign-in has no business leaving a long-lived credential behind.
+                options.RegisterScopes(
+                    Scopes.OfflineAccess,
+                    BackOfficeScopes.BackOffice,
+                    BackOfficeScopes.PreTenant);
 
                 // ---------------------------------------------------------------------------------
                 // The single most important line in this file. The DEFAULT leeway is 30 seconds, and
@@ -268,6 +277,12 @@ public static class OpenIddictRegistration
                     // Without the offline_access scope permission the client may ask for it and be
                     // refused, and the refresh design quietly reduces to access tokens only.
                     Permissions.Prefixes.Scope + Scopes.OfflineAccess,
+
+                    // Without these the token endpoint would refuse to grant the two back-office
+                    // scopes even to a request that asked correctly, and every back-office policy
+                    // would answer 403 for a reason nothing in the response explains.
+                    Permissions.Prefixes.Scope + BackOfficeScopes.BackOffice,
+                    Permissions.Prefixes.Scope + BackOfficeScopes.PreTenant,
                 },
             };
 

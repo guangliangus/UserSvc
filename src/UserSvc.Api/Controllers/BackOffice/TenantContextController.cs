@@ -249,6 +249,20 @@ public static class BackOfficePermissions
                   ?? throw new ForbiddenException(
                       ErrorCodes.TenantNotAuthorized, "The session has no active tenant context.");
 
+        // An act type this build does not recognise is no context at all - the same answer a missing
+        // claim gets above, and the same one BackOfficeAuthzMiddleware already gives by refusing to
+        // resolve a face for it. Without this the two paths disagreed: the middleware failed closed
+        // while this gate handed the value straight to the context funnel, whose "unknown type" arm
+        // is a 500. Measured: a token carrying act {"type":"MARS"} answered
+        // GET .../tenants/company/C001/members with 500 INTERNAL_ERROR. A claim value is data, and a
+        // claim this service no longer mints - an older build's, a downgraded one's - must read as
+        // "holds nothing", never as a server fault.
+        if (!ActTypes.IsKnown(act.Type))
+        {
+            throw new ForbiddenException(
+                ErrorCodes.TenantNotAuthorized, "The session has no active tenant context.");
+        }
+
         AuthzSnapshot snapshot;
         try
         {

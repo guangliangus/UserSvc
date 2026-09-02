@@ -4,6 +4,7 @@ using NSubstitute.ExceptionExtensions;
 using Shouldly;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.BackOffice.Tenants;
+using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Domain.Tenancy;
 using Xunit;

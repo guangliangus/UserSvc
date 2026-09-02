@@ -24,4 +24,17 @@ public sealed class BackOfficeAccountOptions
     /// <summary>Default page size for the back-office directory when the client states none.</summary>
     [Range(1, 100)]
     public int DefaultPageSize { get; set; } = 20;
+
+    /// <summary>
+    /// Where the back office signs in, sent as the <c>login_path</c> variable of every credential
+    /// e-mail.
+    /// <para>
+    /// Blank by default and deliberately not <c>[Required]</c>: a deployment with no back office in
+    /// front of it still boots, and the only thing that stops working is the credential mail, which
+    /// reports itself as not sent. The template treats the variable as mandatory, so sending
+    /// without it would be rejected by the notification service - the sender checks it first and
+    /// refuses locally instead, where the log line can say why.
+    /// </para>
+    /// </summary>
+    public string LoginUrl { get; set; } = string.Empty;
 }

@@ -1,4 +1,5 @@
 using UserSvc.Application.Errors;
+using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Domain.Tenancy;
 
@@ -153,7 +154,7 @@ public sealed class TenantContextAppService(
 
         IReadOnlyDictionary<int, IReadOnlyList<int>> roleIdsByMember = dimensionMembers.Count == 0
             ? new Dictionary<int, IReadOnlyList<int>>()
-            : await bindings.ListRoleIdsByMembersAsync(
+            : await bindings.ListRoleIdsByMemberIdsAsync(
                 [.. dimensionMembers.Select(member => member.Id)], cancellationToken);
 
         var roleIds = roleIdsByMember.Values.SelectMany(ids => ids).Distinct().Order().ToList();
@@ -222,7 +223,7 @@ public sealed class TenantContextAppService(
                 ErrorCodes.TenantNotAuthorized, "This membership is not active.");
         }
 
-        var roleIds = (await bindings.ListByMemberAsync(member.Id, cancellationToken))
+        var roleIds = (await bindings.ListByMemberIdAsync(member.Id, cancellationToken))
             .Select(binding => binding.RoleId)
             .Distinct()
             .Order()

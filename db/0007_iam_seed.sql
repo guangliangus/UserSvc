@@ -358,3 +358,25 @@ INSERT INTO role_menus (id, role_id, menu_id, created_at, created_by) VALUES
   (129, 93, 39, '2026-08-10T07:21:40.150868+00:00', 'system'),
   (130, 93, 11, '2026-08-10T07:21:40.150868+00:00', 'system')
 ON CONFLICT (id) DO NOTHING;
+
+-- =============================================================================
+-- Identity sequences.
+--
+-- Every INSERT above supplies its own id, and PostgreSQL does not advance a SERIAL sequence for a
+-- value it did not generate. Without this block the sequences stay where the CREATE TABLE left them
+-- and the first row the *application* inserts asks for id 1 — which the seed already owns. Measured
+-- on a freshly seeded database before this was added: POST /back-office/menus answered 409 "the
+-- value violates the uniqueness constraint 'pk_menus'" on every attempt, PUT
+-- /back-office/roles/{id}/grants the same on 'pk_role_menus', and a created role landed on id 1
+-- with 88..98 already taken, so the collision was merely deferred rather than avoided.
+--
+-- setval(..., max(id), true) means "the last value handed out was max(id)", so the next nextval is
+-- max(id)+1. COALESCE covers an empty table, and false in that case means "1 has not been handed out
+-- yet" so the first row still gets id 1. Re-running is a no-op once the sequence is already ahead,
+-- which keeps this script idempotent alongside the ON CONFLICT clauses above.
+-- =============================================================================
+SELECT setval('menus_id_seq',            COALESCE((SELECT max(id) FROM menus), 1),            (SELECT max(id) IS NOT NULL FROM menus));
+SELECT setval('permissions_id_seq',      COALESCE((SELECT max(id) FROM permissions), 1),      (SELECT max(id) IS NOT NULL FROM permissions));
+SELECT setval('roles_id_seq',            COALESCE((SELECT max(id) FROM roles), 1),            (SELECT max(id) IS NOT NULL FROM roles));
+SELECT setval('role_permissions_id_seq', COALESCE((SELECT max(id) FROM role_permissions), 1), (SELECT max(id) IS NOT NULL FROM role_permissions));
+SELECT setval('role_menus_id_seq',       COALESCE((SELECT max(id) FROM role_menus), 1),       (SELECT max(id) IS NOT NULL FROM role_menus));

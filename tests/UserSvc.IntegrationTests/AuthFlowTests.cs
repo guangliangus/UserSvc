@@ -9,6 +9,7 @@ using UserSvc.Application.Features.Sessions;
 using UserSvc.Domain.Auth;
 using UserSvc.Domain.Users;
 using UserSvc.IntegrationTests.Infrastructure;
+using Xunit;
 
 namespace UserSvc.IntegrationTests;
 
@@ -46,6 +47,31 @@ public sealed class AuthFlowTests(ServiceFixture fixture) : IntegrationTest(fixt
         var stored = await SessionAsync(sessionId);
         stored.ShouldNotBeNull("The grant must have written the session row the sid names.");
         stored.Value.Status.ShouldBe(SessionStatuses.Active);
+    }
+
+    /// <summary>
+    /// The consumer plane and the back-office plane number their accounts independently, and this
+    /// grant authenticates the consumer one. Before it was checked, a device login that simply added
+    /// <c>scope=backoffice</c> to the form came back with a token that answered
+    /// <c>GET /api/v1/user/profile</c> as consumer <c>N</c> and <c>GET /api/v1/auth/tenants</c> with
+    /// back-office account <c>N</c>'s tenant memberships - one credential, two different people.
+    /// </summary>
+    [RequiresDockerTheory]
+    [InlineData("backoffice")]
+    [InlineData("backoffice_pre_tenant")]
+    [InlineData("openid backoffice")]
+    public async Task TheDeviceGrantRefusesToMintABackOfficeScope(string scope)
+    {
+        var userId = await Fixture.SeedUserAsync();
+        using var client = Fixture.CreateClient();
+
+        var tokens = await TokenEndpoint.SignInDeviceAsync(client, userId, "device-a", scope: scope);
+
+        tokens.Error.ShouldBe(
+            "invalid_scope",
+            "A client asking a consumer grant for a back-office scope is confused about which plane "
+            + "it is on, and must be told so rather than quietly handed a narrower token.");
+        tokens.AccessToken.ShouldBeEmpty();
     }
 
     [RequiresDockerFact]

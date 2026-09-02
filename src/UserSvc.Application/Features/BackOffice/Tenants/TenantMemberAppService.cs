@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.Registration;
 using UserSvc.Application.Ports.Platform;
+using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Domain.Tenancy;
 
@@ -100,7 +101,7 @@ public sealed class TenantMemberAppService(
 
         IReadOnlyDictionary<int, IReadOnlyList<int>> roleIdsByMember = memberIds.Count == 0
             ? new Dictionary<int, IReadOnlyList<int>>()
-            : await bindings.ListRoleIdsByMembersAsync(memberIds, cancellationToken);
+            : await bindings.ListRoleIdsByMemberIdsAsync(memberIds, cancellationToken);
 
         var distinctRoleIds = roleIdsByMember.Values.SelectMany(ids => ids).Distinct().Order().ToList();
         var roleById = (await roles.FindByIdsAsync(distinctRoleIds, cancellationToken))
@@ -334,7 +335,7 @@ public sealed class TenantMemberAppService(
 
             // Read before the replace overwrites them; the codes they map to are resolved after
             // the commit, where the audit row is written.
-            currentRoleIds = [.. (await bindings.ListByMemberAsync(member.Id, token))
+            currentRoleIds = [.. (await bindings.ListByMemberIdAsync(member.Id, token))
                 .Select(binding => binding.RoleId)];
             wasAdmin = member.IsAdmin;
 
@@ -496,7 +497,7 @@ public sealed class TenantMemberAppService(
             // gone, and the question it has to answer is "what access did this take away".
             previousStatus = member.Status;
             wasAdmin = member.IsAdmin;
-            previousRoleIds = [.. (await bindings.ListByMemberAsync(member.Id, token))
+            previousRoleIds = [.. (await bindings.ListByMemberIdAsync(member.Id, token))
                 .Select(binding => binding.RoleId)];
 
             member.Status = TenantMemberStatuses.Removed;
