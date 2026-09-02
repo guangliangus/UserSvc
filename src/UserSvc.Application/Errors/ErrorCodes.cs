@@ -154,4 +154,31 @@ public static class ErrorCodes
     public const string InvalidFileType = "INVALID_FILE_TYPE";
 
     public const string TooManyFiles = "TOO_MANY_FILES";
+
+    // --- Back-office sign-in ---
+
+    /// <summary>Deliberately one answer for an unknown address and a wrong password alike: two
+    /// answers would make the login endpoint an account-existence oracle.</summary>
+    public const string InvalidCredentials = "INVALID_CREDENTIALS";
+
+    /// <summary>The account exists and is neither active nor disabled - a state nothing should be
+    /// signing in from.</summary>
+    public const string AccountInactive = "ACCOUNT_INACTIVE";
+
+    public const string OtpVerificationFailed = "OTP_VERIFICATION_FAILED";
+
+    /// <summary>The employee number already belongs to another account.</summary>
+    public const string StaffCodeConflict = "STAFF_CODE_CONFLICT";
+
+    /// <summary>The caller holds a pre-tenant token and asked for something that needs a chosen
+    /// context. It is not a refusal to be retried but an instruction to finish signing in.</summary>
+    public const string TenantContextRequired = "TENANT_CONTEXT_REQUIRED";
+
+    public const string MissingHeader = "MISSING_HEADER";
+
+    // --- Supplier links ---
+    public const string SupplierNotFound = "SUPPLIER_NOT_FOUND";
+    public const string SupplierNotApproved = "SUPPLIER_NOT_APPROVED";
+    public const string SupplierAlreadyLinked = "SUPPLIER_ALREADY_LINKED";
+    public const string CompanyNotFound = "COMPANY_NOT_FOUND";
 }

@@ -85,6 +85,38 @@ public sealed class SessionAppService(
             throw new ForbiddenException(ErrorCodes.AccountDisabled, "The account is not active.");
         }
 
+        await StartCoreAsync(userId, sessionId, authorizationId, device, cancellationToken);
+    }
+
+    /// <summary>
+    /// Open a session for a <b>back-office</b> subject, whose status the sign-in flow has already
+    /// established.
+    /// <para>
+    /// It exists because <see cref="StartAsync"/> confirms the subject through
+    /// <c>IUserRepository</c>, which is the <i>consumer</i> account table. A back-office subject is
+    /// an <c>iam.backend_users</c> id and the two planes number their accounts independently, so
+    /// that lookup is wrong twice over: it answers "no such user" for every back-office id while
+    /// <c>identity.users</c> is empty, and the day it is not, it would confirm one person's sign-in
+    /// against a different person's row.
+    /// </para>
+    /// </summary>
+    public Task StartForBackOfficeAsync(
+        int userId,
+        string sessionId,
+        string authorizationId,
+        DeviceDescriptor device,
+        CancellationToken cancellationToken) =>
+        StartCoreAsync(userId, sessionId, authorizationId, device, cancellationToken);
+
+    /// <summary>The session bookkeeping both planes share, once the caller has established that the
+    /// subject may sign in. Neither plane's account table is touched from here.</summary>
+    private async Task StartCoreAsync(
+        int userId,
+        string sessionId,
+        string authorizationId,
+        DeviceDescriptor device,
+        CancellationToken cancellationToken)
+    {
         var now = clock.UtcNow;
         var active = await sessions.ListActiveByUserAsync(userId, cancellationToken);
 

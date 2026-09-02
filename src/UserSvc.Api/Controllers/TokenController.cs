@@ -34,6 +34,7 @@ namespace UserSvc.Api.Controllers;
 [Produces("application/json")]
 public sealed class TokenController(
     SessionAppService sessions,
+    BackOfficeTokenIssuer backOffice,
     IOpenIddictApplicationManager applications,
     IOpenIddictAuthorizationManager authorizations,
     IOptions<AuthTokenOptions> options,
@@ -59,6 +60,19 @@ public sealed class TokenController(
         if (request.IsRefreshTokenGrantType())
         {
             return await RefreshAsync(cancellationToken);
+        }
+
+        // The back-office side of the guard below. These two grants mint credentials whose subject
+        // is an iam.backend_users id; the logic lives in BackOfficeTokenIssuer so that this file
+        // holds only what a controller must - SignIn and Forbid.
+        if (string.Equals(request.GrantType, BackOfficeTokenIssuer.SignInGrantType, StringComparison.Ordinal)
+            || string.Equals(request.GrantType, BackOfficeTokenIssuer.ContextGrantType, StringComparison.Ordinal))
+        {
+            var grant = await backOffice.IssueAsync(HttpContext, request, cancellationToken);
+
+            return grant.Principal is null
+                ? Reject(grant.Error, grant.ErrorDescription)
+                : SignIn(grant.Principal, OpenIddictServerAspNetCoreDefaults.AuthenticationScheme);
         }
 
         if (string.Equals(request.GrantType, _options.DeviceGrantType, StringComparison.Ordinal))
@@ -238,6 +252,14 @@ public sealed class TokenController(
     {
         Claims.Subject => [Destinations.AccessToken],
         AuthenticationSchemes.SessionIdClaimType => [Destinations.AccessToken],
+        // The refresh path carries a principal's claims over verbatim and then re-applies this
+        // map, so a back-office claim missing from it would be dropped on the first refresh: the
+        // renewed token would authenticate the same person with no context and no token version,
+        // and every gated route would answer 403 for a reason nothing in the response explains.
+        Claims.Name => [Destinations.AccessToken],
+        BackOfficeCallerReader.ActClaimType => [Destinations.AccessToken],
+        BackOfficeCallerReader.TokenVersionClaimType => [Destinations.AccessToken],
+
         _ => [],
     };
 

@@ -6,10 +6,16 @@ using OpenTelemetry.Trace;
 using Serilog;
 using UserSvc.Api.Auth;
 using UserSvc.Api.Errors;
+using UserSvc.Api.Middleware;
 using UserSvc.Api.Filters;
 using UserSvc.Api.Health;
 using UserSvc.Application.Errors;
+using UserSvc.Application.Features.Auth.TokenValidation;
 using UserSvc.Application.Features.BackOffice.Accounts;
+using UserSvc.Application.Features.BackOffice.Consumers;
+using UserSvc.Application.Features.BackOffice.SignIn;
+using UserSvc.Application.Features.BackOffice.Suppliers;
+using UserSvc.Application.Features.BackOffice.TestWhitelist;
 using UserSvc.Application.Features.BackOffice.Rbac;
 using UserSvc.Application.Features.BackOffice.Tenants;
 using UserSvc.Application.Features.Account;
@@ -89,6 +95,23 @@ builder.Services.AddScoped<SocialIdentityAppService>();
 builder.Services.AddScoped<AvatarAppService>();
 builder.Services.AddScoped<FeedbackAppService>();
 builder.Services.AddScoped<AccountAppService>();
+builder.Services.AddScoped<TokenValidationAppService>();
+
+// Back-office sign-in. The ticket service is a singleton holding only the options accessor and the
+// clock, and it reads the signing key at the point of use rather than at construction - so an
+// unconfigured deployment fails on a sign-in request, not on container build.
+builder.Services.AddSingleton<BackOfficeSignInTicketService>();
+builder.Services.AddScoped<BackOfficeStaffOnboarding>();
+builder.Services.AddScoped<BackOfficeSignInAppService>();
+builder.Services.AddScoped<BackOfficeTokenIssuer>();
+
+// Slice 12: supplier mountings, the consumer test whitelist and the consumer lookup behind it. The
+// summary service is shared by the last two - one answer to "how much of a consumer may an operator
+// see" - so it is registered once rather than constructed twice.
+builder.Services.AddScoped<SupplierLinkAppService>();
+builder.Services.AddScoped<ConsumerSummaryService>();
+builder.Services.AddScoped<ConsumerLookupAppService>();
+builder.Services.AddScoped<TestWhitelistAppService>();
 builder.Services.AddSingleton<OAuthStateService>();
 builder.Services.AddSingleton<SocialBindingTokenService>();
 builder.Services.AddScoped<RegistrationAppService>();
@@ -178,6 +201,13 @@ builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = 
         Activity.Current?.TraceId.ToString() ?? context.HttpContext.TraceIdentifier;
 
     context.ProblemDetails.Instance ??= context.HttpContext.Request.Path;
+
+    // Last, because it reads the errorCode filled above. This is the whole seam the i18n catalogue
+    // plugs into: one call here translates the user-facing 'detail' of every failure - including the
+    // 401s and 403s a middleware answers without ever reaching AppExceptionHandler - and not one
+    // throw site changed to make it happen. 'title' is deliberately left alone so dashboards can
+    // keep aggregating on it.
+    ProblemDetailLocalization.Apply(context);
 });
 builder.Services.AddExceptionHandler<AppExceptionHandler>();
 
@@ -203,6 +233,16 @@ app.UseExceptionHandler();
 // ProblemDetails" is false for exactly the two statuses clients hit most often, 401 and 403.
 // With AddProblemDetails registered, this middleware fills any empty error response with one.
 app.UseStatusCodePages();
+
+// Both of these only read the request and register response callbacks, so neither can swallow an
+// exception: they belong INSIDE the exception handler and the status-code pages, whose bodies then
+// get to read the negotiated locale and the trace id. And both must run BEFORE authentication,
+// because a 401 challenge writes its body on the way back out - run them after and the one response
+// class that most needs a translated sentence is the one that cannot have one.
+// Neither reads sid or act, so neither belongs in the gap between authentication and authorization:
+// that gap is load-bearing for RevokedSessionMiddleware and BackOfficeAuthzMiddleware, in that order.
+app.UseMiddleware<TraceHeaderMiddleware>();
+app.UseMiddleware<RequestContextMiddleware>();
 
 app.UseAuthentication();
 

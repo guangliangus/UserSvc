@@ -14,4 +14,12 @@
     <PackageReference Include="Microsoft.Extensions.Options.DataAnnotations" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The seven i18n bundles are the Go service's own locale files, so error text stays identical
+         across the cutover. They are data, not code: the messages are Chinese, Japanese, Korean,
+         Thai and Vietnamese, which a .cs file in this repository may not contain. Adding a language
+         is one more JSON file plus one entry in SupportedLocales. -->
+    <EmbeddedResource Include="Features/Localization/Locales/*.json" />
+  </ItemGroup>
+
 </Project>

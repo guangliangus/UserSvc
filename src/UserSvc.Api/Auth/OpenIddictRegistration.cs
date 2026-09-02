@@ -56,6 +56,12 @@ public static class OpenIddictRegistration
 
                 options.AllowRefreshTokenFlow();
                 options.AllowCustomFlow(tokenOptions.DeviceGrantType);
+
+                // The two back-office grants. Without these the server refuses the grant type
+                // before TokenController is ever reached, and back-office sign-in answers
+                // unsupported_grant_type with nothing to explain it.
+                options.AllowCustomFlow(BackOfficeTokenIssuer.SignInGrantType);
+                options.AllowCustomFlow(BackOfficeTokenIssuer.ContextGrantType);
                 // The back-office scopes are registered here so the server recognises them at all;
                 // BackOfficeAuthorization is what turns them into route policies. A pre-tenant
                 // token carries PreTenant alone, reaches exactly the two context-selection actions,
@@ -273,6 +279,13 @@ public static class OpenIddictRegistration
                     Permissions.Endpoints.Token,
                     Permissions.GrantTypes.RefreshToken,
                     Permissions.Prefixes.GrantType + settings.DeviceGrantType,
+
+                    // Same reason as the scope permissions below: a grant the SERVER allows but the
+                    // CLIENT is not permitted to use answers unauthorized_client, which reads like a
+                    // client-id problem and is not one. Observed: with AllowCustomFlow set and this
+                    // missing, the back-office context exchange refused every caller.
+                    Permissions.Prefixes.GrantType + BackOfficeTokenIssuer.SignInGrantType,
+                    Permissions.Prefixes.GrantType + BackOfficeTokenIssuer.ContextGrantType,
 
                     // Without the offline_access scope permission the client may ask for it and be
                     // refused, and the refresh design quietly reduces to access tokens only.

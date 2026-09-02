@@ -7,7 +7,9 @@ using StackExchange.Redis;
 using UserSvc.Application.Ports.Auth;
 using UserSvc.Application.Ports.BackOffice;
 using UserSvc.Application.Ports.Iam;
+using UserSvc.Application.Ports.Suppliers;
 using UserSvc.Application.Ports.Tenancy;
+using UserSvc.Application.Ports.TestWhitelist;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Ports.Users;
@@ -78,6 +80,17 @@ public static class DependencyInjection
         services.AddScoped<IRoleMenuRepository, RoleMenuRepository>();
         services.AddScoped<IRolePermissionRepository, RolePermissionRepository>();
         services.AddScoped<IIamAuditLogRepository, IamAuditLogRepository>();
+
+        // --- Supplier mountings and the consumer test whitelist (slice 12) ---
+        // One class, two ports: this slice's own read/write outlet and the narrow directory the
+        // tenancy slice consults on every context resolution. Registered as the concrete type and
+        // forwarded, so both ports resolve the SAME instance inside a request rather than two
+        // adapters over one DbContext.
+        services.AddScoped<SupplierCompanyLinkRepository>();
+        services.AddScoped<ISupplierCompanyLinkRepository>(
+            provider => provider.GetRequiredService<SupplierCompanyLinkRepository>());
+        services.AddScoped<ITestWhitelistRepository, TestWhitelistRepository>();
+        services.AddScoped<IConsumerAccountDirectory, TestWhitelistConsumerDirectory>();
         services.AddScoped<ITenantMemberRepository, TenantMemberRepository>();
         services.AddScoped<IUserTenantRoleRepository, UserTenantRoleRepository>();
         services.AddSingleton<IClock, SystemClock>();
@@ -88,7 +101,7 @@ public static class DependencyInjection
         AddSocialIdentityProviders(services, configuration);
         AddNotificationClient(services, configuration);
         AddRiskControl(services, configuration);
-        AddStaffDirectory(services);
+        AddStaffDirectory(services, configuration);
         AddCrossSliceDirectories(services);
         AddTenantMasterData(services);
 
@@ -169,13 +182,45 @@ public static class DependencyInjection
     }
 
     /// <summary>
-    /// The corporate staff directory ships as a port with a refusing placeholder until an adapter
-    /// for the real upstream exists (see <see cref="UnavailableStaffDirectory"/>). Replacing this
-    /// one line with the real adapter is the whole cutover - no calling code changes.
+    /// The corporate staff directory, behind a real client (see <see cref="LionTravelStaffDirectory"/>).
+    /// <para>
+    /// No <c>ValidateOnStart</c> and nothing <c>[Required]</c>: one capability needs this section,
+    /// and a deployment without it must still boot and still serve every other door. The adapter
+    /// checks its own configuration at the point of use and answers 500 NOT_CONFIGURED naming
+    /// exactly which keys are absent.
+    /// </para>
     /// </summary>
-    private static void AddStaffDirectory(IServiceCollection services)
+    private static void AddStaffDirectory(IServiceCollection services, IConfiguration configuration)
     {
-        services.AddSingleton<IStaffDirectory, UnavailableStaffDirectory>();
+        services.AddOptions<LionTravelOptions>()
+            .Bind(configuration.GetSection(LionTravelOptions.SectionName))
+            .ValidateDataAnnotations();
+
+        // Singleton: the in-process half of the application-token cache and the gate that collapses
+        // concurrent mints are its state; a scoped instance would hold neither across requests.
+        services.AddSingleton<LionTravelAccessTokenCache>();
+
+        // No BaseAddress: the upstream is three hosts and the adapter builds absolute URIs.
+        // Retries stay ON, unlike the WeChat clients - nothing here is a single-use credential from
+        // our side, and a transient 503 means the code was never examined at all.
+        services
+            .AddHttpClient<IStaffDirectory, LionTravelStaffDirectory>()
+            .AddStandardResilienceHandler()
+            .Configure((options, provider) =>
+            {
+                var staff = provider.GetRequiredService<IOptions<LionTravelOptions>>().Value;
+
+                options.AttemptTimeout.Timeout = staff.AttemptTimeout;
+                options.TotalRequestTimeout.Timeout = staff.TotalRequestTimeout;
+                options.Retry.ShouldRetryAfterHeader = false;
+                options.CircuitBreaker.SamplingDuration = MaxOf(
+                    TimeSpan.FromSeconds(30), staff.AttemptTimeout * 2);
+            });
+
+        // A factory, so the sign-in service can be constructed - and the password door served - on
+        // a deployment with no staff directory configured. Injecting the client itself would make
+        // one door's secrets a dependency of the other door.
+        services.AddTransient<Func<IStaffDirectory>>(provider => provider.GetRequiredService<IStaffDirectory>);
     }
 
     /// <summary>
@@ -289,7 +334,12 @@ public static class DependencyInjection
     private static void AddTenantMasterData(IServiceCollection services)
     {
         services.AddSingleton<ITenantMasterDataDirectory, UnavailableTenantMasterDataDirectory>();
-        services.AddSingleton<ISupplierCompanyLinkDirectory, UnavailableSupplierCompanyLinkDirectory>();
+        // Was UnavailableSupplierCompanyLinkDirectory, which answered "no mountings" to everything
+        // because the table did not exist. It does now, so this is the real adapter - and it is
+        // SCOPED, not singleton: it reads the request's own DbContext, and a singleton over a
+        // scoped context is the classic way to capture a disposed one.
+        services.AddScoped<ISupplierCompanyLinkDirectory>(
+            provider => provider.GetRequiredService<SupplierCompanyLinkRepository>());
     }
 
     private static TimeSpan MaxOf(TimeSpan left, TimeSpan right) => left > right ? left : right;
