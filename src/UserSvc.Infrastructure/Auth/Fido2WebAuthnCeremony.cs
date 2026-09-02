@@ -217,7 +217,15 @@ public sealed class RedisPasskeyFlowStore(
     IOptions<RedisOptions> redisOptions,
     ILogger<RedisPasskeyFlowStore> logger) : IPasskeyFlowStore
 {
-    private readonly string _keyPrefix = redisOptions.Value.KeyPrefix;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
+    /// capability may only break itself"). A field initializer runs during construction, and
+    /// <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation runs - so
+    /// binding it into a field makes merely constructing this store throw on a bad <c>Redis</c>
+    /// section, which is a different capability from the one this file is about.
+    /// <see cref="IOptions{TOptions}.Value"/> caches, so the property costs nothing per call.
+    /// </summary>
+    private string _keyPrefix => redisOptions.Value.KeyPrefix;
 
     public async Task StoreAsync(
         string flowId,
@@ -321,6 +329,29 @@ public sealed class RedisPasskeyFlowStore(
 /// no alert would ever find it. So <see cref="Fido2ErrorCode.InvalidSignCount"/> is picked out by
 /// hand and given its own error code and its own log line.
 /// </para>
+/// <para>
+/// <b>The <c>Fido2</c> instance is immutable and built once, but it is built on the first ceremony
+/// rather than in the constructor, and that difference is the whole of a measured outage.</b>
+/// <c>Passkey</c> is the one section in this service registered without
+/// <c>ValidateOnStart()</c> - deliberately, because a relying-party identity is not something every
+/// deployment has yet - so <see cref="IOptions{TOptions}.Value"/> is where its validation actually
+/// runs. Reading it in the constructor therefore threw while the <i>controller</i> was being
+/// activated, before any action method or its consumer-plane guard ran, and no deployment carries a
+/// <c>Passkey</c> section today. Measured on this host: <c>GET /api/v1/auth/passkey</c>, its
+/// <c>PATCH</c> and its <c>DELETE</c> - three pure database operations that never touch a
+/// relying-party identity - all answered 500 <c>NOT_CONFIGURED</c> naming <c>RpId</c>, so an
+/// account that enrolled a credential while the section was present could not list or remove it
+/// afterwards; and a back-office token on any of those routes got that same 500 where every other
+/// consumer endpoint answers 403 <c>FORBIDDEN</c>, because the throw beat
+/// <c>ICurrentUser.RequireConsumerId()</c> to it. Both are the failure
+/// <c>docs/architecture.md</c> records as "a missing capability may only break itself".
+/// </para>
+/// <para>
+/// The deferral changes nothing else, on purpose: the instance is still one per process, still
+/// immutable, and a missing section still surfaces as 500 <c>NOT_CONFIGURED</c> naming the section,
+/// because <see cref="Lazy{T}"/> rethrows the factory's own <c>OptionsValidationException</c>
+/// rather than wrapping it.
+/// </para>
 /// </summary>
 public sealed class Fido2WebAuthnCeremony : IWebAuthnCeremony
 {
@@ -336,9 +367,9 @@ public sealed class Fido2WebAuthnCeremony : IWebAuthnCeremony
     private const string FlowExpiredMessage = "This passkey request has expired. Start again.";
 
     private readonly IPasskeyFlowStore _flows;
+    private readonly IOptions<PasskeyOptions> _options;
     private readonly ILogger<Fido2WebAuthnCeremony> _logger;
-    private readonly IFido2 _fido2;
-    private readonly TimeSpan _challengeTtl;
+    private readonly Lazy<IFido2> _lazyFido2;
 
     public Fido2WebAuthnCeremony(
         IPasskeyFlowStore flows,
@@ -348,17 +379,41 @@ public sealed class Fido2WebAuthnCeremony : IWebAuthnCeremony
         ArgumentNullException.ThrowIfNull(options);
 
         _flows = flows;
+        _options = options;
         _logger = logger;
 
-        var passkey = options.Value;
-        _challengeTtl = passkey.ChallengeTtl;
-        _fido2 = new Fido2(new Fido2Configuration
-        {
-            ServerDomain = passkey.RpId,
-            ServerName = passkey.RpDisplayName,
-            Origins = passkey.BuildOriginSet(),
-        });
+        // ExecutionAndPublication: one Fido2 for the process even if several ceremonies begin at
+        // once. The factory is what reads the section, so it is read on the first ceremony rather
+        // than while this singleton is being constructed - see the class remarks.
+        _lazyFido2 = new Lazy<IFido2>(
+            () =>
+            {
+                var passkey = options.Value;
+
+                return new Fido2(new Fido2Configuration
+                {
+                    ServerDomain = passkey.RpId,
+                    ServerName = passkey.RpDisplayName,
+                    Origins = passkey.BuildOriginSet(),
+                });
+            },
+            LazyThreadSafetyMode.ExecutionAndPublication);
     }
+
+    /// <summary>
+    /// The verifier, built exactly once from the validated section on the first ceremony that needs
+    /// it. Every call site reads this property, so the deferral is invisible above it.
+    /// </summary>
+    private IFido2 _fido2 => _lazyFido2.Value;
+
+    /// <summary>
+    /// Read at the point of use, and deliberately not folded into the <see cref="Lazy{T}"/> above.
+    /// That <see cref="Lazy{T}"/> exists to build one immutable verifier; a duration is not part of
+    /// a verifier, and capturing it there would mean the section is read for a reason that has
+    /// nothing to do with the object being built. <see cref="IOptions{TOptions}.Value"/> caches, so
+    /// two point-of-use reads cost no more than one.
+    /// </summary>
+    private TimeSpan _challengeTtl => _options.Value.ChallengeTtl;
 
     public async Task<WebAuthnCeremonyStart> BeginRegistrationAsync(
         WebAuthnUserEntity user,

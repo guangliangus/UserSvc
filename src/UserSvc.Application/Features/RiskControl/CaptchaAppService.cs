@@ -27,7 +27,16 @@ namespace UserSvc.Application.Features.RiskControl;
 /// </summary>
 public sealed class CaptchaAppService(IRiskControlService riskControl, IOptions<RiskControlOptions> options)
 {
-    private readonly RiskControlOptions _options = options.Value;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
+    /// capability may only break itself"). A field initializer runs during construction, and
+    /// <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation runs - so
+    /// binding it into a field makes merely constructing this service throw on a bad
+    /// <c>RiskControl</c> section, and the CAPTCHA endpoint is anonymous, so that 500 is the first
+    /// thing an unauthenticated caller meets. <see cref="IOptions{TOptions}.Value"/> caches, so
+    /// the property costs nothing per call.
+    /// </summary>
+    private RiskControlOptions _options => options.Value;
 
     /// <summary>
     /// Assess the provider token and, if it holds up, issue the bypass token bound to this exact

@@ -67,7 +67,7 @@ public sealed class BackOfficeSchemaParityTests
         { "staff_code", "text", true },
         { "dept_no", "text", true },
         { "dept_name", "text", true },
-        { "status", "character varying(20)", false },
+        { "status", "text", false },
         { "last_login_at", "timestamp with time zone", true },
         { "created_at", "timestamp with time zone", false },
         { "updated_at", "timestamp with time zone", false },
@@ -97,13 +97,13 @@ public sealed class BackOfficeSchemaParityTests
     {
         { "id", "integer", false },
         { "user_id", "integer", false },
-        { "identity_type", "character varying(20)", false },
-        { "provider", "character varying(50)", false },
+        { "identity_type", "text", false },
+        { "provider", "text", false },
         { "provider_uid", "text", true },
-        { "identifier_hash", "character varying(64)", false },
+        { "identifier_hash", "text", false },
         { "identifier_ciphertext", "text", false },
         { "identifier_masked", "text", false },
-        { "key_version", "character varying(20)", false },
+        { "key_version", "text", false },
         { "provider_details", "jsonb", true },
         { "status", "text", false },
         { "created_at", "timestamp with time zone", false },
@@ -228,8 +228,12 @@ public sealed class BackOfficeSchemaParityTests
         var identities = EntityType<BackendIdentity>();
         identities.GetProperty(nameof(BackendIdentity.Provider)).GetDefaultValue().ShouldBe(string.Empty);
         identities.GetProperty(nameof(BackendIdentity.Status)).GetDefaultValue().ShouldBe("ACTIVE");
+        // No default, in either direction. This used to assert '{}'::jsonb "with the live
+        // column's own default"; the live column has none, so the model was declaring a default the
+        // database would never supply. NULL is the honest value for an identity with no upstream
+        // payload, which is every password- and OTP-provisioned row.
         identities.GetProperty(nameof(BackendIdentity.ProviderDetails))
-            .GetDefaultValueSql().ShouldBe("'{}'::jsonb");
+            .GetDefaultValueSql().ShouldBeNull();
     }
 
     /// <summary>

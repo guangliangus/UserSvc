@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS ix_users_birth_date_hash ON identity.users (birth_dat
 CREATE TABLE IF NOT EXISTS identity.user_identities
 (
     id                     SERIAL NOT NULL,
-    user_id                INTEGER     NOT NULL REFERENCES identity.users (id),
+    user_id                INTEGER     NOT NULL,
     identity_type          TEXT        NOT NULL,
     identifier_hash        TEXT        NOT NULL,
     identifier_ciphertext  TEXT        NOT NULL DEFAULT '',
@@ -54,8 +54,43 @@ CREATE TABLE IF NOT EXISTS identity.user_identities
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by             TEXT        NOT NULL DEFAULT '',
     updated_by             TEXT        NOT NULL DEFAULT '',
-    CONSTRAINT pk_user_identities PRIMARY KEY (id)
+    CONSTRAINT pk_user_identities PRIMARY KEY (id),
+    -- Written out rather than left to the inline REFERENCES shorthand, and that is the whole
+    -- change here. The shorthand produced this same name (PostgreSQL derives
+    -- <table>_<column>_fkey) but no ON DELETE clause, which means NO ACTION - the SQL default, i.e.
+    -- the database answering by omission a question the writer never answered. The EF model has
+    -- always said RESTRICT, so the two sides read differently while behaving identically (the two
+    -- differ only for a DEFERRABLE constraint, and this one is not). RESTRICT is the intent: a
+    -- user row with identities cannot be deleted, and identities are never orphaned by a
+    -- hand-written fix-up script.
+    CONSTRAINT user_identities_user_id_fkey FOREIGN KEY (user_id)
+        REFERENCES identity.users (id) ON DELETE RESTRICT
 );
+
+-- Existing databases carry the same constraint under the same name with NO ACTION, because that is
+-- what the shorthand above used to emit. Re-state it. Guarded on confdeltype ('a' = NO ACTION,
+-- 'r' = RESTRICT) so a re-run does nothing, and inside one DO block so the table is never left
+-- without the key.
+DO $identity_fk_restrict$
+BEGIN
+    IF EXISTS (SELECT 1
+                 FROM pg_constraint
+                WHERE conname = 'user_identities_user_id_fkey'
+                  AND conrelid = 'identity.user_identities'::regclass
+                  AND confdeltype <> 'r') THEN
+        ALTER TABLE identity.user_identities DROP CONSTRAINT user_identities_user_id_fkey;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1
+                     FROM pg_constraint
+                    WHERE conname = 'user_identities_user_id_fkey'
+                      AND conrelid = 'identity.user_identities'::regclass) THEN
+        ALTER TABLE identity.user_identities
+            ADD CONSTRAINT user_identities_user_id_fkey FOREIGN KEY (user_id)
+                REFERENCES identity.users (id) ON DELETE RESTRICT;
+    END IF;
+END
+$identity_fk_restrict$;
 
 COMMENT ON COLUMN identity.user_identities.identity_type IS
     'PHONE | EMAIL | WECHAT | WECHAT_MINI | FIREBASE | LINE | PASSKEY';
@@ -183,8 +218,19 @@ COMMENT ON COLUMN identity.user_sessions.device_id IS 'Client-reported and forge
 COMMENT ON COLUMN identity.user_sessions.user_id IS 'Subject id within realm; identity.users.id or iam.backend_users.id';
 COMMENT ON COLUMN identity.user_sessions.realm IS 'CONSUMER | BACKOFFICE';
 COMMENT ON COLUMN identity.user_sessions.status IS 'ACTIVE | REVOKED';
+-- Every value RevocationReasons defines, and this is the ONLY place the list is stated. It used to
+-- be restated at the end of 0011 as well, which is how the live database ended up carrying the
+-- stale six-value list on 2026-09-02: 0011 wrote the corrected eight, then this script was re-run
+-- for the realm column above and COMMENT - which replaces rather than appends - put the stale one
+-- back. Two scripts owning one comment means whichever ran last wins, silently. If a ninth reason
+-- appears, it belongs here.
+--
+-- There is deliberately NO CHECK constraint on this column; db/README.md argues it. The short
+-- version: the value is written only from a domain constant on a revocation path, nothing branches
+-- on it, and a CHECK that rejected a newly added reason would turn "sign this device out" into a
+-- failed write - an unrevoked session, which is worse than an unfamiliar audit label.
 COMMENT ON COLUMN identity.user_sessions.revoked_by IS
-    'SELF | OTHER_DEVICE | SUPERSEDED | PASSWORD_CHANGE | ADMIN | TOKEN_REPLAY';
+    'SELF | OTHER_DEVICE | SUPERSEDED | DEVICE_LIMIT | PASSWORD_CHANGE | ADMIN | TOKEN_REPLAY | DEREGISTERED; empty string while the session is active';
 COMMENT ON COLUMN identity.user_sessions.last_seen_at IS 'Updated on token refresh only; writing on every request is write amplification';
 
 -- Realm-free on purpose, and the only index here that is. A session_id is a server-generated GUID

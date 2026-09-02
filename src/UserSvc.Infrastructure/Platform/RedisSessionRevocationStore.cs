@@ -38,7 +38,15 @@ public sealed class RedisSessionRevocationStore(
     /// <summary>The value is irrelevant — only the key's existence and its TTL carry meaning.</summary>
     private const string Marker = "1";
 
-    private readonly string _keyPrefix = options.Value.KeyPrefix;
+    /// <summary>
+    /// Read at the point of use, never into a field. <c>.Value</c> is where the section's
+    /// DataAnnotations run, so binding it into a field initializer makes merely <i>constructing</i>
+    /// this type throw when the <c>Redis</c> section is unusable - and it then reports somebody
+    /// else's missing setting from every endpoint that shares the object graph
+    /// (docs/architecture.md, "a missing capability may only break itself"). <c>.Value</c> is
+    /// cached, so reading it per call costs nothing.
+    /// </summary>
+    private string KeyPrefix => options.Value.KeyPrefix;
 
     public async Task RevokeAsync(string sessionId, TimeSpan ttl, CancellationToken cancellationToken)
     {
@@ -94,7 +102,7 @@ public sealed class RedisSessionRevocationStore(
         }
     }
 
-    private string KeyFor(string sessionId) => $"{_keyPrefix}revoked:sid:{sessionId}";
+    private string KeyFor(string sessionId) => $"{KeyPrefix}revoked:sid:{sessionId}";
 
     private bool FailOpen(string sessionId, Exception cause)
     {

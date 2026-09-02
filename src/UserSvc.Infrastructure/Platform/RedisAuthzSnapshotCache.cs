@@ -61,7 +61,15 @@ public sealed class RedisAuthzSnapshotCache(
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
-    private readonly string _keyPrefix = options.Value.KeyPrefix;
+    /// <summary>
+    /// Read at the point of use, never into a field. <c>.Value</c> is where the section's
+    /// DataAnnotations run, so binding it into a field initializer makes merely <i>constructing</i>
+    /// this type throw when the <c>Redis</c> section is unusable - and it then reports somebody
+    /// else's missing setting from every endpoint that shares the object graph
+    /// (docs/architecture.md, "a missing capability may only break itself"). <c>.Value</c> is
+    /// cached, so reading it per call costs nothing.
+    /// </summary>
+    private string KeyPrefix => options.Value.KeyPrefix;
 
     /// <summary>The entry key for one account in one acting context.</summary>
     public string KeyFor(int userId, ActClaim act)
@@ -71,7 +79,7 @@ public sealed class RedisAuthzSnapshotCache(
         var code = string.IsNullOrEmpty(act.Code) ? "*" : act.Code;
         var dimension = string.IsNullOrEmpty(act.Dimension) ? "-" : act.Dimension;
 
-        return $"{_keyPrefix}authz:{userId}:{act.Type}:{code}:{dimension}";
+        return $"{KeyPrefix}authz:{userId}:{act.Type}:{code}:{dimension}";
     }
 
     /// <summary>
@@ -187,7 +195,7 @@ public sealed class RedisAuthzSnapshotCache(
         }
     }
 
-    private string IndexKeyFor(int userId) => $"{_keyPrefix}authz:idx:{userId}";
+    private string IndexKeyFor(int userId) => $"{KeyPrefix}authz:idx:{userId}";
 
     private async Task DeleteQuietlyAsync(string key)
     {

@@ -44,7 +44,16 @@ public sealed class TokenController(
     /// on purpose: two copies that drift produce a 404 with no other symptom.</summary>
     public const string TokenEndpointPath = "/connect/token";
 
-    private readonly AuthTokenOptions _options = options.Value;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
+    /// capability may only break itself"). A field initializer runs while the controller is being
+    /// activated, and <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation
+    /// runs - so binding it into a field would answer <i>every</i> grant this endpoint serves with
+    /// 500 <c>NOT_CONFIGURED</c> when the section is bad, including the refresh-token grant that
+    /// reads nothing from it. <see cref="IOptions{TOptions}.Value"/> caches, so the property costs
+    /// nothing per call.
+    /// </summary>
+    private AuthTokenOptions _options => options.Value;
 
     [HttpPost]
     [Consumes("application/x-www-form-urlencoded")]

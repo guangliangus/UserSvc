@@ -59,7 +59,13 @@ public sealed class RoleConfiguration : IEntityTypeConfiguration<Role>
         // Reproduced from the live schema; see MenuConfiguration for why the model carries them.
         builder.Property(x => x.Category).HasDefaultValueSql("''::text");
         builder.Property(x => x.OwnerType).HasDefaultValueSql($"'{RoleOwnerTypes.System}'::text");
-        builder.Property(x => x.IsAdmin).HasDefaultValueSql("false");
+        // No store default on is_admin, for the reason spelled out in FeedbackTypeConfiguration.
+        // The consequence here was milder - the store default agreed with the CLR default, so
+        // omitting the column landed on the right value anyway - but it is the same warning on
+        // every boot and the same trap underneath: the day someone flips this default to true,
+        // "create a non-admin role" starts creating admin roles. EF now always writes the value.
+        // db/0005 keeps the column's DEFAULT false.
+
         builder.Property(x => x.CreatedAt).HasDefaultValueSql("now()");
         builder.Property(x => x.UpdatedAt).HasDefaultValueSql("now()");
 

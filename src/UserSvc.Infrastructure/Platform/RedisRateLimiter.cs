@@ -29,14 +29,9 @@ namespace UserSvc.Infrastructure.Platform;
 /// call logs a warning - the rate of those lines is the only signal that the window is open.
 /// </para>
 /// <para>
-/// Exception handling follows <see cref="RedisSessionRevocationStore"/>, and for the same
-/// non-obvious reason: <c>RedisTimeoutException</c> derives from <see cref="TimeoutException"/> and
-/// <c>RedisCommandException</c> derives straight from <see cref="Exception"/>, so catching
-/// <c>RedisException</c> alone would miss every timeout - which is the failure fail-open exists
-/// for. There is a fourth, found by running this service rather than by reading it:
-/// <c>TaskCanceledException</c>, which the first command a fresh process issues can throw while the
-/// multiplexer is still connecting. See the comment on that catch clause in
-/// <see cref="TryAcquireAsync"/>.
+/// What counts as a store failure is <see cref="RedisFailure"/>'s to decide, for every adapter in
+/// this service; what to do about one is decided here. The four shapes and the reason a cancelled
+/// task is one of them are written down there rather than repeated in each of the eight.
 /// </para>
 /// <para>
 /// All three operations share the key layout of <see cref="BuildKey"/>, which is what lets
@@ -108,7 +103,15 @@ public sealed class RedisRateLimiter(
         return { count, redis.call('PTTL', KEYS[1]) }
         """;
 
-    private readonly string _keyPrefix = options.Value.KeyPrefix;
+    /// <summary>
+    /// Read at the point of use, never into a field. <c>.Value</c> is where the section's
+    /// DataAnnotations run, so binding it into a field initializer makes merely <i>constructing</i>
+    /// this type throw when the <c>Redis</c> section is unusable - and it then reports somebody
+    /// else's missing setting from every endpoint that shares the object graph
+    /// (docs/architecture.md, "a missing capability may only break itself"). <c>.Value</c> is
+    /// cached, so reading it per call costs nothing.
+    /// </summary>
+    private string KeyPrefix => options.Value.KeyPrefix;
 
     public async Task<RateLimitDecision> TryAcquireAsync(
         string dimension,
@@ -124,7 +127,7 @@ public sealed class RedisRateLimiter(
         // at the boundary only. The command itself, once issued, is not cancellable.
         cancellationToken.ThrowIfCancellationRequested();
 
-        var redisKey = BuildKey(_keyPrefix, dimension, key, policy.Window);
+        var redisKey = BuildKey(KeyPrefix, dimension, key, policy.Window);
 
         try
         {
@@ -135,31 +138,8 @@ public sealed class RedisRateLimiter(
 
             return Interpret(reply, dimension, policy, counted: true);
         }
-        catch (RedisException ex)
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
-            return FailOpen(dimension, policy, ex);
-        }
-        catch (RedisTimeoutException ex)
-        {
-            return FailOpen(dimension, policy, ex);
-        }
-        catch (RedisCommandException ex)
-        {
-            return FailOpen(dimension, policy, ex);
-        }
-        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
-        {
-            // The fourth one, and the one nothing in the type hierarchy hints at. Observed live:
-            // the first ScriptEvaluateAsync a freshly started process issues threw
-            // TaskCanceledException - not RedisTimeoutException - while the multiplexer was still
-            // establishing itself under AsyncTimeout of 500 ms, and the sign-in it was protecting
-            // answered 500 INTERNAL_ERROR. A limiter that 500s the endpoint it guards is the exact
-            // outcome the whole fail-open design exists to prevent, and it happened on the first
-            // login after every deployment.
-            //
-            // The filter is what keeps this honest: if OUR token is the cancelled one, the caller
-            // has gone away and the cancellation is theirs to see, not something to swallow into a
-            // rate-limit decision nobody will read.
             return FailOpen(dimension, policy, ex);
         }
     }
@@ -176,7 +156,7 @@ public sealed class RedisRateLimiter(
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        var redisKey = BuildKey(_keyPrefix, dimension, key, policy.Window);
+        var redisKey = BuildKey(KeyPrefix, dimension, key, policy.Window);
 
         try
         {
@@ -185,19 +165,7 @@ public sealed class RedisRateLimiter(
 
             return Interpret(reply, dimension, policy, counted: false);
         }
-        catch (RedisException ex)
-        {
-            return FailOpen(dimension, policy, ex);
-        }
-        catch (RedisTimeoutException ex)
-        {
-            return FailOpen(dimension, policy, ex);
-        }
-        catch (RedisCommandException ex)
-        {
-            return FailOpen(dimension, policy, ex);
-        }
-        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             return FailOpen(dimension, policy, ex);
         }
@@ -216,6 +184,24 @@ public sealed class RedisRateLimiter(
     /// decided, so a bookkeeping write cannot be allowed to fail it. Warning rather than Error,
     /// because the cost is bounded by the window and the request itself was served correctly.
     /// </para>
+    /// <para>
+    /// <b>And that promise covers the arguments too, which is the part that was wrong.</b> The
+    /// swallowing used to sit behind <c>ArgumentException.ThrowIfNullOrWhiteSpace</c>, so a clear
+    /// of a budget whose subject was empty threw <i>past</i> the try and the endpoint answered
+    /// 500 on a sign-in that had already succeeded - the one outcome the method exists to avoid,
+    /// reached by the one input that never touches Redis. Nothing but the caller's own
+    /// <paramref name="cancellationToken"/> may leave this method now: an input it cannot turn
+    /// into a counter key is logged and dropped, because there is no counter such a call could
+    /// have been about.
+    /// </para>
+    /// <para>
+    /// <b>Giving up the argument guards costs nothing, and the asymmetry is the reason.</b> The
+    /// gate operations keep them: a caller cannot have counters to clear without having counted
+    /// first, so a blank subject or a misspelled dimension is refused loudly by
+    /// <see cref="TryAcquireAsync"/> or <see cref="PeekAsync"/> long before anything asks for a
+    /// reset. Validating is the job of the operation whose answer is load-bearing, not of the one
+    /// that runs after the answer was given.
+    /// </para>
     /// </summary>
     public async Task ResetAsync(
         string dimension,
@@ -223,28 +209,18 @@ public sealed class RedisRateLimiter(
         IReadOnlyList<RateLimitPolicy> policies,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(dimension);
-        ArgumentException.ThrowIfNullOrWhiteSpace(key);
-        ArgumentNullException.ThrowIfNull(policies);
-
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (policies.Count == 0)
+        if (KeysToClear(dimension, key, policies) is not { Length: > 0 } keys)
         {
             return;
-        }
-
-        var keys = new RedisKey[policies.Count];
-        for (var index = 0; index < policies.Count; index++)
-        {
-            keys[index] = BuildKey(_keyPrefix, dimension, key, policies[index].Window);
         }
 
         try
         {
             await connection.GetDatabase().KeyDeleteAsync(keys, CommandFlags.None);
         }
-        catch (Exception ex) when (IsStoreFailure(ex, cancellationToken))
+        catch (Exception ex) when (RedisFailure.IsStoreFailure(ex, cancellationToken))
         {
             logger.LogWarning(
                 ex,
@@ -256,18 +232,65 @@ public sealed class RedisRateLimiter(
     }
 
     /// <summary>
-    /// The four shapes a StackExchange.Redis failure arrives in, in one filter, so the reset path
-    /// cannot drift from the two counting paths. <c>OperationCanceledException</c> is included only
-    /// when it did not come from the caller's own token - see the note in
-    /// <see cref="TryAcquireAsync"/>.
+    /// The keys <see cref="ResetAsync"/> would delete, or null when the call names no counter.
+    /// <para>
+    /// Every rejection here is a return rather than a throw, and the two log levels say which kind
+    /// of caller mistake it was. A dimension this service spells wrong is a defect in this service
+    /// - the dimensions are its own constants - and it will not fix itself, so it is an Error. A
+    /// blank subject is data: the identifier the reset was keyed on was simply absent, which is
+    /// what a per-address reset looks like when the address is unavailable, so it is a Warning and
+    /// the request carries on. Neither may be turned into a counter key: a blank subject hashes to
+    /// one shared digest, and deleting <i>that</i> would clear an aggregate bucket belonging to
+    /// every caller who also sent nothing.
+    /// </para>
     /// </summary>
-    private static bool IsStoreFailure(Exception exception, CancellationToken cancellationToken) =>
-        exception switch
+    private RedisKey[]? KeysToClear(string dimension, string key, IReadOnlyList<RateLimitPolicy> policies)
+    {
+        if (string.IsNullOrWhiteSpace(dimension) || dimension.Contains(':', StringComparison.Ordinal))
         {
-            RedisException or RedisTimeoutException or RedisCommandException => true,
-            OperationCanceledException => !cancellationToken.IsCancellationRequested,
-            _ => false,
-        };
+            logger.LogError(
+                "A rate-limit reset named the dimension {Dimension}, which is not a dimension this "
+                + "service can spell a counter key with; nothing was cleared. The counters it meant "
+                + "to clear stand until their windows expire.",
+                dimension);
+
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            logger.LogWarning(
+                "A rate-limit reset on dimension {Dimension} carried no subject, so there is no "
+                + "counter to clear. Nothing was deleted and the request continues.",
+                dimension);
+
+            return null;
+        }
+
+        // An empty list is the documented no-op - a caller enforcing nothing has nothing to clear.
+        if (policies is null || policies.Count == 0)
+        {
+            return null;
+        }
+
+        var keys = new RedisKey[policies.Count];
+        for (var index = 0; index < policies.Count; index++)
+        {
+            if (policies[index] is not { } policy)
+            {
+                logger.LogError(
+                    "A rate-limit reset on dimension {Dimension} listed a missing policy, so the "
+                    + "windows to clear cannot be named; nothing was deleted.",
+                    dimension);
+
+                return null;
+            }
+
+            keys[index] = BuildKey(KeyPrefix, dimension, key, policy.Window);
+        }
+
+        return keys;
+    }
 
     /// <summary>
     /// Builds the counter's key. Public because the layout is a deployment fact - operators grep

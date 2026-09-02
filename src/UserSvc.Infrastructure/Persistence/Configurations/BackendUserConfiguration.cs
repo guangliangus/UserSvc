@@ -14,10 +14,12 @@ namespace UserSvc.Infrastructure.Persistence.Configurations;
 /// be granted per schema.
 /// </para>
 /// <para>
-/// Two shapes here follow the live database rather than the team's own DDL preferences, because
-/// existing rows are the constraint: <c>status</c> is <c>varchar(20)</c> rather than <c>text</c>,
-/// and most string columns are nullable rather than NOT NULL DEFAULT ''. Both are recorded as
-/// known divergences; neither is worth a data migration on its own.
+/// <b>One shape here departs from the team's DDL conventions, and it is the nullability.</b> Most
+/// string columns are nullable rather than NOT NULL DEFAULT '', and the CLR properties are
+/// <c>string?</c> to match; <c>db/README.md</c> argues it column by column. <c>status</c> used to
+/// be <c>varchar(20)</c> on the same "existing rows are the constraint" reasoning, which was false
+/// - <c>iam</c> is this service's own schema and every row in it was written by this service - so
+/// it is <c>text</c> now, like every other string in this database.
 /// </para>
 /// </summary>
 public sealed class BackendUserConfiguration : IEntityTypeConfiguration<BackendUser>
@@ -44,9 +46,7 @@ public sealed class BackendUserConfiguration : IEntityTypeConfiguration<BackendU
         // xmin can only detect a conflict between two writers, not a rule about the whole table.
         builder.UseXminConcurrencyToken();
 
-        builder.Property(x => x.Status)
-            .HasColumnType("character varying(20)")
-            .HasDefaultValue(BackendUserStatuses.Pending);
+        builder.Property(x => x.Status).HasDefaultValue(BackendUserStatuses.Pending);
 
         builder.Property(x => x.Origin).HasDefaultValue(BackendUserOrigins.Internal);
 

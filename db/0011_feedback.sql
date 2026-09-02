@@ -1,18 +1,21 @@
 -- =============================================================================
--- 0008 · feedback: the personal-centre feedback form's category catalogue and its submissions.
+-- 0011 · feedback: the personal-centre feedback form's category catalogue and its submissions.
 --
 -- Run by hand (decision 14): DDL first, code second. Idempotent and re-runnable.
 -- Column order, types, constraint names and index names are byte-matched to what
 --   dotnet dotnet-ef dbcontext script -p src/UserSvc.Infrastructure -s src/UserSvc.Infrastructure
 -- emits, so CI gate 04 diffs clean.
 --
--- TWO SHAPES FOLLOW THE LIVE DATABASE RATHER THAN THE TEAM'S OWN DDL PREFERENCES, because rows
--- already exist in both tables:
+-- TWO SHAPES DEPART FROM THE TEAM'S OWN DDL CONVENTIONS. Both are recorded in db/README.md, and
+-- neither is argued from "rows already exist" - the only rows in either table are the four
+-- categories this script seeds and whatever submissions this service has taken:
 --   * feedback_types.code is a TEXT primary key, not a surrogate SERIAL. It is the value the client
 --     submits and the value feedback.type_code references, so a surrogate would change the foreign
---     key and the wire contract at once and buy nothing.
---   * created_by / updated_by are nullable, not NOT NULL DEFAULT ''. The four seeded categories
---     carry no author, and inventing an empty string for them would be a value nobody wrote.
+--     key and the published wire contract at once and buy nothing. This is the argument on its own
+--     merits; it would hold for an empty table too.
+--   * created_by / updated_by are nullable, not NOT NULL DEFAULT ''. A category is added by
+--     operations working directly in the database and a submission is written by its own author,
+--     so there is no author string to record, and '' would be a value nobody wrote.
 --
 -- The table name is singular. "feedback" is a mass noun whose plural is itself, so "feedbacks"
 -- would be worse English as well as a rename of a live table.
@@ -58,8 +61,8 @@ COMMENT ON COLUMN identity.feedback_types.sort_order IS 'Ascending display order
 CREATE TABLE IF NOT EXISTS identity.feedback
 (
     id         SERIAL      NOT NULL,
-    user_id    INTEGER     NOT NULL REFERENCES identity.users (id),
-    type_code  TEXT        NOT NULL REFERENCES identity.feedback_types (code),
+    user_id    INTEGER     NOT NULL,
+    type_code  TEXT        NOT NULL,
     content    TEXT        NOT NULL,
     name       TEXT        NOT NULL,
     email      TEXT        NOT NULL,
@@ -70,8 +73,52 @@ CREATE TABLE IF NOT EXISTS identity.feedback
     created_by TEXT,
     updated_by TEXT,
     CONSTRAINT pk_feedback PRIMARY KEY (id),
-    CONSTRAINT chk_feedback_status CHECK (status IN ('PENDING', 'REVIEWED', 'RESOLVED'))
+    CONSTRAINT chk_feedback_status CHECK (status IN ('PENDING', 'REVIEWED', 'RESOLVED')),
+    -- Both keys written out with their delete action, for the reason given at the same place in
+    -- 0001: the inline REFERENCES shorthand produced these same two names but no ON DELETE clause,
+    -- which is NO ACTION by default, while the EF model has always said RESTRICT. Identical
+    -- behaviour (they part company only for a DEFERRABLE constraint, and neither is), different
+    -- text on the two sides of gate 04. RESTRICT is the intent: a submission must not be
+    -- orphanable, which is exactly what a hand-written clean-up script would otherwise do.
+    CONSTRAINT feedback_user_id_fkey FOREIGN KEY (user_id)
+        REFERENCES identity.users (id) ON DELETE RESTRICT,
+    CONSTRAINT feedback_type_code_fkey FOREIGN KEY (type_code)
+        REFERENCES identity.feedback_types (code) ON DELETE RESTRICT
 );
+
+-- Existing databases carry both keys under these names with NO ACTION. Re-state them; guarded on
+-- confdeltype so a re-run does nothing.
+DO $feedback_fk_restrict$
+DECLARE
+    target RECORD;
+BEGIN
+    FOR target IN
+        SELECT *
+          FROM (VALUES
+                    ('feedback_user_id_fkey', 'user_id', 'identity.users (id)'),
+                    ('feedback_type_code_fkey', 'type_code', 'identity.feedback_types (code)')
+               ) AS t (constraint_name, column_name, target_ref)
+    LOOP
+        IF EXISTS (SELECT 1
+                     FROM pg_constraint
+                    WHERE conname = target.constraint_name
+                      AND conrelid = 'identity.feedback'::regclass
+                      AND confdeltype <> 'r') THEN
+            EXECUTE format(
+                'ALTER TABLE identity.feedback DROP CONSTRAINT %I', target.constraint_name);
+        END IF;
+
+        IF NOT EXISTS (SELECT 1
+                         FROM pg_constraint
+                        WHERE conname = target.constraint_name
+                          AND conrelid = 'identity.feedback'::regclass) THEN
+            EXECUTE format(
+                'ALTER TABLE identity.feedback ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %s ON DELETE RESTRICT',
+                target.constraint_name, target.column_name, target.target_ref);
+        END IF;
+    END LOOP;
+END
+$feedback_fk_restrict$;
 
 COMMENT ON TABLE  identity.feedback IS
     'One submission of the personal-centre feedback form. Rows are never updated or deleted by this service';
@@ -109,9 +156,9 @@ INSERT INTO identity.feedback_types (code, labels, is_active, sort_order) VALUES
 ON CONFLICT (code) DO NOTHING;
 
 -- ------------------------------------------------ user_sessions · comment
--- Deregistration adds a seventh revocation reason. The column is documented by a comment rather
--- than constrained by a CHECK, so this is the whole change - restated in full because COMMENT
--- replaces rather than appends. (It also picks up DEVICE_LIMIT, which RevocationReasons has had
--- since 0001 was written and the original comment omitted.)
-COMMENT ON COLUMN identity.user_sessions.revoked_by IS
-    'SELF | OTHER_DEVICE | SUPERSEDED | DEVICE_LIMIT | PASSWORD_CHANGE | ADMIN | TOKEN_REPLAY | DEREGISTERED';
+-- REMOVED, and this note is here so it is not put back. Deregistration added an eighth revocation
+-- reason, and this script used to restate the whole revoked_by comment to pick it up. COMMENT
+-- replaces rather than appends, so with the list stated in two scripts whichever ran last won: on
+-- 2026-09-02 the live column carried the stale six-value list, because 0001 was re-run for its
+-- realm backfill after this script had corrected it. The list now lives in 0001 only, beside the
+-- column it describes.

@@ -41,6 +41,26 @@ namespace UserSvc.Infrastructure.External;
 /// first user to upload a photo to be discovered.
 /// </para>
 /// <para>
+/// <b>And the refusal is 500 <see cref="ErrorCodes.NotConfigured"/>, not 501
+/// <c>NOT_IMPLEMENTED</c>, because of the paragraph above rather than in spite of it.</b> This class
+/// answered 501 until wave 8, and the two docs that describe the situation both said otherwise:
+/// <see cref="ErrorCodes.NotConfigured"/> names "a storage connection string" as its own example and
+/// distinguishes itself from <c>NOT_IMPLEMENTED</c> "because the code exists and is only waiting for
+/// a value", which is word for word the claim the first paragraph here makes. Two codes for one
+/// condition is the part that costs something: a missing reCAPTCHA secret, a missing staff-directory
+/// key and a missing back-office ticket key all answer 500 <c>NOT_CONFIGURED</c> with the section
+/// named in the detail, so a client or an operator meeting the storage variant had to learn a second
+/// vocabulary for the same deployment fault. <c>NOT_IMPLEMENTED</c> keeps its own meaning, which is
+/// narrower and still in use: code that is not written yet, as in the back-office password-reset
+/// purpose whose identity plane has not been ported.
+/// <br/>
+/// What 501 bought was a message to a client that a feature is absent from this deployment for good
+/// - "stop asking, hide the button". That reading does not survive contact with these two callers:
+/// both learn it only from a failed upload, after the user has chosen and cropped an image, so
+/// nothing is saved by learning it there. A client that genuinely needs to hide an upload control
+/// needs a capability document, not an error code on the write path.
+/// </para>
+/// <para>
 /// Registered as a singleton. <see cref="BlobServiceClient"/> holds an HTTP pipeline with its own
 /// connection pooling and is documented as thread-safe; building one per request would leak
 /// sockets. It is built lazily so that an unconfigured deployment does not fail while the container
@@ -50,20 +70,30 @@ namespace UserSvc.Infrastructure.External;
 public sealed class AzureBlobObjectStorage : IObjectStorage
 {
     /// <summary>
-    /// The refusal, worded for the <b>store</b> and not for any feature.
+    /// The refusal, worded for the <b>store</b> and not for any feature, and naming the setting.
     /// <para>
     /// One object store serves every caller that has bytes to keep - avatars and feedback photos
     /// today - and this class cannot tell which of them is on the other end, nor should it: the
     /// port exists so that a use case may depend on storage without storage depending on the use
     /// case. It used to say "Avatar upload is not available on this deployment", which meant
-    /// attaching a photo to a feedback report on a blob-less deployment answered 501 talking about
-    /// avatars. A caller whose users deserve to be told what <i>they</i> were doing re-words this
-    /// refusal itself - see <c>AvatarAppService</c> and <c>FeedbackAppService</c> - and this
+    /// attaching a photo to a feedback report on a blob-less deployment was refused in a sentence
+    /// about avatars. A caller whose users deserve to be told what <i>they</i> were doing re-words
+    /// this refusal itself - see <c>AvatarAppService</c> and <c>FeedbackAppService</c> - and this
     /// sentence is what a caller that does not gets.
+    /// </para>
+    /// <para>
+    /// <b>The section and key are in the message on purpose.</b> That is what
+    /// <see cref="ErrorCodes.NotConfigured"/> is for and what every other use of it in this service
+    /// does: it points whoever is reading at the key store instead of at the source, and it is why
+    /// the code is deliberately absent from the i18n catalogue. A key <i>name</i> is not a secret -
+    /// the value never appears here, and <see cref="AzureBlobOptions.Validate"/> is careful never to
+    /// echo one into a startup message either.
     /// </para>
     /// </summary>
     private const string UnconfiguredMessage =
-        "File storage is not available on this deployment.";
+        "File storage is not available on this deployment: "
+        + AzureBlobOptions.SectionName + ":" + nameof(AzureBlobOptions.ConnectionString)
+        + " must be supplied.";
 
     private const string UpstreamMessage =
         "The image could not be stored because the storage service is unavailable.";
@@ -186,9 +216,10 @@ public sealed class AzureBlobObjectStorage : IObjectStorage
 
         if (string.IsNullOrWhiteSpace(_options.ConnectionString))
         {
-            // Deliberately NOT the 501 that PutAsync throws. A deployment with no storage account
-            // has never written an object, so a delete has nothing to refuse - and the only callers
-            // of this method are already unwinding some other failure, which the 501 would mask.
+            // Deliberately NOT the 500 NOT_CONFIGURED that PutAsync throws. A deployment with no
+            // storage account has never written an object, so a delete has nothing to refuse - and
+            // the only callers of this method are already unwinding some other failure, which that
+            // refusal would mask.
             // Debug, not warning: on such a deployment PutAsync refused first, so this is
             // unreachable in practice and does not deserve a line in a production log.
             _logger.LogDebug(
@@ -347,9 +378,10 @@ public sealed class AzureBlobObjectStorage : IObjectStorage
     /// <summary>
     /// The container client, or a clear refusal when this deployment has no storage account.
     /// <para>
-    /// 501 rather than 500 or 502, matching how the rest of the service reports a capability it
-    /// simply does not have here: nothing upstream failed, because nothing upstream was asked, and
-    /// calling it 500 would send someone hunting for a defect that is really an empty setting.
+    /// 500 <see cref="ErrorCodes.NotConfigured"/>, not 502 and not <c>INTERNAL_ERROR</c>: nothing
+    /// upstream failed because nothing upstream was asked, and a generic 500 would send someone
+    /// hunting for a defect that is really an empty setting. The status says "our side, and the
+    /// caller can do nothing about it"; the code and the detail say which side of ours.
     /// </para>
     /// </summary>
     private BlobContainerClient ResolveContainer()
@@ -366,7 +398,7 @@ public sealed class AzureBlobObjectStorage : IObjectStorage
                 AzureBlobOptions.SectionName,
                 nameof(AzureBlobOptions.ConnectionString));
 
-            throw new AppException(ErrorCodes.NotImplemented, UnconfiguredMessage, 501);
+            throw new AppException(ErrorCodes.NotConfigured, UnconfiguredMessage, 500);
         }
 
         try

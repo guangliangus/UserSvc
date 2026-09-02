@@ -30,9 +30,15 @@ public sealed class UserConfiguration : IEntityTypeConfiguration<User>
 
         builder.HasIndex(x => x.BirthDateHash);
 
+        // HasConstraintName, and it is not cosmetic: without it EF names this key
+        // fk_user_identities_users_user_id while db/0001 names it user_identities_user_id_fkey, so
+        // a database that had both artefacts applied to it carried the SAME foreign key twice under
+        // two names - two constraints to validate on every insert, and a schema diff that could
+        // never come out clean.
         builder.HasMany(x => x.Identities)
             .WithOne()
             .HasForeignKey(x => x.UserId)
-            .OnDelete(DeleteBehavior.Restrict);
+            .OnDelete(DeleteBehavior.Restrict)
+            .HasConstraintName("user_identities_user_id_fkey");
     }
 }

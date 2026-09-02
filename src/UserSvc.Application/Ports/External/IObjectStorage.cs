@@ -35,18 +35,27 @@ public interface IObjectStorage
     /// <para>
     /// Failure is reported as an <see cref="Errors.AppException"/> so the error contract stays
     /// identical whichever adapter is registered: 502 when the storage account is unreachable or
-    /// answered a 5xx, 500 when it refused a request that we built wrong, and 501 when this
+    /// answered a 5xx, 500 <see cref="Errors.ErrorCodes.InternalError"/> when it refused a request
+    /// that we built wrong, and 500 <see cref="Errors.ErrorCodes.NotConfigured"/> when this
     /// deployment has no storage configured at all.
     /// </para>
     /// <para>
-    /// <b>The 501's message names the store, never the feature.</b> One store serves every caller
-    /// that has bytes to keep, and an adapter cannot know whether it is holding an avatar or a
-    /// photo attached to a complaint - teaching it to know would point the dependency the wrong way
-    /// down and make one feature's wording an adapter's business. A caller whose users should be
-    /// told what they were doing therefore catches the refusal - the error code is
-    /// <see cref="Errors.ErrorCodes.NotImplemented"/> - and rewords it with its own subject,
-    /// keeping the status and the error code. That knowledge lives in the use case and nowhere
-    /// else.
+    /// <b>That last one is not 501 <c>NOT_IMPLEMENTED</c>, and the difference is which of the two
+    /// things is missing.</b> <c>NOT_IMPLEMENTED</c> means the code has not been written;
+    /// <see cref="Errors.ErrorCodes.NotConfigured"/> means the code is complete and a value is
+    /// absent, which is precisely the state an adapter with no connection string is in. Every other
+    /// missing secret in this service answers the second way, with the section named in the detail,
+    /// and one condition should not carry two vocabularies. <c>AzureBlobObjectStorage</c> has the
+    /// full argument, including what the 501 was thought to buy and why it did not.
+    /// </para>
+    /// <para>
+    /// <b>The refusal's message names the store, never the feature.</b> One store serves every
+    /// caller that has bytes to keep, and an adapter cannot know whether it is holding an avatar or
+    /// a photo attached to a complaint - teaching it to know would point the dependency the wrong
+    /// way down and make one feature's wording an adapter's business. A caller whose users should
+    /// be told what they were doing therefore catches the refusal - the error code is
+    /// <see cref="Errors.ErrorCodes.NotConfigured"/> - and rewords it with its own subject, keeping
+    /// the status and the error code. That knowledge lives in the use case and nowhere else.
     /// </para>
     /// </summary>
     /// <param name="objectName">Path-like name within the configured container or bucket, without a

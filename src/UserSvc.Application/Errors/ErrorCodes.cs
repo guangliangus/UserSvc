@@ -43,13 +43,39 @@ public static class ErrorCodes
     public const string CaptchaRequired = "CAPTCHA_REQUIRED";
     public const string CaptchaInvalid = "CAPTCHA_INVALID";
     public const string RiskControlCooldown = "RISK_CONTROL_COOLDOWN";
+
+    // --- Capabilities this deployment cannot perform ---
+    //
+    // Two codes, and the question that picks between them is "what is missing, the code or a
+    // value?". They were not being told apart: the Azure Blob adapter answered NOT_IMPLEMENTED for
+    // an absent connection string until wave 8, while the reCAPTCHA client, the corporate staff
+    // directory and the back-office ticket key all answered NOT_CONFIGURED for the same class of
+    // fault. Both docs below were already right; only the blob adapter disagreed with them.
+
+    /// <summary>
+    /// A capability whose <b>code has not been written</b> for this service yet, on a route that is
+    /// part of the published contract anyway. 501, because no value and no deployment change can
+    /// make it work - only a release can.
+    /// <para>
+    /// The one live instance is the <c>backoffice_reset_password</c> verification purpose, whose
+    /// identity plane has not been ported from the Go service. It is <b>not</b> the code for a
+    /// missing secret: see <see cref="NotConfigured"/>.
+    /// </para>
+    /// </summary>
     public const string NotImplemented = "NOT_IMPLEMENTED";
 
     /// <summary>
-    /// A capability whose configuration this deployment does not carry - a provider credential, a
-    /// storage connection string. Distinct from <see cref="InternalError"/> so an operator reading
-    /// the response knows to look at the secrets rather than at the code, and distinct from
-    /// <see cref="NotImplemented"/> because the code exists and is only waiting for a value.
+    /// A capability whose <b>configuration</b> this deployment does not carry - a provider
+    /// credential, a storage connection string. Distinct from <see cref="InternalError"/> so an
+    /// operator reading the response knows to look at the secrets rather than at the code, and
+    /// distinct from <see cref="NotImplemented"/> because the code exists and is only waiting for a
+    /// value.
+    /// <para>
+    /// 500, with the missing <b>section and key named in the detail</b> and the value never in it
+    /// (docs/architecture.md). That detail is why this code is deliberately absent from the i18n
+    /// catalogue: it is addressed to whoever holds the secrets, and translating it would replace the
+    /// one useful sentence with a generic apology.
+    /// </para>
     /// </summary>
     public const string NotConfigured = "NOT_CONFIGURED";
 

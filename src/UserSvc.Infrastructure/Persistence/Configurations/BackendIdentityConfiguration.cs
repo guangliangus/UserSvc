@@ -44,20 +44,26 @@ public sealed class BackendIdentityConfiguration : IEntityTypeConfiguration<Back
         builder.UseXminConcurrencyToken();
 
         builder.Property(x => x.UserId).HasColumnName("user_id");
-        builder.Property(x => x.IdentityType).HasColumnType("character varying(20)");
-        builder.Property(x => x.Provider).HasColumnType("character varying(50)").HasDefaultValue(string.Empty);
-        builder.Property(x => x.IdentifierHash).HasColumnType("character varying(64)");
-        builder.Property(x => x.KeyVersion).HasColumnType("character varying(20)");
+        builder.Property(x => x.Provider).HasDefaultValue(string.Empty);
+
+        // identity_type, provider, identifier_hash and key_version carry no HasColumnType and no
+        // HasMaxLength on purpose: they are text, like every other string here. They used to be
+        // character varying(20/50/64/20), justified as following the live database - which was
+        // false, iam being this service's own schema. key_version made that concrete: its value is
+        // IdentifierProtectionOptions.KeyVersion, an operator-supplied configuration string with no
+        // length bound anywhere, so a 21-character key version would have failed every back-office
+        // identity write with 22001 while the consumer plane's text column took it happily.
 
         // Kept as jsonb rather than flattened into text columns: what an upstream sends about a
         // subject differs per upstream and changes without asking us, and a column per attribute
         // would make every one of those changes a migration.
-        // jsonb, with the live column's own default. An INSERT that omits it lands on '{}'
-        // rather than NULL, so every reader sees an object; the column stays nullable because the
-        // live rows do.
-        builder.Property(x => x.ProviderDetails)
-            .HasColumnType("jsonb")
-            .HasDefaultValueSql("'{}'::jsonb");
+        //
+        // No HasDefaultValueSql. It used to declare '{}'::jsonb "with the live column's own
+        // default" - the live column has no default, and all three rows in it are NULL (read
+        // 2026-09-02), so the claim was wrong in both directions. The column is nullable and NULL
+        // is the honest value for "this identity has no upstream payload", which is every
+        // password- and OTP-provisioned row.
+        builder.Property(x => x.ProviderDetails).HasColumnType("jsonb");
 
         builder.Property(x => x.Status).HasDefaultValue(BackendIdentityStatuses.Active);
         builder.Property(x => x.CreatedAt).HasDefaultValueSql("now()");

@@ -34,7 +34,22 @@ public sealed class FeedbackTypeConfiguration : IEntityTypeConfiguration<Feedbac
             .HasColumnType("jsonb")
             .HasDefaultValueSql($"'{FeedbackType.EmptyLabelsJson}'::jsonb");
 
-        builder.Property(x => x.IsActive).HasDefaultValueSql("true");
+        // NO store default on is_active, and that is a correctness fix rather than an omission.
+        //
+        // EF decides whether to include a property in an INSERT by comparing it to a sentinel, and
+        // the sentinel for a non-nullable bool is false - the CLR default. While this property
+        // declared HasDefaultValueSql("true"), an entity with IsActive = false was left OUT of the
+        // statement and the row came back ACTIVE: a retired category was silently impossible to
+        // insert. That is what EF's "configured with a database-generated default, but has no
+        // configured sentinel value" warning, logged on every boot of this service, was pointing at.
+        //
+        // HasSentinel(null) is the documented remedy and does not apply here: EF 10 refuses it on a
+        // non-nullable value type ("The sentinel value 'null' is not assignable to the property
+        // 'FeedbackType.IsActive' of type 'bool'") and the context cannot even be constructed. So
+        // the model stops claiming a default it must never act on; db/0011 keeps the column's
+        // DEFAULT true, where it belongs - it is there for the hand-written seed, not for EF.
+        // db/README.md records the class of difference.
+
         builder.Property(x => x.SortOrder).HasDefaultValueSql("0");
         builder.Property(x => x.CreatedAt).HasDefaultValueSql("now()");
         builder.Property(x => x.UpdatedAt).HasDefaultValueSql("now()");

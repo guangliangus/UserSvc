@@ -23,8 +23,18 @@ steps:
     displayName: Build (zero warnings)
 
   # 门禁 02：全部测试绿 —— 含架构守卫，依赖方向违规会在这里失败
-  - script: dotnet test UserSvc.slnx -c $(buildConfiguration) --no-build --logger trx
+  - script: |
+      set -e
+      # 先清掉上一轮的 trx，否则门禁 02b 可能读到陈旧结果而误判「跑过了」
+      rm -rf tests/*/TestResults
+      dotnet test UserSvc.slnx -c $(buildConfiguration) --no-build --logger trx
     displayName: Test
+
+  # 门禁 02b：集成测试必须真的跑过，而不只是报绿。
+  # RequiresDockerFact 在「发现阶段」就赋 Skip，所以没有 Docker 的节点会 0 个测试全绿——
+  # 而这 40 个集成测试是后台登录门的全部覆盖，那道门的配置节曾在 1281 个绿测试下完全没绑定。
+  - script: scripts/ci/assert-integration-tests-ran.sh
+    displayName: Integration tests actually ran
 
   # 门禁 03：DDL 双跑幂等
   - script: |
@@ -37,15 +47,19 @@ steps:
     env:
       DATABASE_URL: $(CiDatabaseUrl)
 
-  # 门禁 04：模型与手写 DDL 对照，防止悄悄漂移
+  # 门禁 04：模型与手写 DDL 对照，防止悄悄漂移。
+  # 这一步在第八波之前只是 `echo "Review model.sql"`——不 diff、不断言，八波以来从未可能失败，
+  # 漂移就是这样攒起来的（user_passkeys 少一个外键、user_identities 一个外键两个名字）。
+  # 现在它建两个临时库：一个灌 db/*.sql，一个灌模型生成的 DDL，然后 diff 两边的
+  # information_schema.columns 与 pg_indexes 投影。例外必须写在 db/README.md 的表里才被容忍，
+  # 而且例外一旦不再对应真实差异同样会失败——例外不能活得比它的理由更久。
   - script: |
       set -e
       dotnet tool restore
-      dotnet dotnet-ef dbcontext script \
-        -p src/UserSvc.Infrastructure -s src/UserSvc.Infrastructure \
-        --no-build -o $(Agent.TempDirectory)/model.sql
-      echo "Review model.sql against db/*.sql — see db/README.md"
+      scripts/ci/gate04-ef-model-vs-ddl.sh
     displayName: EF model vs db/ scripts
+    env:
+      DATABASE_URL: $(CiDatabaseUrl)
 
   # 门禁 06：依赖漏洞，High/Critical 直接失败
   - script: |

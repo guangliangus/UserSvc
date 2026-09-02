@@ -46,7 +46,23 @@ public sealed class BackOfficeAccountAppService(
     IOptions<BackOfficeAccountOptions> options,
     ILogger<BackOfficeAccountAppService> logger)
 {
-    private readonly BackOfficeAccountOptions _options = options.Value;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
+    /// capability may only break itself"). A field initializer runs during construction, and
+    /// <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation runs - so
+    /// binding it into a field makes merely constructing this service throw, taking down every
+    /// back-office account endpoint including the ones that never look at this section.
+    /// <see cref="IOptions{TOptions}.Value"/> caches, so the property costs nothing per call.
+    /// <para>
+    /// <b>This one is why the rule is not "only the sections that validate matter".</b>
+    /// <see cref="BackOfficeAccountOptions"/> does carry DataAnnotations - <c>[Required]</c> and a
+    /// <c>[Range]</c> - but <c>Program.cs</c> registers the section with a bare <c>Bind</c> and no
+    /// <c>ValidateDataAnnotations()</c>, so nothing runs them and <c>.Value</c> cannot throw
+    /// today. That containment lives in one call in a different file, which somebody tightening
+    /// configuration validation would add in good faith and with no idea it was load-bearing here.
+    /// </para>
+    /// </summary>
+    private BackOfficeAccountOptions _options => options.Value;
 
     /// <summary>
     /// Registers a corporate mailbox as a back-office account, or attaches a password to the

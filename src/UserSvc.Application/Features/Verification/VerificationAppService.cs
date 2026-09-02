@@ -76,7 +76,15 @@ public sealed class VerificationAppService(
     /// </summary>
     private const string SentMessage = "Verification code sent successfully";
 
-    private readonly VerificationOptions _options = options.Value;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
+    /// capability may only break itself"). A field initializer runs during construction, and
+    /// <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation runs - so
+    /// binding it into a field makes merely constructing this service throw, and both verification
+    /// routes plus every flow that consumes a ticket sit on it.
+    /// <see cref="IOptions{TOptions}.Value"/> caches, so the property costs nothing per call.
+    /// </summary>
+    private VerificationOptions _options => options.Value;
 
     /// <summary>
     /// Issue a code for the target and deliver it. See the class remarks for why the checks run in

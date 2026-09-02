@@ -168,6 +168,16 @@ builder.Services.AddScoped<TenantMemberAppService>();
 // serves every request.
 builder.Services.AddSingleton<PasswordHasher>();
 builder.Services.AddSingleton<IdentifierProtector>();
+
+// The factory beside it, for IdentifierProtectionHealthCheck. HealthCheckService constructs a check
+// OUTSIDE the try/catch that guards CheckHealthAsync, so a check taking the protector directly would
+// turn a construction failure into an unhandled 500 on /health/ready rather than an unhealthy
+// result - which is the failure that check exists to close. The protector's constructor is total
+// today; this keeps the probe honest if it ever stops being (docs/architecture.md, "inject Func<T>
+// not T when a client's construction could fail").
+builder.Services.AddTransient<Func<IdentifierProtector>>(
+    provider => provider.GetRequiredService<IdentifierProtector>);
+
 builder.Services.AddValidatorsFromAssemblyContaining<UpdateProfileRequestValidator>();
 
 builder.Services.AddHttpContextAccessor();
@@ -234,9 +244,16 @@ builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = 
 builder.Services.AddExceptionHandler<AppExceptionHandler>();
 
 // ---------------------------------------------------------------- Three probes, three meanings
+// Every check here is tagged "ready" and nothing is tagged for liveness, which is the whole design:
+// readiness answers "should traffic be routed to me" and may fail on anything that makes an answer
+// wrong, while liveness answers "is this process wedged, should I be restarted" and must fail on
+// nothing a restart cannot repair. A dependency outage and a malformed secret are both in the
+// second category - restarting the pod fixes neither, and a liveness check that failed on either
+// would turn one of them into a cluster-wide restart storm.
 builder.Services.AddHealthChecks()
     .AddCheck<DatabaseHealthCheck>("postgres", tags: ["ready"])
-    .AddCheck<RedisHealthCheck>("redis", tags: ["ready"]);
+    .AddCheck<RedisHealthCheck>("redis", tags: ["ready"])
+    .AddCheck<IdentifierProtectionHealthCheck>("identifier-protection", tags: ["ready"]);
 
 var app = builder.Build();
 
@@ -284,9 +301,34 @@ app.MapControllers();
 
 // startup and live self-check only and never aggregate external dependencies — otherwise a
 // database blip triggers a restart storm across every replica.
-app.MapHealthChecks("/health/startup", new() { Predicate = _ => false });
-app.MapHealthChecks("/health/live", new() { Predicate = _ => false });
-app.MapHealthChecks("/health/ready", new() { Predicate = check => check.Tags.Contains("ready") });
+//
+// The predicates are only half of what keeps liveness answering 200. The other half is that nothing
+// the pipeline resolves per request may throw for a configuration reason: with a three-byte
+// IdentifierProtection:DataKey this host used to answer 500 to all three probes, because
+// BackOfficeAuthzMiddleware resolves the authorization snapshot provider on every request and that
+// graph reached IdentifierProtector's throwing constructor. An empty check list cannot save a probe
+// from the middleware in front of it, so both halves are load-bearing.
+//
+// The response writer is what makes the readiness failure diagnosable: the default one answers with
+// the single word "Unhealthy", which tells whoever is looking that something is wrong and nothing
+// about what.
+app.MapHealthChecks("/health/startup", new()
+{
+    Predicate = _ => false,
+    ResponseWriter = HealthReportWriter.WriteAsync,
+});
+
+app.MapHealthChecks("/health/live", new()
+{
+    Predicate = _ => false,
+    ResponseWriter = HealthReportWriter.WriteAsync,
+});
+
+app.MapHealthChecks("/health/ready", new()
+{
+    Predicate = check => check.Tags.Contains("ready"),
+    ResponseWriter = HealthReportWriter.WriteAsync,
+});
 
 if (app.Environment.IsDevelopment())
 {

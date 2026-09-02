@@ -28,7 +28,15 @@ public sealed class OpenIddictPruningService(
     IOptions<OpenIddictPruningOptions> options,
     ILogger<OpenIddictPruningService> logger) : BackgroundService
 {
-    private readonly OpenIddictPruningOptions _options = options.Value;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer (docs/architecture.md: "a missing
+    /// capability may only break itself"). A hosted service is constructed while the host is being
+    /// built, and <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation runs -
+    /// so binding it into a field turns a bad <c>OpenIddictPruning</c> section into a host that
+    /// will not start at all, rather than a pruning loop that stops and says why.
+    /// <see cref="IOptions{TOptions}.Value"/> caches, so the property costs nothing per tick.
+    /// </summary>
+    private OpenIddictPruningOptions _options => options.Value;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
