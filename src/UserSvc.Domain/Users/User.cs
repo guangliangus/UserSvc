@@ -1,3 +1,6 @@
+using UserSvc.Domain.Abstractions;
+using UserSvc.Domain.Users.Events;
+
 namespace UserSvc.Domain.Users;
 
 /// <summary>
@@ -5,8 +8,14 @@ namespace UserSvc.Domain.Users;
 /// protecting in the domain layer — profile fields are CRUD, and the rules that do exist are
 /// orchestrated by the application layer. The concepts that earn a rich model are the ones where
 /// breaking an invariant is a security incident, such as <see cref="Auth.UserSession"/>.
+/// <para>
+/// It derives from <see cref="Entity"/> only so that it can carry domain events. That is not a
+/// step towards a rich model: raising the event from the aggregate is what puts the outbox row in
+/// the same transaction as the insert (decision 16), and an application service cannot do that -
+/// the interceptor drains tracked entities, not services.
+/// </para>
 /// </summary>
-public sealed class User
+public sealed class User : Entity
 {
     public int Id { get; set; }
 
@@ -40,4 +49,16 @@ public sealed class User
     public List<UserIdentity> Identities { get; set; } = [];
 
     public bool IsActive() => Status == UserStatuses.Active;
+
+    /// <summary>
+    /// Records that this account was just created, so the fact reaches the outbox in the same
+    /// transaction as the row itself. Called once, by registration, immediately before the insert.
+    /// <para>
+    /// The event carries the identity type and blind index rather than <see cref="Id"/> on purpose:
+    /// the outbox row is serialized before the database assigns the key, so an id here would always
+    /// publish 0.
+    /// </para>
+    /// </summary>
+    public void RecordRegistration(string identityType, string identifierHash, DateTimeOffset now) =>
+        Raise(new UserRegistered(identityType, identifierHash, now));
 }

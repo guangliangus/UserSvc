@@ -8,6 +8,7 @@ using UserSvc.Application.Ports.Auth;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Ports.Users;
+using UserSvc.Application.Ports.Verification;
 using UserSvc.Infrastructure.Auth;
 using UserSvc.Infrastructure.External;
 using UserSvc.Infrastructure.Persistence;
@@ -52,11 +53,15 @@ public static class DependencyInjection
 
         services.AddScoped<IUnitOfWork, UnitOfWork>();
         services.AddScoped<IUserRepository, UserRepository>();
+        services.AddScoped<IUserIdentityRepository, UserIdentityRepository>();
         services.AddScoped<IUserSessionRepository, UserSessionRepository>();
+        services.AddScoped<IVerificationCodeRepository, VerificationCodeRepository>();
+        services.AddScoped<IVerificationTicketConsumer, VerificationCodeRepository>();
         services.AddSingleton<IClock, SystemClock>();
 
         AddRedis(services, configuration);
         AddNotificationClient(services, configuration);
+        AddRiskControl(services);
 
         return services;
     }
@@ -77,6 +82,20 @@ public static class DependencyInjection
             provider.GetRequiredService<IOptions<RedisOptions>>().Value.ToConfigurationOptions()));
 
         services.AddSingleton<ISessionRevocationStore, RedisSessionRevocationStore>();
+
+        // Shares the multiplexer and the key prefix with the revocation set: same Redis, different
+        // key space, opposite failure direction on write (fail-open - see RedisRateLimiter).
+        services.AddSingleton<IRateLimiter, RedisRateLimiter>();
+    }
+
+    /// <summary>
+    /// Risk control ships as a port with a refusing placeholder until a CAPTCHA provider is
+    /// configured (see <see cref="PlaceholderRiskControlService"/>). Replacing this one line with
+    /// the real adapter is the whole cutover - no calling code changes.
+    /// </summary>
+    private static void AddRiskControl(IServiceCollection services)
+    {
+        services.AddSingleton<IRiskControlService, PlaceholderRiskControlService>();
     }
 
     /// <summary>

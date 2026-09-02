@@ -7,6 +7,9 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/UserSvc.Application/UserSvc.Application.csproj" />
+    <!-- Adapters whose logic is worth testing without their infrastructure: the rate limiter's key
+         layout and its fail-open path both matter and neither needs a Redis. -->
+    <ProjectReference Include="../../src/UserSvc.Infrastructure/UserSvc.Infrastructure.csproj" />
   </ItemGroup>
 
   <ItemGroup>

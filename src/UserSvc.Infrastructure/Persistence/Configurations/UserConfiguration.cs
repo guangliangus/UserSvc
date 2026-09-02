@@ -25,6 +25,9 @@ public sealed class UserConfiguration : IEntityTypeConfiguration<User>
         // status predicate.
         builder.HasQueryFilter(x => x.Status != UserStatuses.Deleted);
 
+        // Domain events are transient and live in memory only; they are never persisted here.
+        builder.Ignore(x => x.DomainEvents);
+
         builder.HasIndex(x => x.BirthDateHash);
 
         builder.HasMany(x => x.Identities)

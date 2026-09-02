@@ -11,10 +11,20 @@ using UserSvc.Api.Filters;
 using UserSvc.Api.Health;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.Profile;
+using UserSvc.Application.Features.Registration;
 using UserSvc.Application.Features.Sessions;
+using UserSvc.Application.Features.Verification;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Security;
 using UserSvc.Infrastructure;
+
+// FluentValidation localizes its built-in messages from the ambient thread culture, so on a server
+// whose locale is not English a missing field comes back described in that language - the API's
+// error contract would then depend on which machine answered. Turning the language manager off
+// pins the built-in messages to English; rules with an explicit WithMessage are unaffected.
+// The source-language guard cannot catch this one: the text comes from a package's resources at
+// run time, not from any .cs file. It was found by reading a real 400 response.
+ValidatorOptions.Global.LanguageManager.Enabled = false;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -45,6 +55,11 @@ builder.Services.AddOptions<AuthSessionOptions>()
     .ValidateDataAnnotations()
     .ValidateOnStart();
 
+builder.Services.AddOptions<VerificationOptions>()
+    .Bind(builder.Configuration.GetSection(VerificationOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
 // ---------------------------------------------------------------- Infrastructure (ports -> adapters)
 builder.Services.AddUserSvcInfrastructure(builder.Configuration);
 
@@ -52,6 +67,11 @@ builder.Services.AddUserSvcInfrastructure(builder.Configuration);
 // Decision 05: no MediatR. App services are registered directly and injected into controllers.
 builder.Services.AddScoped<ProfileAppService>();
 builder.Services.AddScoped<SessionAppService>();
+builder.Services.AddScoped<VerificationAppService>();
+builder.Services.AddScoped<RegistrationAppService>();
+// Stateless and thread-safe; the Argon2 parameters are compile-time constants, so one instance
+// serves every request.
+builder.Services.AddSingleton<PasswordHasher>();
 builder.Services.AddSingleton<IdentifierProtector>();
 builder.Services.AddValidatorsFromAssemblyContaining<UpdateProfileRequestValidator>();
 
