@@ -28,11 +28,12 @@ namespace UserSvc.Infrastructure.External;
 /// required secret in this service - the database, Redis, the token-signing certificates - is
 /// <c>[Required]</c> and refuses to start, and that is right for them: they sit on paths that every
 /// request crosses, so a deployment missing one is not a degraded service, it is a service that
-/// answers nothing correctly. Avatar upload is one endpoint. Making it <c>[Required]</c> would mean
-/// a deployment that has no blob account cannot sign anybody in, cannot issue a token and cannot
-/// serve the back office - the entire service held hostage by a profile picture. So the refusal
-/// lands exactly where the capability is missing: <see cref="PutAsync"/> throws, every other
-/// endpoint is untouched, and the log line says which setting is absent.
+/// answers nothing correctly. Storing a file is two endpoints - an avatar and a feedback
+/// attachment. Making it <c>[Required]</c> would mean a deployment that has no blob account cannot
+/// sign anybody in, cannot issue a token and cannot serve the back office - the entire service held
+/// hostage by a profile picture. So the refusal lands exactly where the capability is missing:
+/// <see cref="PutAsync"/> throws, every other endpoint is untouched, and the log line says which
+/// setting is absent.
 /// <br/>
 /// The option is still validated: if a connection string <i>is</i> supplied it must parse, and that
 /// check does run at startup (see <see cref="AzureBlobOptions.Validate"/>). "Absent" is a
@@ -48,17 +49,44 @@ namespace UserSvc.Infrastructure.External;
 /// </summary>
 public sealed class AzureBlobObjectStorage : IObjectStorage
 {
+    /// <summary>
+    /// The refusal, worded for the <b>store</b> and not for any feature.
+    /// <para>
+    /// One object store serves every caller that has bytes to keep - avatars and feedback photos
+    /// today - and this class cannot tell which of them is on the other end, nor should it: the
+    /// port exists so that a use case may depend on storage without storage depending on the use
+    /// case. It used to say "Avatar upload is not available on this deployment", which meant
+    /// attaching a photo to a feedback report on a blob-less deployment answered 501 talking about
+    /// avatars. A caller whose users deserve to be told what <i>they</i> were doing re-words this
+    /// refusal itself - see <c>AvatarAppService</c> and <c>FeedbackAppService</c> - and this
+    /// sentence is what a caller that does not gets.
+    /// </para>
+    /// </summary>
     private const string UnconfiguredMessage =
-        "Avatar upload is not available on this deployment.";
+        "File storage is not available on this deployment.";
 
     private const string UpstreamMessage =
         "The image could not be stored because the storage service is unavailable.";
 
     private const string RejectedMessage = "The image could not be stored.";
 
-    private readonly AzureBlobOptions _options;
+    private readonly IOptions<AzureBlobOptions> _optionsAccessor;
     private readonly ILogger<AzureBlobObjectStorage> _logger;
     private readonly Lazy<BlobContainerClient> _container;
+
+    /// <summary>
+    /// The validated section, read at the point of use and never in the constructor.
+    /// <para>
+    /// <see cref="IOptions{TOptions}.Value"/> is where DataAnnotations validation runs, so reading
+    /// it in the constructor makes merely <i>building</i> this adapter throw - and this adapter is
+    /// a singleton in the graph of two features, on a section that deliberately carries no
+    /// <c>[Required]</c> connection string precisely so that a deployment without one keeps
+    /// working. Reading it here instead means a malformed section refuses the upload that touched
+    /// it, which is the same place the missing connection string is already refused.
+    /// docs/architecture.md records this failure; it has been made four times.
+    /// </para>
+    /// </summary>
+    private AzureBlobOptions _options => _optionsAccessor.Value;
 
     public AzureBlobObjectStorage(
         IOptions<AzureBlobOptions> options,
@@ -66,13 +94,20 @@ public sealed class AzureBlobObjectStorage : IObjectStorage
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        _options = options.Value;
+        _optionsAccessor = options;
         _logger = logger;
 
         // ExecutionAndPublication: one client for the process even under a burst of first requests.
+        // The factory reads the section, so it is read on the first upload rather than at
+        // construction - one more reason the Lazy is here.
         _container = new Lazy<BlobContainerClient>(
-            () => new BlobServiceClient(_options.ConnectionString, BuildClientOptions(_options))
-                .GetBlobContainerClient(_options.ContainerName),
+            () =>
+            {
+                var settings = _optionsAccessor.Value;
+
+                return new BlobServiceClient(settings.ConnectionString, BuildClientOptions(settings))
+                    .GetBlobContainerClient(settings.ContainerName);
+            },
             LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
@@ -324,9 +359,10 @@ public sealed class AzureBlobObjectStorage : IObjectStorage
             // Error, not warning: the endpoint is routable and someone just used it, so either the
             // route should not be exposed on this deployment or a setting is missing from it.
             _logger.LogError(
-                "An avatar upload reached the Azure Blob adapter, but {Section}:{Setting} is not "
-                + "configured. The adapter is complete and needs only that value; until it is set, "
-                + "this one endpoint refuses and the rest of the service is unaffected.",
+                "An object-storage write reached the Azure Blob adapter, but {Section}:{Setting} is "
+                + "not configured. The adapter is complete and needs only that value; until it is "
+                + "set, the endpoints that store files refuse and the rest of the service is "
+                + "unaffected. Which endpoint it was is on the request log line beside this one.",
                 AzureBlobOptions.SectionName,
                 nameof(AzureBlobOptions.ConnectionString));
 

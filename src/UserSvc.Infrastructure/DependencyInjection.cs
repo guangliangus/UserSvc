@@ -128,6 +128,12 @@ public static class DependencyInjection
         // Shares the multiplexer and the key prefix with the revocation set: same Redis, different
         // key space, opposite failure direction on write (fail-open - see RedisRateLimiter).
         services.AddSingleton<IRateLimiter, RedisRateLimiter>();
+
+        // Third key space on the same multiplexer, and the only one of the three that fails
+        // CLOSED - it is the sole record of whether a self-contained credential has been spent, so
+        // allowing on a Redis failure would not degrade the single-use guarantee but delete it.
+        // See ISingleUseMarkerStore for the full reasoning.
+        services.AddSingleton<ISingleUseMarkerStore, RedisSingleUseMarkerStore>();
     }
 
     /// <summary>
@@ -330,17 +336,17 @@ public static class DependencyInjection
     /// now and one is not, and the asymmetry is the whole content of this method.
     /// <para>
     /// The supplier-to-company mountings live in <b>this</b> service's own table, so the second
-    /// registration is the real adapter. It replaced
-    /// <see cref="UnavailableSupplierCompanyLinkDirectory"/>, which answered "no mountings" to
-    /// everything because the table did not exist yet; that class is now unreferenced here and is
-    /// kept only for the test that pins what a fail-quiet placeholder must look like.
+    /// registration is the real adapter. The placeholder that answered "no mountings" to everything
+    /// while the table did not exist is <b>deleted</b>, not merely unregistered: an unreferenced
+    /// second implementation of a port is a class the next reader has to disprove, and two
+    /// registrations for one port is how last-one-wins quietly decides what callers get.
     /// </para>
     /// <para>
     /// The company and supplier registers are somebody else's tables, so the first registration is
-    /// still <see cref="UnavailableTenantMasterDataDirectory"/> - the last refusing placeholder in
-    /// the service. It answers null, which every caller reads as "not reached" and falls open on;
-    /// see that class for why a throw would be the wrong shape. Replacing that <b>one</b> line is
-    /// the remaining cutover.
+    /// still <see cref="UnavailableTenantMasterDataDirectory"/> - now the <b>only</b> placeholder
+    /// left in the service. It answers null, which every caller reads as "not reached" and falls
+    /// open on; see that class for why a throw would be the wrong shape. Replacing that <b>one</b>
+    /// line is the remaining cutover.
     /// </para>
     /// </summary>
     private static void AddTenantMasterData(IServiceCollection services)

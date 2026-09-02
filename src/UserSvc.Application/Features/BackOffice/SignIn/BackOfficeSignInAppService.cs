@@ -45,6 +45,7 @@ public sealed class BackOfficeSignInAppService(
     IAdminStandingService standing,
     IIamAuditLogRepository auditLog,
     IRateLimiter rateLimiter,
+    ISingleUseMarkerStore markers,
     IdentifierProtector protector,
     PasswordHasher passwordHasher,
     BackOfficeSignInTicketService tickets,
@@ -54,12 +55,37 @@ public sealed class BackOfficeSignInAppService(
     IOptions<BackOfficeSignInOptions> signInOptions,
     ILogger<BackOfficeSignInAppService> logger)
 {
-    /// <summary>Rate-limit dimensions. Two, so a password lockout and a one-time-password lockout
-    /// are independent budgets - and both are separate from every consumer counter, so one mailbox
-    /// used on both planes cannot be locked out of one by hammering the other.</summary>
+    /// <summary>Rate-limit dimensions. Three, so a password lockout, a per-address lockout's
+    /// per-source counterpart and a one-time-password lockout are independent budgets - and all
+    /// three are separate from every consumer counter, so one mailbox used on both planes cannot be
+    /// locked out of one by hammering the other.</summary>
     private const string PasswordDimension = "backoffice-sign-in";
 
+    /// <summary>
+    /// The per-source budget on the password door. A dimension of its own rather than the
+    /// <c>login-ip</c> the port's documentation names as an example: that slug would eventually be
+    /// shared with consumer sign-in, and one address failing on the consumer plane would then eat
+    /// the back office's budget for the whole office behind it.
+    /// </summary>
+    private const string PasswordIpDimension = "backoffice-sign-in-ip";
+
     private const string OtpDimension = "backoffice-sign-in-otp";
+
+    /// <summary>What the consume-once marker for a sign-in ticket is filed under.</summary>
+    private const string SignInTicketPurpose = "back-office-sign-in-ticket";
+
+    /// <summary>
+    /// How much longer than the ticket the consume-once marker lives.
+    /// <para>
+    /// The marker has to outlast the ticket or a replay lands in the gap, and the gap is exactly
+    /// where somebody holding a captured ticket is waiting. The two are measured by different
+    /// clocks - the ticket's expiry by whichever pod minted it, the marker's TTL by Redis - so
+    /// equal lifetimes are not enough: a minute of skew is generous for machines that are meant to
+    /// be NTP-synchronised, and the cost of being generous is one key per sign-in living a minute
+    /// longer in a key space that expires itself.
+    /// </para>
+    /// </summary>
+    private static readonly TimeSpan MarkerSkew = TimeSpan.FromMinutes(1);
 
     /// <summary>Stamped on the rows this flow writes.</summary>
     private const string SystemActor = "system";
@@ -67,14 +93,22 @@ public sealed class BackOfficeSignInAppService(
     /// <summary>
     /// Sign in with a corporate mailbox and a password.
     /// <para>
-    /// The order of the gates is the contract. Throttle first, because everything after it costs
-    /// either a database read or 30 ms of Argon2. Then identity, then the password, then the
+    /// The order of the gates is the contract. The lockout check first, because everything after it
+    /// costs either a database read or 50 ms of Argon2. Then identity, then the password, then the
     /// account's status, and the corporate domain gate <b>last</b> - after the identity is known,
     /// so an unknown mailbox is answered with "invalid credentials" and never with "your domain is
     /// not allowed", which would confirm the address exists.
     /// </para>
+    /// <para>
+    /// <b>Every refusal before a real password verify pays for one anyway.</b> The bodies were
+    /// already identical; the clock was not. Measured live, an unknown mailbox came back in a
+    /// median of 3.6 ms, a wrong password in 52.3 ms and an account with no local password in
+    /// 6.0 ms - three states of an account, readable by anybody with a stopwatch and no credential
+    /// at all. See <see cref="BackOfficePasswordTiming"/>.
+    /// </para>
     /// </summary>
-    /// <exception cref="RateLimitedException">Too many attempts on this mailbox.</exception>
+    /// <exception cref="RateLimitedException">Too many failures on this mailbox, or from this
+    /// source address.</exception>
     /// <exception cref="UnauthorizedException">Unknown mailbox, wrong password, or an account that
     /// may not sign in.</exception>
     /// <exception cref="ForbiddenException">An internal account presenting a non-corporate mailbox.</exception>
@@ -86,17 +120,12 @@ public sealed class BackOfficeSignInAppService(
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(requestContext);
 
-        var settings = signInOptions.Value;
         var normalizedEmail = Accounts.BackOfficeIdentifiers.Normalize(
             BackendIdentityTypes.Email, request.Email);
 
-        await ThrottleAsync(
-            PasswordDimension,
-            normalizedEmail,
-            settings.PasswordAttemptsPerMinute,
-            settings.PasswordAttemptsPerHour,
-            "Too many sign-in attempts for this address. Try again shortly.",
-            cancellationToken);
+        var budgets = PasswordBudgets(normalizedEmail, requestContext.IpAddress);
+
+        await RefuseWhenLockedOutAsync(budgets, cancellationToken);
 
         var identity = await identities.FindActiveAsync(
             BackendIdentityTypes.Email, protector.Hash(normalizedEmail), cancellationToken);
@@ -108,7 +137,7 @@ public sealed class BackOfficeSignInAppService(
             logger.LogInformation(
                 "A back-office password sign-in named an address with no active identity.");
 
-            throw InvalidCredentials();
+            throw await RefuseCredentialAsync(budgets, request.Password, cancellationToken);
         }
 
         var account = await users.FindByIdAsync(identity.UserId, cancellationToken);
@@ -121,14 +150,23 @@ public sealed class BackOfficeSignInAppService(
                 identity.Id,
                 identity.UserId);
 
-            throw InvalidCredentials();
+            throw await RefuseCredentialAsync(budgets, request.Password, cancellationToken);
         }
 
-        await VerifyPasswordAsync(account, request.Password, requestContext, cancellationToken);
+        await VerifyPasswordAsync(account, request.Password, budgets, requestContext, cancellationToken);
         await RequireSignInAllowedAsync(account, requestContext, password: true, cancellationToken);
         await EnforceCorporateDomainAsync(account, request.Email, requestContext, cancellationToken);
 
-        return await FinishAsync(account, requestContext, canSave: true, cancellationToken);
+        var response = await FinishAsync(account, requestContext, canSave: true, cancellationToken);
+
+        // Specification 3.2 step 7. Only the per-address budget: the per-source one counts failures
+        // from an address across every mailbox it tries, and clearing it on a success would hand
+        // anybody holding one valid account an unlimited spray - four failures, one own sign-in,
+        // repeat. See PasswordBudgets.
+        await ClearFailuresAsync(
+            PasswordDimension, normalizedEmail, budgets.Mailbox, cancellationToken);
+
+        return response;
     }
 
     /// <summary>
@@ -166,11 +204,16 @@ public sealed class BackOfficeSignInAppService(
             throw new BadRequestException(ErrorCodes.ValidationFailed, "An employee number is required.");
         }
 
+        RateLimitPolicy[] otpBudget =
+        [
+            RateLimitPolicy.PerMinute(settings.OtpAttemptsPerMinute),
+            RateLimitPolicy.PerHour(settings.OtpAttemptsPerHour),
+        ];
+
         await ThrottleAsync(
             OtpDimension,
             staffId,
-            settings.OtpAttemptsPerMinute,
-            settings.OtpAttemptsPerHour,
+            otpBudget,
             "Too many one-time-password sign-in attempts for this employee number. Try again shortly.",
             cancellationToken);
 
@@ -239,11 +282,27 @@ public sealed class BackOfficeSignInAppService(
             }
         }
 
-        return await FinishAsync(account, requestContext, resolution.CanSave, cancellationToken);
+        var response = await FinishAsync(account, requestContext, resolution.CanSave, cancellationToken);
+
+        // Specification 3.3 step 9. This door counts attempts rather than failures - each one costs
+        // an upstream call - so without the clear an operator who signs in twice in a minute is
+        // three attempts from being locked out of a door they are using correctly. Only consecutive
+        // failures should accumulate.
+        await ClearFailuresAsync(OtpDimension, staffId, otpBudget, cancellationToken);
+
+        return response;
     }
 
     /// <summary>
-    /// Redeems a sign-in ticket into what the token endpoint should mint.
+    /// Redeems a sign-in ticket into what the token endpoint should mint. <b>Once.</b>
+    /// <para>
+    /// <b>The ticket is claimed before anything else happens.</b> Verifying the signature first and
+    /// claiming second is the only sound order: claiming on an unauthenticated id would let anybody
+    /// write a marker per request into Redis, and doing the account read first would let two
+    /// concurrent redemptions of one ticket both get as far as minting. Claiming immediately after
+    /// the signature check means a refusal further down still burns the ticket - which is correct.
+    /// A disabled account's ticket should not be redeemable a second time either.
+    /// </para>
     /// <para>
     /// <b>The account's status is re-read here rather than trusted from the ticket.</b> The window
     /// is small - a ticket lives two minutes - but it is exactly the window in which an
@@ -251,11 +310,15 @@ public sealed class BackOfficeSignInAppService(
     /// the ticket was signed before that happened.
     /// </para>
     /// </summary>
-    /// <exception cref="UnauthorizedException">The ticket is unusable, or the account has since
-    /// been disabled.</exception>
+    /// <exception cref="UnauthorizedException">The ticket is unusable, has already been redeemed,
+    /// or the account has since been disabled.</exception>
+    /// <exception cref="UpstreamException">It could not be established whether the ticket had
+    /// already been redeemed. Fail-closed: see <see cref="ISingleUseMarkerStore"/>.</exception>
     public async Task<BackOfficeTokenGrant> RedeemAsync(string ticket, CancellationToken cancellationToken)
     {
         var opened = tickets.Open(ticket);
+
+        await ConsumeAsync(opened, cancellationToken);
 
         var account = await users.ReadByIdAsync(opened.UserId, cancellationToken);
         if (account is null)
@@ -264,8 +327,7 @@ public sealed class BackOfficeSignInAppService(
                 "A back-office sign-in ticket named account {BackendUserId}, which no longer exists.",
                 opened.UserId);
 
-            throw new UnauthorizedException(
-                ErrorCodes.InvalidToken, "The sign-in ticket has expired or is not valid. Sign in again.");
+            throw TicketNotUsable();
         }
 
         if (account.Status == BackendUserStatuses.Disabled)
@@ -545,6 +607,7 @@ public sealed class BackOfficeSignInAppService(
     private async Task VerifyPasswordAsync(
         BackendUser account,
         string password,
+        PasswordBudget budgets,
         BackOfficeSignInContext requestContext,
         CancellationToken cancellationToken)
     {
@@ -561,7 +624,11 @@ public sealed class BackOfficeSignInAppService(
             await WriteFailureAsync(
                 account, BackOfficeSignInFailureReasons.InvalidPassword, requestContext, cancellationToken);
 
-            throw InvalidCredentials();
+            // The third timing class, and the one the wave-6 report did not name: this path used to
+            // return in 6.0 ms against 52.3 ms for a wrong password, so "this address exists and
+            // signs in through the corporate one-time password" was readable off the clock. The
+            // response has always been identical; now the cost is too.
+            throw await RefuseCredentialAsync(budgets, password, cancellationToken);
         }
 
         var stored = account.PasswordHash!;
@@ -580,6 +647,11 @@ public sealed class BackOfficeSignInAppService(
 
             await WriteFailureAsync(
                 account, BackOfficeSignInFailureReasons.InvalidPassword, requestContext, cancellationToken);
+
+            // No equalising verify here: this path has just paid for a real one. Adding it would
+            // make a wrong password cost twice what a right one does, which is a new oracle in the
+            // other direction - and two concurrent 19 MiB derivations per attempt rather than one.
+            await CountFailureAsync(budgets, cancellationToken);
 
             throw InvalidCredentials();
         }
@@ -680,14 +752,16 @@ public sealed class BackOfficeSignInAppService(
     // ------------------------------------------------------------------ side effects
 
     /// <summary>
-    /// Counts the attempt against a per-subject budget and refuses when it is spent.
+    /// Counts the attempt against a per-subject budget and refuses when it is spent. The
+    /// one-time-password door's throttle, and the only one that still counts <i>attempts</i>.
     /// <para>
-    /// <b>It counts attempts, not failures</b>, which is not what the service being replaced did -
-    /// that one incremented on failure and reset on success, so a person who types their password
-    /// correctly is never throttled at all. The shared limiter port has one operation and it
-    /// increments, so a read-only "is this locked out" check cannot be expressed against it; see
-    /// the follow-ups. The budgets are therefore set for a human who mistypes rather than for the
-    /// five-strikes lockout the old numbers describe.
+    /// <b>That is deliberate here and wrong on the password door.</b> Specification 3.3 step 1
+    /// counts every one-time-password attempt, and the reason is in what an attempt costs: each one
+    /// is an HTTP call to the corporate directory and a code somebody was sent, so arriving at all
+    /// is the thing worth bounding. A password attempt costs us a hash and nothing else, so there
+    /// the budget is a lockout - see <see cref="RefuseWhenLockedOutAsync"/>. Both doors clear the
+    /// budget on a successful sign-in (steps 7 and 9), which is what stops an operator who signs in
+    /// repeatedly from being throttled for it.
     /// </para>
     /// <para>
     /// The minute window is evaluated first and a refusal stops there. Each call spends a unit of
@@ -700,12 +774,11 @@ public sealed class BackOfficeSignInAppService(
     private async Task ThrottleAsync(
         string dimension,
         string key,
-        int perMinute,
-        int perHour,
+        IReadOnlyList<RateLimitPolicy> policies,
         string message,
         CancellationToken cancellationToken)
     {
-        foreach (var policy in new[] { RateLimitPolicy.PerMinute(perMinute), RateLimitPolicy.PerHour(perHour) })
+        foreach (var policy in policies)
         {
             var decision = await rateLimiter.TryAcquireAsync(dimension, key, policy, cancellationToken);
             if (!decision.Allowed)
@@ -714,6 +787,189 @@ public sealed class BackOfficeSignInAppService(
             }
         }
     }
+
+    // ------------------------------------------------------------- the password door's two budgets
+
+    /// <summary>
+    /// The two independent budgets a password attempt is measured against, and the subjects they
+    /// are measured on.
+    /// <para>
+    /// <b>Both count failures rather than attempts, and only one of them is cleared by a
+    /// success.</b> The per-address budget is a lockout for one mailbox and is cleared when its
+    /// owner finally types the right password (specification 3.2 step 7). The per-source budget is
+    /// not: clearing it would mean anybody holding one working back-office account could spray as
+    /// much as they liked - fail four times, sign into their own account, repeat - and the whole
+    /// point of the per-source dimension is that it survives the attacker having a valid credential
+    /// of their own.
+    /// </para>
+    /// </summary>
+    /// <param name="Mailbox">Windows for the normalized address.</param>
+    /// <param name="Source">Windows for the client address, empty when there is none to attribute to.</param>
+    /// <param name="Email">The normalized address, as the counter's subject.</param>
+    /// <param name="Ip">The client address, as the counter's subject.</param>
+    private sealed record PasswordBudget(
+        IReadOnlyList<RateLimitPolicy> Mailbox,
+        IReadOnlyList<RateLimitPolicy> Source,
+        string Email,
+        string Ip);
+
+    /// <summary>
+    /// Reads the configured budgets for this attempt.
+    /// <para>
+    /// <b>The client address comes from <see cref="BackOfficeSignInContext.IpAddress"/></b>, which
+    /// the API layer fills from the same place the rest of the service resolves a peer address -
+    /// the socket, since nothing in this host registers the forwarded-headers middleware (see
+    /// <c>RequestContext.ClientIp</c>). A second, private <c>X-Forwarded-For</c> parse here would
+    /// be a second trust model: this one would believe a header the audit trail does not, so a
+    /// spray could pick a fresh budget per request by inventing one while the audit rows kept
+    /// recording the gateway. When the host does start trusting a proxy, both move together.
+    /// </para>
+    /// <para>
+    /// <b>An empty address disables the per-source budget rather than sharing one bucket.</b> Every
+    /// request that arrives without an attributable peer - a unit test, a Unix socket, some future
+    /// transport - would otherwise count into the same counter, and the first few would lock out
+    /// all the others. A budget that cannot name its subject is not a budget.
+    /// </para>
+    /// </summary>
+    private PasswordBudget PasswordBudgets(string normalizedEmail, string clientIp)
+    {
+        var settings = signInOptions.Value;
+
+        RateLimitPolicy[] mailbox =
+        [
+            RateLimitPolicy.PerMinute(settings.PasswordFailuresPerMinute),
+            RateLimitPolicy.PerHour(settings.PasswordFailuresPerHour),
+        ];
+
+        RateLimitPolicy[] source = string.IsNullOrWhiteSpace(clientIp)
+            ? []
+            :
+            [
+                RateLimitPolicy.PerMinute(settings.PasswordFailuresPerSourcePerMinute),
+                RateLimitPolicy.PerHour(settings.PasswordFailuresPerSourcePerHour),
+            ];
+
+        return new PasswordBudget(mailbox, source, normalizedEmail, clientIp);
+    }
+
+    /// <summary>
+    /// Refuses an attempt whose subject has already spent its failure budget, without spending any
+    /// of it to find out.
+    /// <para>
+    /// <b>A read, not a count</b> - which is the whole difference between a lockout and an attempt
+    /// budget. Counting here is what made a correct password spend budget, so the configured 10 a
+    /// minute described a human who mistypes rather than the five-strikes lockout the numbers were
+    /// chosen for.
+    /// </para>
+    /// <para>
+    /// <b>The address is checked before the source, and the first refusal stops everything.</b>
+    /// Order matters twice over: <see cref="IRateLimiter"/> requires a caller enforcing several
+    /// policies to stop at the first refusal, and the messages differ - somebody who has locked
+    /// their own mailbox needs to be told about their mailbox, not about the office they share an
+    /// address with.
+    /// </para>
+    /// </summary>
+    private async Task RefuseWhenLockedOutAsync(
+        PasswordBudget budgets, CancellationToken cancellationToken)
+    {
+        await RefuseWhenSpentAsync(
+            PasswordDimension,
+            budgets.Email,
+            budgets.Mailbox,
+            "Too many failed sign-in attempts for this address. Try again shortly.",
+            cancellationToken);
+
+        await RefuseWhenSpentAsync(
+            PasswordIpDimension,
+            budgets.Ip,
+            budgets.Source,
+            "Too many failed sign-in attempts from this network. Try again shortly.",
+            cancellationToken);
+    }
+
+    private async Task RefuseWhenSpentAsync(
+        string dimension,
+        string key,
+        IReadOnlyList<RateLimitPolicy> policies,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        foreach (var policy in policies)
+        {
+            var decision = await rateLimiter.PeekAsync(dimension, key, policy, cancellationToken);
+            if (!decision.Allowed)
+            {
+                throw new RateLimitedException(ErrorCodes.RateLimitExceeded, message, decision.RetryAfter);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records one credential failure against every window of both budgets.
+    /// <para>
+    /// <b>Every window is counted, and the decisions are discarded</b>, which is the one case
+    /// <see cref="IRateLimiter"/> exempts from its stop-at-the-first-refusal rule: this is a tally
+    /// of something that has already happened, not a gate. Stopping at the minute window would
+    /// leave the hour window empty for a subject failing steadily at just under the minute rate -
+    /// which is exactly the shape of a patient attack, and the reason the hour window exists.
+    /// </para>
+    /// </summary>
+    private async Task CountFailureAsync(PasswordBudget budgets, CancellationToken cancellationToken)
+    {
+        foreach (var policy in budgets.Mailbox)
+        {
+            _ = await rateLimiter.TryAcquireAsync(
+                PasswordDimension, budgets.Email, policy, cancellationToken);
+        }
+
+        foreach (var policy in budgets.Source)
+        {
+            _ = await rateLimiter.TryAcquireAsync(
+                PasswordIpDimension, budgets.Ip, policy, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// The one exit every refusal before a real password verify goes through: count the failure,
+    /// spend the missing Argon2id cost, and hand back the exception for the caller to throw.
+    /// <para>
+    /// It returns the exception rather than throwing it so that the compiler can see the calling
+    /// branch ends - <c>throw await RefuseCredentialAsync(...)</c> reads as the exit it is, and a
+    /// method that merely always threw would leave every call site needing an unreachable
+    /// <c>return</c> after it.
+    /// </para>
+    /// <para>
+    /// <b>The order inside is deliberate.</b> The verify goes last, so the failure is recorded
+    /// even if the request is abandoned during the 50 ms it takes - otherwise a client that hangs
+    /// up on every attempt would never fill the budget it is exhausting.
+    /// </para>
+    /// </summary>
+    private async Task<UnauthorizedException> RefuseCredentialAsync(
+        PasswordBudget budgets, string password, CancellationToken cancellationToken)
+    {
+        await CountFailureAsync(budgets, cancellationToken);
+
+        BackOfficePasswordTiming.SpendVerifyCost(passwordHasher, password);
+
+        return InvalidCredentials();
+    }
+
+    /// <summary>
+    /// Clears a subject's failure budget after it has authenticated correctly.
+    /// <para>
+    /// Best effort by contract: <see cref="IRateLimiter.ResetAsync"/> swallows a store failure and
+    /// logs it, because by this point the sign-in has already been decided and a bookkeeping write
+    /// must not fail a request that succeeded. What is lost when it fails is bounded and errs the
+    /// safe way - the counter stands, so this subject may still be refused for the rest of the
+    /// window despite having just proved its password.
+    /// </para>
+    /// </summary>
+    private Task ClearFailuresAsync(
+        string dimension,
+        string key,
+        IReadOnlyList<RateLimitPolicy> policies,
+        CancellationToken cancellationToken) =>
+        rateLimiter.ResetAsync(dimension, key, policies, cancellationToken);
 
     /// <summary>
     /// Records the arrival. The tenant columns come from the context the sign-in resolved, so a
@@ -905,9 +1161,48 @@ public sealed class BackOfficeSignInAppService(
             _ => null,
         };
 
+    /// <summary>
+    /// Spends the ticket, or refuses.
+    /// <para>
+    /// <b>A replay is answered in exactly the words an expired or forged ticket is answered in.</b>
+    /// Saying "this ticket has already been used" would confirm to whoever intercepted it that they
+    /// had intercepted a real one, and that the legitimate holder had got there first. The log line
+    /// says which it was, at Warning: a second redemption inside a two-minute window is not a
+    /// client retrying, it is either a bug in a client or somebody holding a credential they should
+    /// not have.
+    /// </para>
+    /// </summary>
+    private async Task ConsumeAsync(
+        BackOfficeSignInTicket opened, CancellationToken cancellationToken)
+    {
+        var claimed = await markers.TryClaimAsync(
+            SignInTicketPurpose,
+            opened.TicketId,
+            signInOptions.Value.SignInTicketLifetime + MarkerSkew,
+            cancellationToken);
+
+        if (claimed)
+        {
+            return;
+        }
+
+        logger.LogWarning(
+            "A back-office sign-in ticket for account {BackendUserId} was presented a second time "
+            + "and refused. A ticket is redeemable once; a repeat means a client is retrying a "
+            + "token request it already completed, or somebody else is holding the ticket.",
+            opened.UserId);
+
+        throw TicketNotUsable();
+    }
+
     private static UnauthorizedException InvalidCredentials() =>
         new(ErrorCodes.InvalidCredentials, "That email address and password do not match.");
 
+    /// <summary>One sentence for every unusable ticket - malformed, forged, expired, already
+    /// redeemed, or naming an account that has gone. The redeeming grant turns all of them into one
+    /// OAuth <c>invalid_grant</c>, and none of them tells a caller something they did not know.</summary>
+    private static UnauthorizedException TicketNotUsable() =>
+        new(ErrorCodes.InvalidToken, "The sign-in ticket has expired or is not valid. Sign in again.");
 }
 
 /// <summary>

@@ -1,11 +1,19 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 using Shouldly;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.Auth.TokenValidation;
+using UserSvc.Application.Features.BackOffice.Consumers;
+using UserSvc.Application.Features.BackOffice.Rbac;
+using UserSvc.Application.Features.BackOffice.TestWhitelist;
 using UserSvc.Application.Ports.Auth;
 using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Platform;
+using UserSvc.Application.Ports.TestWhitelist;
+using UserSvc.Application.Ports.Users;
+using UserSvc.Application.Security;
 using UserSvc.Domain.Auth;
 using UserSvc.Domain.Iam;
 using Xunit;
@@ -23,9 +31,17 @@ public sealed class TokenValidationAppServiceTests
 
     private readonly IBackOfficeCaller _caller = Substitute.For<IBackOfficeCaller>();
     private readonly IUserSessionRepository _sessions = Substitute.For<IUserSessionRepository>();
+    private readonly ITestWhitelistRepository _whitelist = Substitute.For<ITestWhitelistRepository>();
+
+    /// <summary>How the whitelist reaches the endpoint. Replaced by a throwing factory in the one
+    /// test that pins what happens when the capability cannot even be constructed.</summary>
+    private Func<TestWhitelistAppService> _whitelistFactory;
 
     public TokenValidationAppServiceTests()
     {
+        _whitelistFactory = WhitelistService;
+        _whitelist.IsWhitelistedAsync(Arg.Any<int>(), Arg.Any<CancellationToken>()).Returns(false);
+
         _caller.UserId.Returns(42);
         _caller.ActType.Returns(string.Empty);
         _caller.ActCode.Returns(string.Empty);
@@ -54,14 +70,81 @@ public sealed class TokenValidationAppServiceTests
         response.IsTenantAdmin.ShouldBeFalse();
     }
 
+    /// <summary>The test-user flag is whatever the whitelist store says about this consumer.</summary>
+    [Fact]
+    public async Task TheTestUserFlagIsWhateverTheWhitelistStoreSays()
+    {
+        _whitelist.IsWhitelistedAsync(42, Arg.Any<CancellationToken>()).Returns(true);
+
+        (await Describe(Facts())).IsTest.ShouldBeTrue();
+    }
+
+    /// <summary>A consumer the store does not hold is not a test user, and the store is asked about
+    /// exactly the presenting account.</summary>
+    [Fact]
+    public async Task AConsumerTheWhitelistDoesNotHoldIsNotATestUser()
+    {
+        (await Describe(Facts())).IsTest.ShouldBeFalse();
+
+        await _whitelist.Received(1).IsWhitelistedAsync(42, Arg.Any<CancellationToken>());
+    }
+
     /// <summary>
-    /// The fail-closed direction for the test-user flag: false hides the test company's products.
-    /// The whitelist store itself belongs to a slice that has not landed, and reporting true
-    /// without one would expose test inventory to every consumer.
+    /// <b>The realm guard.</b> The whitelist table is keyed by <c>identity.users.id</c> and the two
+    /// planes number their accounts independently, so back-office account 42 must not inherit
+    /// consumer 42's entitlement. The store is not consulted at all - the guard is the absence of
+    /// the lookup, not a filter applied to its answer, which is what makes it hold for a store
+    /// that would have said yes.
     /// </summary>
     [Fact]
-    public async Task TheTestUserFlagIsFalseUntilTheWhitelistStoreExists() =>
-        (await Describe(Facts())).IsTest.ShouldBeFalse();
+    public async Task ABackOfficeTokenIsNeverATestUserEvenWhenItsIdIsWhitelisted()
+    {
+        _whitelist.IsWhitelistedAsync(42, Arg.Any<CancellationToken>()).Returns(true);
+
+        var response = await Describe(Facts() with { IsInternal = true });
+
+        response.IsTest.ShouldBeFalse();
+        await _whitelist.DidNotReceive().IsWhitelistedAsync(
+            Arg.Any<int>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// A whitelist store that cannot be read reports false rather than failing the call. The flag
+    /// is additive - false hides the test company's products - and this endpoint is the platform's
+    /// hottest authenticated path, so a whitelist hiccup must not read as an authentication
+    /// failure.
+    /// </summary>
+    [Fact]
+    public async Task AnUnreadableWhitelistLeavesTheTokenValidAndTheFlagFalse()
+    {
+        _whitelist.IsWhitelistedAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(new InvalidOperationException("the whitelist table is gone"));
+
+        var response = await Describe(Facts());
+
+        response.IsValid.ShouldBeTrue();
+        response.UserId.ShouldBe(42);
+        response.IsTest.ShouldBeFalse();
+    }
+
+    /// <summary>
+    /// A whitelist that cannot be constructed at all degrades the flag and not the answer. The
+    /// realistic trigger is <c>IdentifierProtector</c>, which the whitelist service reaches and
+    /// which throws on a key that is missing or the wrong length - though on a live host a broken
+    /// key already fails every request in the middleware, so this pins the app service's own
+    /// promise rather than a survivable deployment.
+    /// </summary>
+    [Fact]
+    public async Task AWhitelistThatCannotBeConstructedLeavesTheTokenValid()
+    {
+        _whitelistFactory = () => throw new OptionsValidationException(
+            "IdentifierProtection", typeof(IdentifierProtectionOptions), ["DataKey is required."]);
+
+        var response = await Describe(Facts());
+
+        response.IsValid.ShouldBeTrue();
+        response.IsTest.ShouldBeFalse();
+    }
 
     /// <summary>
     /// A back-office caller who holds nothing gets empty lists and a fully declared scope envelope.
@@ -255,7 +338,7 @@ public sealed class TokenValidationAppServiceTests
         _sessions.FindBySessionIdAsync("sid-1", Arg.Any<CancellationToken>()).Returns(
             UserSession.Start(
                 "sid-1",
-                99,
+                SessionSubject.Consumer(99),
                 new DeviceDescriptor("device-9", "someone else", "android", "1.0.0", "198.51.100.4", "agent"),
                 "auth-9",
                 Now));
@@ -286,7 +369,7 @@ public sealed class TokenValidationAppServiceTests
 
     private static UserSession StartSession() => UserSession.Start(
         "sid-1",
-        42,
+        SessionSubject.Consumer(42),
         new DeviceDescriptor("device-7", "Alan's phone", "ios", "3.1.0", "203.0.113.7", "agent"),
         "auth-1",
         Now);
@@ -297,8 +380,46 @@ public sealed class TokenValidationAppServiceTests
         clock.UtcNow.Returns(Now);
 
         var service = new TokenValidationAppService(
-            _caller, _sessions, clock, NullLogger<TokenValidationAppService>.Instance);
+            _caller,
+            _sessions,
+            _whitelistFactory,
+            clock,
+            NullLogger<TokenValidationAppService>.Instance);
 
         return service.DescribeAsync(facts, CancellationToken.None);
     }
+
+    /// <summary>
+    /// The real whitelist service over a substituted store. The real one because the behaviour
+    /// under test lives in it - the non-throwing read this endpoint relies on - and substituting it
+    /// would test a mock's manners instead. Everything it needs for its administrative half is a
+    /// substitute; none of that half is reachable from here.
+    /// </summary>
+    private TestWhitelistAppService WhitelistService() => new(
+        new AdminScopeService(
+            Substitute.For<IBackOfficeUserDirectory>(),
+            Substitute.For<ITenantMemberDirectory>(),
+            Substitute.For<IUserTenantRoleRepository>(),
+            Substitute.For<IRoleRepository>(),
+            Substitute.For<IRoleMenuRepository>(),
+            Substitute.For<IMenuRepository>(),
+            Substitute.For<IRolePermissionRepository>()),
+        _whitelist,
+        Substitute.For<IUserRepository>(),
+        new ConsumerSummaryService(
+            Substitute.For<IConsumerAccountDirectory>(),
+            new IdentifierProtector(Options.Create(new IdentifierProtectionOptions
+            {
+                Pepper = "00112233445566778899aabbccddeeff",
+                DataKey = Convert.ToBase64String(new byte[32]),
+                KeyVersion = "v3",
+            })),
+            NullLogger<ConsumerSummaryService>.Instance),
+        new IamAuditWriter(
+            Substitute.For<IIamAuditLogRepository>(),
+            new TestClock(Now),
+            NullLogger<IamAuditWriter>.Instance),
+        Substitute.For<IUnitOfWork>(),
+        new TestClock(Now),
+        NullLogger<TestWhitelistAppService>.Instance);
 }

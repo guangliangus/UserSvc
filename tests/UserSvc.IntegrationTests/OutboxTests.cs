@@ -76,7 +76,7 @@ public sealed class OutboxTests(ServiceFixture fixture) : IntegrationTest(fixtur
             // A second row claiming the same sid violates the unique index on session_id, so the
             // whole unit of work has to roll back.
             db.UserSessions.Add(UserSession.Start(
-                sessionId, userId, Device("device-b"), "authorization-b", now));
+                sessionId, SessionSubject.Consumer(userId), Device("device-b"), "authorization-b", now));
 
             var conflict = await Should.ThrowAsync<ConflictException>(
                 async () => await unitOfWork.SaveChangesAsync(CancellationToken.None));
@@ -106,7 +106,7 @@ public sealed class OutboxTests(ServiceFixture fixture) : IntegrationTest(fixtur
         var db = scope.ServiceProvider.GetRequiredService<UserSvcDbContext>();
 
         db.UserSessions.Add(UserSession.Start(
-            sessionId, userId, Device(deviceId), $"authorization-{deviceId}", DateTimeOffset.UtcNow));
+            sessionId, SessionSubject.Consumer(userId), Device(deviceId), $"authorization-{deviceId}", DateTimeOffset.UtcNow));
 
         await db.SaveChangesAsync();
         return sessionId;

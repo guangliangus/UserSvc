@@ -14,16 +14,22 @@ namespace UserSvc.Infrastructure.Persistence.Configurations;
 /// database already resolves correctly into a 409 the client cannot act on.
 /// </para>
 /// <para>
-/// Four indexes serve seven statements, and one of the seven is only partly covered - worth naming
-/// rather than glossing. The send path's retirement UPDATE and the ticket consume both ride the
-/// (target_hash, purpose, ...) index; the verify candidate SELECT has its own; the conditional
-/// UPDATE that follows it goes by primary key; the two risk-control counts have one each. The
-/// exception is the miss classification, which queries target_hash + purpose + code_hash with
-/// <b>no</b> state filter and so cannot use the partial index the candidate SELECT uses: it falls
-/// back to the unfiltered (target_hash, created_at) index and filters the rest in memory. That is
-/// acceptable because it only runs on a failed verify and only ever reads one target's history -
-/// but history does accumulate here, since rows are never deleted, so a target that has been sent
-/// thousands of codes makes a failed verify measurably slower than a successful one.
+/// Three indexes serve the statements this table runs. The send path's retirement UPDATE and the
+/// ticket consume both ride the (target_hash, purpose, ...) index; the verify candidate SELECT has
+/// its own; the conditional UPDATE that follows it goes by primary key. The miss classification
+/// queries target_hash + purpose + code_hash with <b>no</b> state filter and so cannot use the
+/// partial index the candidate SELECT uses: it falls back to the unfiltered (target_hash,
+/// created_at) index and filters the rest in memory. That runs only on a failed verify and reads
+/// one target's history - but history accumulates here, since rows are never deleted, so a target
+/// sent thousands of codes makes a failed verify measurably slower than a successful one, and the
+/// unfiltered index keeps it a bounded index read rather than a growing sequential scan.
+/// </para>
+/// <para>
+/// There is deliberately <b>no</b> (device_id_hash, created_at) index, though the risk-control
+/// spec pairs it with the target one. It backed only the device-dimension "count sends from the DB
+/// when Redis is down" fallback, and that fallback was never wired - nothing calls
+/// <c>CountInWindow</c> - so the index was written on every send and read by nothing. It is dropped
+/// in db/0003_verification.sql; this configuration and that script must stay in step (gate 04).
 /// </para>
 /// </summary>
 public sealed class VerificationCodeConfiguration : IEntityTypeConfiguration<VerificationCode>
@@ -47,9 +53,16 @@ public sealed class VerificationCodeConfiguration : IEntityTypeConfiguration<Ver
         builder.HasIndex(x => new { x.TargetHash, x.Purpose, x.VerificationTicketHash })
             .HasFilter("consumed_at IS NULL");
 
-        // The two risk-control fallback counts. Unfiltered on purpose: they count history,
-        // including the rows the other indexes deliberately exclude.
+        // The unfiltered (target_hash, created_at) index. Its live reader is the miss
+        // classification on a failed verify - (target_hash, purpose, code_hash) with no state
+        // filter, which the partial indexes above cannot serve - not the never-wired risk-control
+        // fallback. The target-dimension fallback COUNT rides it too; the index stands on the
+        // verify path alone. See db/0003_verification.sql for the EXPLAIN numbers.
         builder.HasIndex(x => new { x.TargetHash, x.CreatedAt });
-        builder.HasIndex(x => new { x.DeviceIdHash, x.CreatedAt });
+
+        // No (device_id_hash, created_at) index: it backed only the device-dimension fallback COUNT,
+        // which no caller reaches, so it was pure write amplification on every send. Dropped in
+        // db/0003_verification.sql (DROP INDEX IF EXISTS). Recreate it there and here together, and
+        // prove it with EXPLAIN, if the device fallback is ever actually implemented.
     }
 }

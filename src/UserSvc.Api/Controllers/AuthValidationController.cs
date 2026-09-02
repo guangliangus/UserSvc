@@ -39,7 +39,8 @@ namespace UserSvc.Api.Controllers;
 /// </description></item>
 /// <item><description>
 /// <b>Is this consumer a test user?</b> A verdict that lives in this service's own store and in no
-/// token. Not yet answerable here - see <see cref="TokenValidationResponse.IsTest"/>.
+/// token, read per call so that whitelisting somebody lands on their next request. It is asked for
+/// consumer tokens only - see <see cref="TokenValidationResponse.IsTest"/>.
 /// </description></item>
 /// </list>
 /// <para>

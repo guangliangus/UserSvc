@@ -136,19 +136,36 @@ public sealed class VerificationAppService(
     /// <summary>
     /// Exchange a correct code for a verification ticket.
     /// <para>
-    /// <b>There is no throttle on this path, and that is a known hole rather than a design.</b> It
-    /// matches the original, which rate-limited only <c>/send</c>. A wrong guess does <i>not</i>
-    /// retire the code row - the conditional UPDATE only fires when the code matched - so the row
-    /// stays live for the whole of <c>CodeExpires</c> and nothing here counts attempts. Six digits
-    /// over a five-minute window is a million-guess space with no counter in front of it, which is
-    /// within reach of an attacker who can trigger a send to a victim and then guess quickly.
+    /// <b>There is no throttle on this path, and that is a faithful port rather than an oversight.</b>
+    /// The spec (02-verification-codes, section 4.2) states plainly that <c>/verify</c> carries no
+    /// per-IP rate limit and no risk control - only <c>/send</c> and <c>/captcha/verify</c> do - so
+    /// what bounds a brute force here is the code itself, not a counter. The bounds, exactly:
+    /// <list type="bullet">
+    /// <item><b>Entropy:</b> six decimal digits, one of 1,000,000 values, about 19.9 bits.</item>
+    /// <item><b>One live code:</b> <see cref="SendVerificationCodeAsync"/> retires every prior live
+    /// code for the target and purpose, so an attacker faces exactly one valid code at a time - a
+    /// fresh send does not add a second, it replaces the first.</item>
+    /// <item><b>A hard time ceiling:</b> the candidate lookup requires <c>expires_at &gt; now</c>, so
+    /// the code is unguessable after <c>CodeExpires</c> (default five minutes); the window does not
+    /// reopen without a new send delivering a new code to the victim.</item>
+    /// <item><b>No attempt counter:</b> a wrong guess does not retire the row - the conditional
+    /// UPDATE fires only on a match - and nothing counts misses, so guesses are limited only by the
+    /// caller's request throughput.</item>
+    /// </list>
+    /// So an attacker who can trigger one send to a victim gets, within that five-minute window,
+    /// guesses ≈ throughput × 300 s out of 1,000,000, and success probability ≈ that many over a
+    /// million: about 500,000 distinct guesses (~1,700 req/s sustained) for a coin flip, ~167 req/s
+    /// for a 5% chance. That is a real online-guessing oracle for a well-resourced attacker, not a
+    /// trivial one - the five-minute ceiling and the single live code are the whole defence.
     /// </para>
     /// <para>
     /// Closing it means a per-target attempt budget on this endpoint, keyed on the target rather
     /// than the caller's address (an attacker rotates addresses; the victim's mailbox does not
     /// move). It is deliberately not added here: it introduces a 429 on a path the clients and the
-    /// two auth slices were written against, and it hands an attacker a cheap way to block a
-    /// victim's own reset. That trade needs a decision, not a unilateral edit during a port.
+    /// two auth slices were written against, and a naive per-target counter hands an attacker a
+    /// cheap way to block a victim's own reset. That trade needs the client-contract owner's
+    /// decision (tracked alongside the enumeration oracles in docs/architecture.md), not a
+    /// unilateral edit during a port.
     /// </para>
     /// </summary>
     public async Task<VerifyCodeResponse> VerifyCodeAsync(

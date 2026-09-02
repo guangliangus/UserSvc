@@ -48,7 +48,20 @@ public sealed class NotificationHttpClient(
     private const string UpstreamUnavailableMessage =
         "The notification could not be sent because the notification service is unavailable.";
 
-    private readonly string _sendDirectPath = options.Value.SendDirectPath;
+    /// <summary>
+    /// The validated section, read at the point of use and never in a field initializer.
+    /// <para>
+    /// A field initializer runs in the constructor, and <see cref="IOptions{TOptions}.Value"/> is
+    /// where DataAnnotations validation happens - so reading it there makes merely
+    /// <i>constructing</i> this class throw, taking down every caller that has this one in its
+    /// dependency graph rather than only the capability whose configuration is missing. That is
+    /// the failure docs/architecture.md records, and it stays fixed here even though this section
+    /// is validated at startup today: the shape must not be lying around for the day somebody
+    /// removes <c>ValidateOnStart</c> from it, which has already happened to four sections in this
+    /// service. <see cref="IOptions{TOptions}.Value"/> caches, so a property costs nothing.
+    /// </para>
+    /// </summary>
+    private string _sendDirectPath => options.Value.SendDirectPath;
 
     public async Task SendDirectAsync(SendDirectRequest request, CancellationToken cancellationToken)
     {

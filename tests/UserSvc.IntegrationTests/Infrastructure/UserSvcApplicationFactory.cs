@@ -1,5 +1,9 @@
+using System.Net;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
 namespace UserSvc.IntegrationTests.Infrastructure;
@@ -23,9 +27,36 @@ namespace UserSvc.IntegrationTests.Infrastructure;
 /// without it the host refuses to boot.
 /// </para>
 /// </summary>
+/// <param name="postgresConnectionString">Connection string of the throwaway database.</param>
+/// <param name="redisConfiguration">Configuration string of the throwaway Redis.</param>
+/// <param name="overrides">
+/// Extra host settings, applied <b>after</b> everything below so they win.
+/// <para>
+/// It exists for the tests that need a differently configured deployment rather than a different
+/// request - "no back-office ticket key" being the one that matters, because a missing capability
+/// is only provably isolated if a host without it still serves everything else. Overriding through
+/// the same <c>UseSetting</c> channel keeps that host identical to this one in every other respect;
+/// a second factory class would drift.
+/// </para>
+/// </param>
+/// <param name="peerAddress">
+/// A client address to stamp on every request, or null to leave the connection without one.
+/// <para>
+/// <b>Null is the default because null is what TestServer actually does</b>, and that turns out to
+/// matter. <c>TestServer</c> serves requests over no socket, so
+/// <c>HttpContext.Connection.RemoteIpAddress</c> is null and every per-source budget in the
+/// service - which reads that address and disables itself when there is none - is silently
+/// switched off for the whole suite. That is why a suite signing in twenty times cannot throttle
+/// itself on the per-address dimension, and equally why nothing here can exercise that dimension
+/// unless it is asked for. Setting it is opt-in, per host, so a test about the per-address lockout
+/// can have one without switching the lockout on underneath every other test.
+/// </para>
+/// </param>
 internal sealed class UserSvcApplicationFactory(
     string postgresConnectionString,
-    string redisConfiguration) : WebApplicationFactory<Program>
+    string redisConfiguration,
+    IReadOnlyDictionary<string, string>? overrides = null,
+    string? peerAddress = null) : WebApplicationFactory<Program>
 {
     /// <summary>Matches appsettings.Development.json, so the Redis keys the assertions look for are
     /// the keys the service actually writes.</summary>
@@ -67,8 +98,71 @@ internal sealed class UserSvcApplicationFactory(
         // read. A test host has no business asking the operating system for a key.
         builder.UseSetting("AuthToken:UseEphemeralKeys", "true");
 
+        // The back-office sign-in ticket's HMAC key, which the two back-office grants are the whole
+        // of back-office authentication on top of.
+        //
+        // Supplied here rather than left to appsettings.Development.json, which does carry a
+        // development value, because the two files answer different questions. A failing
+        // back-office test then means the code is wrong, not that somebody edited a developer's
+        // config file - the same reason the connection string, Redis and the notification address
+        // are all stated above rather than inherited. It stays a distinct value from the
+        // development one so that neither file's key can quietly become "the" key.
+        //
+        // It is 32 bytes of hex, which is the minimum the ticket service accepts; a shorter key is
+        // not a weaker ticket but a forgeable one.
+        builder.UseSetting(
+            "BackOfficeSignIn:SignInTicketKey",
+            "696e746567726174696f6e2d746573742d7469636b65742d6b65792d33326279");
+
         // The service logs one line per request plus a warning per intentionally failed one. At
         // Information that buries the assertion failures in the test output.
         builder.UseSetting("Serilog:MinimumLevel:Default", "Warning");
+
+        // Last, so a test that asked for a differently configured deployment actually gets one.
+        if (overrides is null)
+        {
+            return;
+        }
+
+        foreach (var (key, value) in overrides)
+        {
+            builder.UseSetting(key, value);
+        }
+    }
+
+    /// <summary>
+    /// Installs the peer-address middleware, when one was asked for.
+    /// <para>
+    /// Through <see cref="IStartupFilter"/> rather than a <c>ConfigureWebHost</c> callback because
+    /// the address has to be in place before anything reads it, and a startup filter is the one
+    /// hook that <b>prepends</b> to the pipeline the application built rather than appending to it.
+    /// </para>
+    /// </summary>
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        if (peerAddress is { } address)
+        {
+            builder.ConfigureServices(services => services.AddSingleton<IStartupFilter>(
+                new PeerAddressStartupFilter(IPAddress.Parse(address))));
+        }
+
+        return base.CreateHost(builder);
+    }
+
+    /// <summary>Puts a client address on the connection of every request, first in the pipeline.</summary>
+    private sealed class PeerAddressStartupFilter(IPAddress address) : IStartupFilter
+    {
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app =>
+        {
+            app.Use(async (context, following) =>
+            {
+                context.Connection.RemoteIpAddress = address;
+                await following();
+            });
+
+            next(app);
+        };
     }
 }

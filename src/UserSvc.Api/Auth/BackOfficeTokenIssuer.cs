@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Claims;
 using System.Text.Json;
@@ -113,13 +114,32 @@ public sealed class BackOfficeTokenIssuer(
         catch (AppException ex)
         {
             // 5xx: this deployment cannot serve the grant - most often an unconfigured secret.
-            // Reported as server_error with the reason, rather than as invalid_grant, because an
-            // operator reading a client's console needs to know it is not the credential's fault.
-            // The message names the missing section; AppException messages are safe to return.
+            // Reported as server_error rather than as invalid_grant, because an operator reading a
+            // client's console needs to know it is not the credential's fault. That much was always
+            // right; returning ex.Message with it was not.
+            //
+            // AppException messages are safe to return to the caller who caused them. The callers
+            // here are anonymous - /connect/token takes no credential before this point - and the
+            // messages on this path name internal configuration keys:
+            // "BackOfficeSignIn:SignInTicketKey is unusable because it is not valid hex". That is a
+            // free map of a deployment's secret names, handed to anybody who can POST a form. The
+            // names are not values, and the intent - telling an operator to go and look at the
+            // secrets - is worth keeping, so it moves to where only an operator reads it.
+            //
+            // The trace id is the join. It is computed exactly as the ProblemDetails contract
+            // computes it (Program.cs: the bare 32-hex W3C trace id, not the full traceparent) and
+            // it is what Serilog renders as {TraceId} on every line of this request, including the
+            // Error line above - so the id a client pastes into a support ticket finds the log line
+            // that still carries the whole message.
+            var traceId = Activity.Current?.TraceId.ToString() ?? context.TraceIdentifier;
+
             logger.LogError(ex, "A back-office token request failed: {ErrorCode}.", ex.ErrorCode);
 
             return BackOfficeTokenResult.Rejected(
-                OpenIddictConstants.Errors.ServerError, ex.Message);
+                OpenIddictConstants.Errors.ServerError,
+                "This deployment cannot serve back-office token requests right now. It is a "
+                + $"server-side fault rather than a problem with the credential presented. Quote trace id {traceId} "
+                + "when reporting it.");
         }
     }
 
@@ -201,7 +221,76 @@ public sealed class BackOfficeTokenIssuer(
             new SelectTenantContextRequest { TenantType = tenantType, TenantCode = tenantCode },
             cancellationToken);
 
-        return await MintAsync(context, request, grant, cancellationToken);
+        var minted = await MintAsync(context, request, grant, cancellationToken);
+
+        if (minted.Principal is not null)
+        {
+            await RetirePresentedSessionAsync(caller, cancellationToken);
+        }
+
+        return minted;
+    }
+
+    /// <summary>
+    /// Takes down the session the caller presented, now that it holds a credential for the context
+    /// it switched to.
+    /// <para>
+    /// <b>Without this a switch adds authority instead of moving it.</b> Measured before the fix:
+    /// switching from company C001 to C002 on a second device left the C001 session ACTIVE, its
+    /// access token answering <c>/back-office/me</c> with C001's scope envelope, and its refresh
+    /// chain minting fresh C001 tokens - so an operator who "left" a tenant kept a working
+    /// credential for it indefinitely, and revoking their access to C001 in the database was
+    /// invisible to that chain until somebody signed the device out by hand. On the same device the
+    /// partial unique index made the new session supersede the old one and hid the problem; the
+    /// second device is where it showed.
+    /// </para>
+    /// <para>
+    /// <b>After the mint, not before.</b> The failure mode of this order is "the old token lives a
+    /// few more minutes"; of the other, "the operator holds nothing at all because the mint failed
+    /// after their credential was destroyed". One <see cref="SessionAppService.RevokeDeviceAsync"/>
+    /// does all three revocations in the load-bearing order - session row, OpenIddict chain, Redis
+    /// revocation entry - so the old access token stops working now rather than at its expiry.
+    /// </para>
+    /// <para>
+    /// <b>Best effort, with an Error log rather than a throw.</b> docs/architecture.md already
+    /// settles this exact case for the superseding write, and by this point a good token has been
+    /// minted: raising here would answer a successful exchange with a 502 and send the client back
+    /// to mint another, leaving a second live session behind on every retry.
+    /// </para>
+    /// <para>
+    /// <see cref="RevocationReasons.Superseded"/> rather than a new <c>CONTEXT_SWITCH</c> value:
+    /// the row is a session stepping aside for a newer one, which is what that reason means, and
+    /// adding a revocation reason is a change to a column's documented value set.
+    /// </para>
+    /// </summary>
+    private async Task RetirePresentedSessionAsync(
+        BackOfficeCaller caller, CancellationToken cancellationToken)
+    {
+        if (caller.SessionId.Length == 0)
+        {
+            // A pre-tenant credential carries no sid because it has no session row: this exchange
+            // is the first context this sign-in has had, so there is nothing behind it to retire.
+            return;
+        }
+
+        try
+        {
+            await sessions.RevokeDeviceAsync(
+                SessionSubject.BackOffice(caller.UserId),
+                caller.SessionId,
+                RevocationReasons.Superseded,
+                cancellationToken);
+        }
+        catch (AppException ex)
+        {
+            logger.LogError(
+                ex,
+                "A context exchange minted a token for back-office account {BackendUserId} but could "
+                + "not retire the session {SessionId} it was switching away from; that session's "
+                + "credential stays usable for its own context until it expires or is signed out.",
+                caller.UserId,
+                caller.SessionId);
+        }
     }
 
     /// <summary>
@@ -443,8 +532,12 @@ public sealed class BackOfficeTokenIssuer(
 /// </summary>
 /// <param name="Principal">The principal to sign in, or null when the grant was refused.</param>
 /// <param name="Error">OAuth error code, when refused.</param>
-/// <param name="ErrorDescription">OAuth error description, when refused. Safe to return: it never
-/// names an account and never says which of several refusals applied.</param>
+/// <param name="ErrorDescription">
+/// OAuth error description, when refused. Safe to return: it never names an account, never says
+/// which of several refusals applied, and - since the caller of this endpoint is anonymous - never
+/// names a configuration key. A server-side fault travels as a generic sentence plus the request's
+/// trace id, which is the only thing that gets an operator to the log line holding the detail.
+/// </param>
 public sealed record BackOfficeTokenResult(
     ClaimsPrincipal? Principal, string Error = "", string ErrorDescription = "")
 {

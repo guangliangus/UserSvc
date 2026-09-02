@@ -104,15 +104,25 @@ public sealed record TokenValidationResponse
 
     /// <summary>
     /// Whether this consumer is on the test-user whitelist, which lets them see and order the test
-    /// company's products.
+    /// company's products. It is read from the whitelist store on every call rather than baked into
+    /// a token, so adding somebody takes effect on their next request instead of at their next
+    /// sign-in.
     /// <para>
-    /// <b>Always <see langword="false"/> in this service today, and false is the fail-closed
-    /// direction</b> — it hides test products rather than exposing them, which is exactly what the
-    /// Go implementation degraded to when its whitelist store could not be read. The whitelist
-    /// itself (the <c>uam:testwl</c> Redis set, its administration endpoints and the realm guard
-    /// that keeps back-office ids out of it) belongs to the misc-platform data slice and has not
-    /// landed. The field is present rather than omitted because the relying services already read
-    /// it and a missing field is indistinguishable from an old build.
+    /// <b>Always <see langword="false"/> for a back-office token</b>, where the question does not
+    /// apply: the whitelist is keyed by consumer account id, and the two planes number their
+    /// accounts independently, so answering it for an internal subject would hand one plane's
+    /// entitlement to the other plane's account of the same number.
+    /// </para>
+    /// <para>
+    /// <see langword="false"/> is also what a store that cannot be read degrades to. That hides
+    /// test products rather than exposing them - the fail-closed direction, and the one the Go
+    /// implementation degraded to as well.
+    /// </para>
+    /// <para>
+    /// A plain <see langword="bool"/> rather than a nullable one, unlike the authority collections
+    /// above: the relying services read a missing field as false, so "does not apply" and "no" are
+    /// not two states they can tell apart, and pretending otherwise would only invite a null check
+    /// nobody writes.
     /// </para>
     /// </summary>
     public bool IsTest { get; init; }

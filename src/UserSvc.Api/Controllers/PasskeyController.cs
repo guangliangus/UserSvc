@@ -48,7 +48,7 @@ public sealed class PasskeyController(PasskeyAppService passkeys, ICurrentUser c
         // The body is optional: a client with no label to suggest has nothing to send, and the Go
         // clients send none. Binding null must therefore not be a 400.
         passkeys.BeginRegistrationAsync(
-            currentUser.RequireUserId(),
+            currentUser.RequireConsumerId(),
             request ?? new PasskeyRegisterBeginRequest(),
             cancellationToken);
 
@@ -65,7 +65,7 @@ public sealed class PasskeyController(PasskeyAppService passkeys, ICurrentUser c
     public Task<PasskeyRegistrationResponse> FinishRegistration(
         PasskeyRegisterFinishRequest request,
         CancellationToken cancellationToken) =>
-        passkeys.FinishRegistrationAsync(currentUser.RequireUserId(), request, cancellationToken);
+        passkeys.FinishRegistrationAsync(currentUser.RequireConsumerId(), request, cancellationToken);
 
     /// <summary>
     /// Start a passkey sign-in.
@@ -118,7 +118,7 @@ public sealed class PasskeyController(PasskeyAppService passkeys, ICurrentUser c
     [ProducesResponseType<PasskeyListResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     public Task<PasskeyListResponse> List(CancellationToken cancellationToken) =>
-        passkeys.ListAsync(currentUser.RequireUserId(), cancellationToken);
+        passkeys.ListAsync(currentUser.RequireConsumerId(), cancellationToken);
 
     /// <summary>Relabel one passkey.</summary>
     /// <response code="404">No such passkey on this account. Somebody else's id answers the same way.</response>
@@ -131,7 +131,7 @@ public sealed class PasskeyController(PasskeyAppService passkeys, ICurrentUser c
         int id,
         RenamePasskeyRequest request,
         CancellationToken cancellationToken) =>
-        passkeys.RenameAsync(currentUser.RequireUserId(), id, request, cancellationToken);
+        passkeys.RenameAsync(currentUser.RequireConsumerId(), id, request, cancellationToken);
 
     /// <summary>
     /// Remove one passkey.
@@ -149,7 +149,7 @@ public sealed class PasskeyController(PasskeyAppService passkeys, ICurrentUser c
     [ProducesResponseType(StatusCodes.Status409Conflict)]
     public async Task<IActionResult> Delete(int id, CancellationToken cancellationToken)
     {
-        await passkeys.DeleteAsync(currentUser.RequireUserId(), id, cancellationToken);
+        await passkeys.DeleteAsync(currentUser.RequireConsumerId(), id, cancellationToken);
 
         return NoContent();
     }

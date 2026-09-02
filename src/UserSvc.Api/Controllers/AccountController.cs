@@ -40,7 +40,7 @@ public sealed class AccountController(AccountAppService accounts, ICurrentUser c
     [ProducesResponseType(StatusCodes.Status502BadGateway)]
     public async Task<IActionResult> Deregister(CancellationToken cancellationToken)
     {
-        await accounts.DeregisterAsync(currentUser.RequireUserId(), cancellationToken);
+        await accounts.DeregisterAsync(currentUser.RequireConsumerId(), cancellationToken);
         return NoContent();   // Decision 09: a delete answers 204 with no body.
     }
 }

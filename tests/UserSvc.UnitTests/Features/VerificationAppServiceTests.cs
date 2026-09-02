@@ -568,6 +568,26 @@ public sealed class VerificationAppServiceTests
     }
 
     [Fact]
+    public async Task VerifyingIsNeitherRateLimitedNorRiskControlled()
+    {
+        // Pins the deliberate no-throttle contract of /verify (spec 02, section 4.2: no per-IP
+        // limit, no risk control - only /send carries those). The protection against brute force is
+        // the code's own entropy and its five-minute expiry, quantified on VerifyCodeAsync; nothing
+        // on this path counts attempts. If a throttle is ever added it must be a considered contract
+        // change - it introduces a 429 the clients and the auth slices were not written against, and
+        // a naive per-target counter lets an attacker lock a victim out of their own reset - so this
+        // test failing is the signal to have that conversation, not to update the assertion.
+        await Sut.VerifyCodeAsync(
+            new VerifyCodeRequest { Target = Email, Code = "123456", Purpose = VerificationPurposes.Auth },
+            CancellationToken.None);
+
+        await _rateLimiter.DidNotReceive().TryAcquireAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>());
+        await _riskControl.DidNotReceive().EvaluateSendCodeAsync(
+            Arg.Any<SendCodeRiskContext>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task AVerifyMissingItsCodeNeverReachesTheDatabase()
     {
         var ex = await Should.ThrowAsync<BadRequestException>(() => Sut.VerifyCodeAsync(

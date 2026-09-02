@@ -13,7 +13,17 @@ namespace UserSvc.Application.Ports.Platform;
 /// </para>
 /// <para>
 /// <b>Implementations must fail open.</b> See <see cref="RateLimitDecision.FailOpen"/> for the
-/// reasoning and the cost.
+/// reasoning and the cost. That holds for all three operations, in the two shapes a failure can
+/// take: a lost read or count allows the request, and a lost reset leaves a counter standing.
+/// </para>
+/// <para>
+/// <b>Three operations, because "5 per minute" and "locked out after 5 failures" are not the same
+/// thing.</b> Counting every attempt makes the budget a budget for arriving at all, so somebody who
+/// types their password correctly spends it; counting only failures and clearing them on success
+/// makes it a lockout, which is what a sign-in door wants. That needs a gate which does not count
+/// (<see cref="PeekAsync"/>) and a way to clear (<see cref="ResetAsync"/>) beside the counting one.
+/// A caller that genuinely means attempts - because each attempt costs an upstream call, say - uses
+/// <see cref="TryAcquireAsync"/> alone, exactly as before.
 /// </para>
 /// </summary>
 public interface IRateLimiter
@@ -24,8 +34,8 @@ public interface IRateLimiter
     /// <para>
     /// The call is <b>not</b> free of side effects: it increments the counter whether or not the
     /// request ultimately succeeds. Callers that must not spend budget on a read - "is this
-    /// identifier locked out?" asked on every login attempt - need a separate read-only check, not
-    /// this method.
+    /// identifier locked out?" asked on every login attempt - want <see cref="PeekAsync"/>, which
+    /// answers the same question and counts nothing.
     /// </para>
     /// </summary>
     /// <param name="dimension">
@@ -47,12 +57,87 @@ public interface IRateLimiter
     /// exhausts its hourly allowance on requests it never received an answer to, and a short
     /// throttle silently becomes an hour-long one.
     /// </para>
+    /// <para>
+    /// The one caller entitled to ignore that is one using this method as a <i>tally</i> rather
+    /// than as a gate: recording a failure that has already happened, having gated on
+    /// <see cref="PeekAsync"/> first. Every window has to see that failure or the wider one never
+    /// fills, and nothing is being refused on the strength of the return value, so no budget is
+    /// spent on an unserved request. Such a caller discards the decision, which is the signal to a
+    /// reader that it is a tally and not a gate.
+    /// </para>
     /// </param>
     /// <param name="cancellationToken">Honoured before the call is issued; the command itself is not cancellable.</param>
     Task<RateLimitDecision> TryAcquireAsync(
         string dimension,
         string key,
         RateLimitPolicy policy,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Answers what <see cref="TryAcquireAsync"/> <i>would</i> answer, and counts nothing.
+    /// <para>
+    /// This is the operation "is this identifier locked out?" needs. Asked through
+    /// <see cref="TryAcquireAsync"/> the question is self-fulfilling: the asking spends the budget,
+    /// so an attempt ends up refused for having been made rather than for having failed, and no
+    /// configuration value says so.
+    /// </para>
+    /// <para>
+    /// <b>It reports on the request that would come next, not on the count as it stands.</b> A
+    /// limit of 5 with five failures already recorded answers <see cref="RateLimitDecision.Allowed"/>
+    /// false, because the sixth is what is being asked about. Reporting on the stored count would
+    /// make "5 per minute" mean six, and that off-by-one would live in every caller instead of in
+    /// <see cref="RateLimitDecision.Peek"/>.
+    /// </para>
+    /// <para>
+    /// <b>It is a read, so it is racy, and that is acceptable here.</b> Two attempts arriving
+    /// together both see the same count and both proceed; the counter is still right afterwards
+    /// because the failures are counted separately. The cost of the race is one extra attempt
+    /// against a locked-out subject, not an unbounded number of them.
+    /// </para>
+    /// </summary>
+    Task<RateLimitDecision> PeekAsync(
+        string dimension,
+        string key,
+        RateLimitPolicy policy,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Forgets everything counted against <paramref name="key"/> in <paramref name="dimension"/>,
+    /// for each window in <paramref name="policies"/>.
+    /// <para>
+    /// <b>Why this belongs on the port now, when the argument used to run the other way.</b> The
+    /// risk-control adapter already clears the limiter's counters after a solved CAPTCHA, and does
+    /// it by deleting the limiter's own keys - with a comment saying that adding a reset to the
+    /// port "for this single caller would put a 'clear the evidence' method on every rate limit in
+    /// the service". That was right while there was one caller. There are now three: both
+    /// back-office sign-in doors clear a mailbox's and an employee number's failures on a
+    /// successful sign-in, which the specification states as a step of each flow. A private
+    /// key-layout dependency that three call sites reach around the port to reproduce is worse than
+    /// a named operation on it.
+    /// </para>
+    /// <para>
+    /// <b>Every window has to be listed.</b> A window is part of a counter's identity, so clearing
+    /// the minute of a minute-and-hour pair leaves the hour standing - and the symptom is a lockout
+    /// that survives a correct password for up to an hour while the minute counter is visibly
+    /// empty.
+    /// </para>
+    /// <para>
+    /// <b>What a lost reset means, and why it is still the fail-open family.</b> The counters stay
+    /// as they are, so a subject that has just authenticated correctly keeps its accumulated
+    /// failures until the windows expire and can be refused for the rest of them. That is a
+    /// nuisance, bounded by the window, and it errs towards refusing - the opposite direction from
+    /// a lost count, which errs towards allowing. What it must never do is fail the operation that
+    /// asked for it: by then the caller is signed in, and turning a bookkeeping write into a 502
+    /// would fail a request that had already succeeded. Adapters therefore swallow and log, and
+    /// there is deliberately nothing here for a caller to branch on. The one exception is the
+    /// caller's own <paramref name="cancellationToken"/>, which propagates from this operation
+    /// exactly as it does from the other two: a client that has gone away is not a failed reset.
+    /// </para>
+    /// </summary>
+    Task ResetAsync(
+        string dimension,
+        string key,
+        IReadOnlyList<RateLimitPolicy> policies,
         CancellationToken cancellationToken);
 }
 
@@ -109,7 +194,8 @@ public sealed record RateLimitPolicy
 }
 
 /// <summary>
-/// The outcome of one <see cref="IRateLimiter.TryAcquireAsync"/> call.
+/// The outcome of one <see cref="IRateLimiter.TryAcquireAsync"/> or
+/// <see cref="IRateLimiter.PeekAsync"/> call.
 /// </summary>
 /// <param name="Allowed">Whether the caller may proceed.</param>
 /// <param name="Remaining">
@@ -156,6 +242,23 @@ public sealed record RateLimitDecision(bool Allowed, int Remaining, TimeSpan Ret
             ? new RateLimitDecision(true, remaining, TimeSpan.Zero)
             : new RateLimitDecision(false, 0, timeToLive > TimeSpan.Zero ? timeToLive : policy.Window);
     }
+
+    /// <summary>
+    /// The same arithmetic for a counter that has <b>not</b> been incremented -
+    /// <see cref="IRateLimiter.PeekAsync"/>'s reply.
+    /// <para>
+    /// The stored count is advanced by one before <see cref="From"/> sees it, because a peek is
+    /// asked in order to decide whether to serve something: "the stored count is within the limit"
+    /// is a different sentence and a useless one, under which a limit of 5 serves a sixth request.
+    /// Putting that increment here rather than in each adapter and each caller is what keeps one
+    /// definition of what a limit of 5 means.
+    /// </para>
+    /// </summary>
+    /// <param name="count">The counter's stored value; 0 when nothing has been counted yet.</param>
+    /// <param name="policy">The policy the count was taken under.</param>
+    /// <param name="timeToLive">Time left on the current window, as the store reports it.</param>
+    public static RateLimitDecision Peek(long count, RateLimitPolicy policy, TimeSpan timeToLive) =>
+        From(count + 1, policy, timeToLive);
 
     /// <summary>
     /// What an adapter returns when the store is unreachable: allow, and do not pretend to know

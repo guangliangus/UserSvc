@@ -28,6 +28,13 @@ namespace UserSvc.Infrastructure.External;
 /// Registered as a singleton: the in-process half of the cache and the semaphore are the state, and
 /// a scoped instance would hold neither across requests.
 /// </para>
+/// <para>
+/// <b><see cref="LionTravelAccessTokenCache"/> is deliberately this class again</b> rather than a
+/// shared base class: the two cache different upstreams' tokens under different keys, and the day
+/// one of them needs a different failure direction, shared code is what would make that change
+/// dangerous. The cost is that a correctness fix has to be made twice - so the two are kept
+/// line-for-line recognisable, and <c>AccessTokenCacheTests</c> runs every case against both.
+/// </para>
 /// </summary>
 public sealed class WechatMiniAccessTokenCache(
     IConnectionMultiplexer connection,
@@ -37,10 +44,23 @@ public sealed class WechatMiniAccessTokenCache(
     private const string CacheKeySuffix = "wechat_mini:access_token";
 
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
-    private readonly string _key = redisOptions.Value.KeyPrefix + CacheKeySuffix;
 
-    private string _token = string.Empty;
-    private DateTimeOffset _expiresAt = DateTimeOffset.MinValue;
+    /// <summary>The in-process half of the cache. Swapped, never mutated in place - see
+    /// <see cref="CachedToken"/>.</summary>
+    private CachedToken _cached = CachedToken.None;
+
+    /// <summary>
+    /// The Redis key, read at the point of use rather than in a field initializer.
+    /// <para>
+    /// A field initializer runs in the constructor, so reading
+    /// <see cref="IOptions{TOptions}.Value"/> there makes merely <i>constructing</i> this cache
+    /// throw on a deployment whose Redis section will not validate - the failure mode
+    /// docs/architecture.md records, and one that would take this singleton's whole dependency
+    /// graph with it. Today <c>RedisOptions</c> is validated at startup so the host would refuse
+    /// to boot first; the point is not to leave the shape lying around for the day that changes.
+    /// </para>
+    /// </summary>
+    private string Key => redisOptions.Value.KeyPrefix + CacheKeySuffix;
 
     /// <param name="forceRefresh">
     /// Skip both cache layers. Set only after WeChat has rejected a token this cache handed out -
@@ -81,8 +101,7 @@ public sealed class WechatMiniAccessTokenCache(
 
             var (token, ttl) = await fetch(cancellationToken).ConfigureAwait(false);
 
-            _token = token;
-            _expiresAt = now + ttl;
+            Volatile.Write(ref _cached, new CachedToken(token, now + ttl));
 
             await TryWriteRedisAsync(token, ttl).ConfigureAwait(false);
 
@@ -101,12 +120,11 @@ public sealed class WechatMiniAccessTokenCache(
     /// </summary>
     public async Task InvalidateAsync()
     {
-        _token = string.Empty;
-        _expiresAt = DateTimeOffset.MinValue;
+        Volatile.Write(ref _cached, CachedToken.None);
 
         try
         {
-            await connection.GetDatabase().KeyDeleteAsync(_key).ConfigureAwait(false);
+            await connection.GetDatabase().KeyDeleteAsync(Key).ConfigureAwait(false);
         }
         catch (Exception ex) when (IsRedisFailure(ex))
         {
@@ -115,13 +133,41 @@ public sealed class WechatMiniAccessTokenCache(
         }
     }
 
-    private string TryRead(DateTimeOffset now) => _token.Length > 0 && now < _expiresAt ? _token : string.Empty;
+    /// <summary>
+    /// The in-process copy, if there is one that is still good. One read of one reference, so the
+    /// token and the expiry that authorises it are always the same refresh's.
+    /// </summary>
+    private string TryRead(DateTimeOffset now)
+    {
+        var cached = Volatile.Read(ref _cached);
+
+        return cached.Token.Length > 0 && now < cached.ExpiresAt ? cached.Token : string.Empty;
+    }
+
+    /// <summary>
+    /// A token and the instant it stops being usable, as <b>one</b> object.
+    /// <para>
+    /// Two fields could not be read as a pair: a reader outside the refresh gate could take the
+    /// token from one refresh and the expiry from the next, and a
+    /// <see cref="DateTimeOffset"/> is sixteen bytes, so it is not even read atomically by itself -
+    /// a reader could see an instant that was never written. Both are answered by making the pair a
+    /// single immutable reference that a refresh swaps in one assignment: a reader sees the state
+    /// entirely before or entirely after, and there is no third possibility to reason about.
+    /// </para>
+    /// </summary>
+    /// <param name="Token">The cached token, or empty when there is none.</param>
+    /// <param name="ExpiresAt">When it stops being usable. Past for an empty token.</param>
+    private sealed record CachedToken(string Token, DateTimeOffset ExpiresAt)
+    {
+        /// <summary>No token: the state before the first mint and after an invalidation.</summary>
+        public static readonly CachedToken None = new(string.Empty, DateTimeOffset.MinValue);
+    }
 
     private async Task<string> TryReadRedisAsync()
     {
         try
         {
-            var value = await connection.GetDatabase().StringGetAsync(_key).ConfigureAwait(false);
+            var value = await connection.GetDatabase().StringGetAsync(Key).ConfigureAwait(false);
             return value.IsNullOrEmpty ? string.Empty : value.ToString();
         }
         catch (Exception ex) when (IsRedisFailure(ex))
@@ -138,7 +184,7 @@ public sealed class WechatMiniAccessTokenCache(
         try
         {
             await connection.GetDatabase()
-                .StringSetAsync(_key, token, expiry: ttl, keepTtl: false, when: When.Always, flags: CommandFlags.None)
+                .StringSetAsync(Key, token, expiry: ttl, keepTtl: false, when: When.Always, flags: CommandFlags.None)
                 .ConfigureAwait(false);
         }
         catch (Exception ex) when (IsRedisFailure(ex))

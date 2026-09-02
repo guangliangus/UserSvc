@@ -6,10 +6,12 @@ namespace UserSvc.Application.Ports.External;
 /// possible for group staff who have no local password.
 /// <para>
 /// It is a port for all three reasons at once - it crosses the network, unit tests must replace it,
-/// and the implementation is a vendor API that will change. No adapter for the real upstream is
-/// configured in this deployment, so the registered implementation is
-/// <c>UnavailableStaffDirectory</c>, which <b>refuses</b>. The calling logic is written in full
-/// against this interface, so swapping that one registration is the entire cutover.
+/// and the implementation is a vendor API that will change. The registered adapter is the real
+/// client for the upstream; what a deployment may not have is the <c>StaffDirectory</c> section,
+/// and the adapter checks that at the point of use and answers 500 <c>NOT_CONFIGURED</c> naming
+/// the absent keys. So this capability is missing on its own: the password door, consumer sign-in
+/// and everything else are untouched, and there is no second registration standing in for the
+/// first.
 /// </para>
 /// <para>
 /// <b>The two methods fail in deliberately different ways, and callers depend on the difference.</b>

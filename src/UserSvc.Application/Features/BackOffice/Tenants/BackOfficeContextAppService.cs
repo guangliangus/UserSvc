@@ -61,7 +61,36 @@ public sealed class BackOfficeContextAppService(
     /// the only one that leaves the process, and a request already refused for a local reason
     /// should not pay for it.
     /// </para>
+    /// <para>
+    /// <b>A tenant this caller does not hold answers 403, not 400.</b> That is a ratified
+    /// deviation from porting spec 09 section 3.3, whose steps 2 to 4 say "BadRequest". In the
+    /// service being replaced that word named an error <i>kind</i>, not a status: every soft error
+    /// it constructed - BadRequest and Conflict alike - went out as HTTP 200 with
+    /// <c>success=false</c> (same spec, section 4). There is therefore no 400 on the wire to
+    /// preserve. The port has to pick a real status for the kind, exactly as it already does for
+    /// TENANT_DISABLED (403) and TENANT_INACTIVE (409).
+    /// </para>
+    /// <para>
+    /// 403 for three reasons. Nothing about the request is malformed: the caller is authenticated,
+    /// the token is valid, <c>tenantType</c> is one of the two legal values and <c>tenantCode</c>
+    /// is a well-formed code. What is missing is a member row - "understood the request, refuses
+    /// to authorize it", which is what 403 is for. The status classes are grouped by what the
+    /// client should do next, and for <i>this</i> tenant the answer is never "correct the field and
+    /// resubmit" but "stop asking about this one"; the client's real recovery is the switcher list,
+    /// which is a different request rather than a corrected one. And TENANT_NOT_AUTHORIZED already
+    /// means 403 everywhere else in this service - the per-request permission gate answers exactly
+    /// that for a forged or stale <c>act</c> - so answering 400 here would hand the front end two
+    /// status branches for one error code, and the error code is the part clients are promised.
+    /// </para>
     /// </summary>
+    /// <exception cref="BadRequestException">The tenant type is neither company nor supplier. This
+    /// one is genuinely a malformed field, which is why it keeps the 400.</exception>
+    /// <exception cref="ForbiddenException">TENANT_NOT_AUTHORIZED when no member row backs the
+    /// request, or TENANT_DISABLED when the membership is suspended.</exception>
+    /// <exception cref="UnauthorizedException">ACCOUNT_DISABLED - the account itself is switched
+    /// off, so the answer is to re-authenticate rather than to pick elsewhere.</exception>
+    /// <exception cref="ConflictException">TENANT_INACTIVE - the tenant is switched off in the
+    /// master data, a platform-side state that can be flipped back.</exception>
     public async Task<TenantContextResponse> SelectContextAsync(
         BackOfficeCaller caller, SelectTenantContextRequest request, CancellationToken cancellationToken)
     {
@@ -139,6 +168,10 @@ public sealed class BackOfficeContextAppService(
     /// flag is always false: a dimension has no administrator seat - that standing lives on the
     /// whole-dimension member row and travels as permissions.
     /// </para>
+    /// <para>
+    /// A dimension this account does not hold is refused with 403 for the same reason a tenant is;
+    /// see <see cref="SelectContextAsync"/>.
+    /// </para>
     /// </summary>
     private async Task<TenantContextResponse> SelectGlobalDimensionAsync(
         int userId, string dimension, CancellationToken cancellationToken)
@@ -170,8 +203,32 @@ public sealed class BackOfficeContextAppService(
     /// <para>
     /// Deliberately carries <b>no permission requirement</b> - see the endpoint for why - and its
     /// authority fields are three-state. Null means "not delivered this time" and leaves the front
-    /// end's current state alone; an empty list means "you have none" and closes every gate. A
-    /// transient snapshot failure must produce the first.
+    /// end's current state alone; an empty list means "you have none" and closes every gate.
+    /// </para>
+    /// <para>
+    /// Which means <b>the two ways of having nothing must not be answered the same way</b>, and
+    /// telling them apart is what the two catch clauses below are for. A snapshot that refuses
+    /// with 403 has decided something definite about this caller - not a member of this tenant,
+    /// membership no longer active, no longer the platform super administrator - and the shell has
+    /// to <i>clear</i>: this endpoint is its resynchronisation source, and answering null there
+    /// tells it to keep the sidebar of a tenant the account has been removed from. A snapshot that
+    /// could not be read at all has decided nothing, and answering empty there would report a
+    /// Redis or database wobble to the user as "your permissions were revoked".
+    /// </para>
+    /// <para>
+    /// The status class is the discriminator, and it is the right one rather than a convenient one:
+    /// 403 is defined in this service as "stop trying, nothing about the request can be corrected",
+    /// so every 403 the derivation funnel raises is by construction a definite answer, while an
+    /// outage arrives as a 502, as an infrastructure exception, or as this component not being
+    /// wired up at all. Catching the exception type instead of inspecting error codes also keeps
+    /// this call site honest as the funnel grows: a new definite refusal is a 403 and lands in the
+    /// clearing branch without anybody having to remember to extend a list of codes.
+    /// </para>
+    /// <para>
+    /// <see cref="BackOfficeMeResponse.ActiveTenant"/> survives a refusal on purpose. It is a fact
+    /// about the presented token, not a grant, and the shell needs it to say <i>which</i> context
+    /// it has just lost - next to a <see cref="BackOfficeMeResponse.Tenants"/> list that no longer
+    /// contains it, which is the switcher the user is meant to pick from instead.
     /// </para>
     /// </summary>
     public async Task<BackOfficeMeResponse> GetMeAsync(
@@ -219,14 +276,7 @@ public sealed class BackOfficeContextAppService(
         // same shape a no-access sign-in produces. The front end reads it and closes the gates.
         if (act is null || !ActTypes.IsKnown(act.Type))
         {
-            return response with
-            {
-                Roles = [],
-                Permissions = [],
-                Menus = [],
-                MenuRoutes = [],
-                Scopes = TenantContextResult.EmptyScopeEnvelope(),
-            };
+            return WithNoAuthority(response);
         }
 
         if (snapshots is null)
@@ -254,6 +304,23 @@ public sealed class BackOfficeContextAppService(
                 ActiveTenant = ActiveTenantFrom(act, snapshot.Scopes),
             };
         }
+        catch (ForbiddenException ex)
+        {
+            // A definite "you hold nothing here", not an outage: the account is not a member of
+            // this tenant, its membership is no longer active, or it no longer carries the
+            // platform flag. Reported as an explicit empty surface - the same shape a no-access
+            // sign-in produces - because null would tell the shell to keep rendering the tenant it
+            // has just been removed from. Information, not warning: this is a normal answer to a
+            // stale token, and the gated routes refuse it in the same breath.
+            logger.LogInformation(
+                ex,
+                "The authorization snapshot refused context {ActType} for user {UserId}; the shell "
+                + "response states its grants as empty so the shell clears.",
+                act.Type,
+                userId);
+
+            return WithNoAuthority(response);
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(
@@ -265,6 +332,20 @@ public sealed class BackOfficeContextAppService(
             return response;
         }
     }
+
+    /// <summary>
+    /// The shell response with every authority field stated as empty: "you have none", which closes
+    /// every gate. The counterpart of leaving them null, which means "not delivered".
+    /// </summary>
+    private static BackOfficeMeResponse WithNoAuthority(BackOfficeMeResponse response) =>
+        response with
+        {
+            Roles = [],
+            Permissions = [],
+            Menus = [],
+            MenuRoutes = [],
+            Scopes = TenantContextResult.EmptyScopeEnvelope(),
+        };
 
     // ---------------------------------------------------------------------------- helpers
 
@@ -310,6 +391,13 @@ public sealed class BackOfficeContextAppService(
         var entry = entries.FirstOrDefault(e =>
             e.TenantType == tenantType && e.TenantCode == tenantCode);
 
+        // A code the answer left out is waved through, which is not the same reading the port
+        // describes - it says an absent entry and an Unknown one mean the same thing, and the rule
+        // being ported is "the row exists and its status is ACTIVE". Left as it is on purpose: the
+        // same judgement decides the switcher list, that list feeds the sign-in option count in
+        // another slice, and tightening one call site without the other produces entries the
+        // select endpoint refuses. Unreachable today - the only adapter answers null wholesale -
+        // and reported as a defect for whoever owns the port to settle in one move.
         return entry is null || entry.Usable;
     }
 
@@ -359,13 +447,10 @@ public sealed class BackOfficeContextAppService(
 
         foreach (var member in loginTenants)
         {
-            TenantMasterDataEntry? entry = null;
-            if (byKey is not null
-                && !byKey.TryGetValue((member.TenantType, member.TenantCode), out entry))
-            {
-                entry = null;
-            }
+            var entry = byKey?.GetValueOrDefault((member.TenantType, member.TenantCode));
 
+            // Only a verdict that came back and said "no" drops a tenant. A missing entry stays,
+            // matching the select endpoint's reading of the same answer - see the note there.
             if (entry is { Usable: false })
             {
                 continue;

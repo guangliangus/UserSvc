@@ -22,7 +22,7 @@ public sealed class UserSessionTests
 
     private static UserSession NewSession(string authorizationId = "auth-1") =>
         UserSession.Start(
-            "sid-1", 1024,
+            "sid-1", SessionSubject.Consumer(1024),
             new DeviceDescriptor("dev-1", "iPhone 15 Pro", "IOS", "3.2.0", "203.0.113.7", "ua"),
             authorizationId, Now);
 
@@ -33,6 +33,7 @@ public sealed class UserSessionTests
 
         session.SessionId.ShouldBe("sid-1");
         session.UserId.ShouldBe(1024);
+        session.Realm.ShouldBe(SessionRealms.Consumer);
         session.DeviceId.ShouldBe("dev-1");
         session.DeviceName.ShouldBe("iPhone 15 Pro");
         session.Platform.ShouldBe("IOS");
@@ -64,7 +65,7 @@ public sealed class UserSessionTests
     public void ASessionWithoutAServerGeneratedIdIsRefused()
     {
         var error = Should.Throw<DomainRuleException>(() => UserSession.Start(
-            string.Empty, 1024,
+            string.Empty, SessionSubject.Consumer(1024),
             new DeviceDescriptor("dev-1", "iPhone", "IOS", "3.2.0", "203.0.113.7", "ua"),
             "auth-1", Now));
 
@@ -107,6 +108,9 @@ public sealed class UserSessionTests
         var revoked = session.DomainEvents.OfType<SessionRevoked>().ShouldHaveSingleItem();
         revoked.SessionId.ShouldBe("sid-1");
         revoked.UserId.ShouldBe(1024);
+        revoked.Realm.ShouldBe(
+            SessionRealms.Consumer,
+            "the outbox row is a permanent audit record, and an id without its realm names two people");
         revoked.Reason.ShouldBe(RevocationReasons.OtherDevice);
     }
 
@@ -135,11 +139,80 @@ public sealed class UserSessionTests
 
         var replay = session.DomainEvents.OfType<RefreshTokenReplayDetected>().ShouldHaveSingleItem();
         replay.SessionId.ShouldBe("sid-1");
+        replay.Realm.ShouldBe(SessionRealms.Consumer);
         replay.DeviceId.ShouldBe("dev-1");
         replay.OccurredAt.ShouldBe(Now.AddMinutes(5));
 
         // The alert and the revocation are separate facts: consumers of one are not consumers of the
         // other.
         session.DomainEvents.OfType<SessionRevoked>().ShouldHaveSingleItem();
+    }
+
+    // ------------------------------------------------------------------ realm
+
+    [Fact]
+    public void ABackOfficeSessionCarriesTheBackOfficeRealm()
+    {
+        var session = UserSession.Start(
+            "sid-2", SessionSubject.BackOffice(1024),
+            new DeviceDescriptor("dev-1", "Chrome", "WEB", string.Empty, "203.0.113.7", "ua"),
+            "auth-1", Now);
+
+        session.Realm.ShouldBe(SessionRealms.BackOffice);
+        session.UserId.ShouldBe(1024);
+    }
+
+    /// <summary>
+    /// The defect this column exists for, expressed at the level where it can be caught: the two
+    /// account tables number their rows independently, so the same integer is two different people.
+    /// </summary>
+    [Fact]
+    public void TheSameIdInTheTwoRealmsIsTwoDifferentSubjects()
+    {
+        var consumer = SessionSubject.Consumer(100);
+        var backOffice = SessionSubject.BackOffice(100);
+
+        consumer.ShouldNotBe(backOffice);
+
+        var session = UserSession.Start(
+            "sid-3", consumer,
+            new DeviceDescriptor("shared-device", "Chrome", "WEB", string.Empty, "203.0.113.7", "ua"),
+            "auth-1", Now);
+
+        session.BelongsTo(consumer).ShouldBeTrue();
+        session.BelongsTo(backOffice).ShouldBeFalse(
+            "matching on the id alone is how a consumer signed an operator's device out");
+    }
+
+    [Fact]
+    public void ASubjectCannotBeBuiltWithoutAKnownRealm()
+    {
+        // There is no public constructor, so this is the only way in - and it refuses rather than
+        // falling back to a realm, because a fallback would scope a revocation sweep to the wrong
+        // plane and do it silently.
+        var error = Should.Throw<DomainRuleException>(() => SessionSubject.For(string.Empty, 1024));
+
+        error.ErrorCode.ShouldBe("SESSION_REALM_REQUIRED");
+
+        Should.Throw<DomainRuleException>(() => SessionSubject.For("consumer", 1024))
+            .ErrorCode.ShouldBe("SESSION_REALM_REQUIRED", "the realm is a stored value, not free text");
+    }
+
+    [Fact]
+    public void ASubjectCannotBeBuiltWithoutARealId()
+    {
+        Should.Throw<DomainRuleException>(() => SessionSubject.Consumer(0))
+            .ErrorCode.ShouldBe("SESSION_SUBJECT_REQUIRED");
+    }
+
+    [Fact]
+    public void ASessionReportsItsOwnSubjectBackAsTheValueTheRepositoryFiltersOn()
+    {
+        var session = UserSession.Start(
+            "sid-4", SessionSubject.BackOffice(7),
+            new DeviceDescriptor("dev-1", "Chrome", "WEB", string.Empty, "203.0.113.7", "ua"),
+            "auth-1", Now);
+
+        session.Subject.ShouldBe(SessionSubject.BackOffice(7));
     }
 }

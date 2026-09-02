@@ -59,9 +59,20 @@ public interface IVerificationCodeRepository
     /// <summary>
     /// How many codes were created for a target or a device since <paramref name="since"/>.
     /// <para>
-    /// This is the fallback risk control counts on when Redis is unavailable. <paramref name="rawValue"/>
-    /// is normalized and hashed the same way <see cref="CreateAsync"/> stored it, so the count
-    /// matches the rows that exist; a blank value therefore matches nothing and answers zero.
+    /// This is the fallback risk control was meant to count on when Redis is unavailable. <b>It has
+    /// no production caller today</b> - risk control counts in Redis and fails open by contract - so
+    /// this method and its <see cref="VerificationCountDimension"/> are a port surface kept for the
+    /// day the fallback is actually wired, not a live path. <paramref name="rawValue"/> is normalized
+    /// and hashed the same way <see cref="CreateAsync"/> stored it, so the count matches the rows
+    /// that exist; a blank value therefore matches nothing and answers zero.
+    /// </para>
+    /// <para>
+    /// <b>Only the <see cref="VerificationCountDimension.Target"/> dimension is indexed.</b> Its
+    /// index <c>ix_verification_codes_target_hash_created_at</c> is kept for the failed-verify miss
+    /// classification and covers the target count as well. The device index was dropped as unused
+    /// write amplification (see db/0003_verification.sql), so a
+    /// <see cref="VerificationCountDimension.Device"/> count sequentially scans the table until that
+    /// index is recreated - which anyone wiring the device fallback must do first.
     /// </para>
     /// </summary>
     Task<long> CountInWindowAsync(

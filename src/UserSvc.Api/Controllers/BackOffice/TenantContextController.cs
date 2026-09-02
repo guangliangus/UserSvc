@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using Asp.Versioning;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using UserSvc.Api.Auth;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.BackOffice.Tenants;
 using UserSvc.Application.Ports.Tenancy;
@@ -45,8 +46,26 @@ public sealed class TenantContextController(BackOfficeContextAppService contexts
     /// It answers with the authority surface of the chosen context and does <b>not</b> mint tokens:
     /// credentials come out of the OpenIddict token endpoint, and the exchange that turns this
     /// decision into a full back-office token is described in <see cref="BackOfficePolicies"/>.
+    /// That split is also why this action retires no credential of its own: the caller's current
+    /// token is what it must present to that exchange, so killing it here would end every switch
+    /// in a forced sign-in. The old credential is retired at the moment the new one is minted -
+    /// see the context grant.
+    /// </para>
+    /// <para>
+    /// <b>A tenant the caller does not hold answers 403, not the 400 porting spec 09 section 3.3
+    /// reads as.</b> The reasoning is written out on
+    /// <see cref="BackOfficeContextAppService.SelectContextAsync"/>, and the short version is that
+    /// the spec's "BadRequest" was an error <i>kind</i> that went out as HTTP 200, so there is no
+    /// 400 to preserve - while TENANT_NOT_AUTHORIZED already means 403 on every gated route in
+    /// this service.
     /// </para>
     /// </summary>
+    /// <response code="200">The chosen context, with the authority surface it resolves to.</response>
+    /// <response code="400">BAD_REQUEST - the tenant type is neither company nor supplier.</response>
+    /// <response code="401">The token is not usable, or ACCOUNT_DISABLED.</response>
+    /// <response code="403">TENANT_NOT_AUTHORIZED or TENANT_DISABLED - this account may not enter
+    /// this tenant, and no correction to the request changes that.</response>
+    /// <response code="409">TENANT_INACTIVE - the tenant is switched off in the master data.</response>
     [HttpPost("auth/context")]
     [Authorize(Policy = BackOfficePolicies.TenantSelection)]
     [ProducesResponseType<TenantContextResponse>(StatusCodes.Status200OK)]
@@ -169,7 +188,14 @@ public static class BackOfficeCallerReader
             ? ver
             : 0;
 
-        return new BackOfficeCaller(userId, actorName, ReadAct(principal), tokenVersion);
+        // The session behind this credential. Read here rather than by each caller that wants it,
+        // so "which session am I" is answered by the same reader that answers "which context am I
+        // in" - a context switch has to retire one and mint the other in the same breath, and two
+        // readers is how those two answers come from different tokens.
+        var sessionId = principal.FindFirstValue(AuthenticationSchemes.SessionIdClaimType)
+                        ?? string.Empty;
+
+        return new BackOfficeCaller(userId, actorName, ReadAct(principal), tokenVersion, sessionId);
     }
 
     private static ActClaim? ReadAct(ClaimsPrincipal principal)

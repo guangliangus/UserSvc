@@ -21,8 +21,17 @@ namespace UserSvc.Application.Features.BackOffice.Tenants;
 /// <param name="TokenVersion">The account's token version at the moment this token was minted. It
 /// is the cache key of the authority snapshot, which is how a permission taken away lands on the
 /// next request instead of at the next sign-in.</param>
+/// <param name="SessionId">The <c>sid</c> of the session this credential belongs to, or empty when
+/// it has none - a token that has not chosen a context yet never opens one.
+/// <para>
+/// It is here because it is the only handle a caller has on <b>its own credential</b>. The session
+/// row carries the OpenIddict authorization id that every token in this chain hangs off, so a sid
+/// is enough to retire the credential a context switch replaced - which is why that switch does not
+/// need the authorization id put into the token, where it would be a second copy of a
+/// server-side fact and would travel to every request that has no business knowing it.
+/// </para></param>
 public sealed record BackOfficeCaller(
-    int UserId, string ActorName, ActClaim? Act, int TokenVersion = 0)
+    int UserId, string ActorName, ActClaim? Act, int TokenVersion = 0, string SessionId = "")
 {
     /// <summary>
     /// The tenant this caller is acting in, or null when it is acting globally. The

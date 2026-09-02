@@ -39,11 +39,17 @@ public sealed class AccountAppServiceTests
 
     private readonly User _user = new() { Id = UserId, Status = UserStatuses.Active };
 
+    /// <summary>Deregistration is a consumer-plane use case: the id it is handed was confirmed
+    /// against identity.users, so the sweep must never reach the back-office session sharing the
+    /// integer. Every stub here is keyed on the whole subject so a realm-blind sweep would find
+    /// nothing rather than quietly pass.</summary>
+    private static SessionSubject Subject => SessionSubject.Consumer(UserId);
+
     public AccountAppServiceTests()
     {
         _users.FindByIdAsync(UserId, Arg.Any<CancellationToken>()).Returns(_user);
         _identities.ListActiveByUserAsync(UserId, Arg.Any<CancellationToken>()).Returns([]);
-        _sessions.ListActiveByUserAsync(UserId, Arg.Any<CancellationToken>()).Returns([]);
+        _sessions.ListActiveBySubjectAsync(Subject, Arg.Any<CancellationToken>()).Returns([]);
 
         // The substitute has to run the body, or every assertion here would pass against a
         // transaction that never opened.
@@ -85,13 +91,13 @@ public sealed class AccountAppServiceTests
     private void ActiveSessionsPerCall(params IReadOnlyList<UserSession>[] perCall)
     {
         var call = 0;
-        _sessions.ListActiveByUserAsync(UserId, Arg.Any<CancellationToken>())
+        _sessions.ListActiveBySubjectAsync(Subject, Arg.Any<CancellationToken>())
             .Returns(_ => call < perCall.Length ? perCall[call++] : []);
     }
 
     private UserSession Session(string sessionId, string authorizationId) => UserSession.Start(
         sessionId,
-        UserId,
+        Subject,
         new DeviceDescriptor("dev-" + sessionId, "iPhone", "IOS", "3.2.0", "203.0.113.7", "ua"),
         authorizationId,
         _clock.UtcNow);

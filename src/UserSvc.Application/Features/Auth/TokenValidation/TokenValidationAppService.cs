@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using UserSvc.Application.Errors;
+using UserSvc.Application.Features.BackOffice.TestWhitelist;
 using UserSvc.Application.Features.BackOffice.Tenants;
 using UserSvc.Application.Ports.Auth;
 using UserSvc.Application.Ports.Iam;
@@ -10,9 +11,9 @@ using UserSvc.Domain.Iam;
 namespace UserSvc.Application.Features.Auth.TokenValidation;
 
 /// <summary>
-/// Answers the two questions a relying service cannot answer for itself about one of this service's
-/// access tokens: <b>is the session behind it still alive</b>, and <b>what does its holder
-/// currently hold</b>.
+/// Answers the questions a relying service cannot answer for itself about one of this service's
+/// access tokens: <b>is the session behind it still alive</b>, <b>what does its holder currently
+/// hold</b>, and <b>is this consumer a test user</b>.
 /// <para>
 /// Signature, issuer, audience and expiry are deliberately <b>not</b> among them. Those are settled
 /// by the caller's own JWKS validation before this service is ever asked, and re-checking them here
@@ -30,6 +31,7 @@ namespace UserSvc.Application.Features.Auth.TokenValidation;
 public sealed class TokenValidationAppService(
     IBackOfficeCaller caller,
     IUserSessionRepository sessions,
+    Func<TestWhitelistAppService> testWhitelist,
     IClock clock,
     ILogger<TokenValidationAppService> logger)
 {
@@ -59,8 +61,18 @@ public sealed class TokenValidationAppService(
             throw new UnauthorizedException(ErrorCodes.Unauthorized, "Authentication is required.");
         }
 
-        var session = await FindLiveSessionAsync(token.SessionId, userId, cancellationToken);
         var internalCaller = token.IsInternal;
+
+        // The realm comes off the granted scopes, the same signal the authority fields below are
+        // gated on - never from the shape of the id, which is identical in both planes.
+        var subject = SessionSubject.For(
+            internalCaller ? SessionRealms.BackOffice : SessionRealms.Consumer, userId);
+
+        var session = await FindLiveSessionAsync(token.SessionId, subject, cancellationToken);
+
+        // After the liveness check, not before: there is no reason to ask the whitelist about a
+        // token this call is about to refuse.
+        var isTest = await IsWhitelistedTestConsumerAsync(internalCaller, userId, cancellationToken);
 
         return new TokenValidationResponse
         {
@@ -82,7 +94,79 @@ public sealed class TokenValidationAppService(
             Permissions = internalCaller ? caller.Authz.Permissions : null,
             Menus = internalCaller ? caller.Authz.Menus : null,
             Scopes = internalCaller ? DeclareBothDimensions(caller.Authz.Scopes) : null,
+
+            IsTest = isTest,
         };
+    }
+
+    /// <summary>
+    /// The <c>is_test</c> flag: whether this consumer may additionally see and order the test
+    /// company's products.
+    /// <para>
+    /// <b>A back-office token short-circuits to false without touching the store, and that is a
+    /// correctness gate rather than an optimisation.</b>
+    /// <see cref="TestWhitelistAppService.IsTestUserAsync"/> is realm-blind by contract - it
+    /// compares whatever id it is handed against a table keyed by <c>identity.users.id</c> - and
+    /// the two planes number their accounts independently, so back-office account 5 would inherit
+    /// consumer 5's entitlement. <see cref="ValidatedTokenFacts.IsInternal"/> is the signal to gate
+    /// on because it is the same one the authority fields are gated on: read off the granted scopes,
+    /// not guessed from the shape of the subject. The back office has no use for the flag either -
+    /// what its holders may see is already bounded by their data scopes.
+    /// </para>
+    /// <para>
+    /// <b>The whitelist service is taken as a factory and resolved here, not injected.</b> Two
+    /// reasons, in order of how much they are worth. First, construction is then paid only by the
+    /// callers that use it: a back-office token returns above without building the whitelist's
+    /// administrative graph - an admin-scope service over seven repositories, a consumer summary
+    /// service and an audit writer - on the platform's hottest authenticated path. Second, it is
+    /// the house rule for a dependency whose construction can fail (docs/architecture.md), and this
+    /// one's can: it reaches <c>IdentifierProtector</c>, whose constructor reads
+    /// <c>IOptions&lt;IdentifierProtectionOptions&gt;.Value</c> and throws on a key that is missing
+    /// or not 32 bytes.
+    /// </para>
+    /// <para>
+    /// <b>That second reason buys less than it looks like today, and the measurement is worth
+    /// writing down.</b> With a deliberately broken <c>IdentifierProtection:DataKey</c> this host
+    /// answers 500 to <i>every</i> request - <c>/health/live</c> included - because
+    /// <c>BackOfficeAuthzMiddleware</c> resolves <c>IAuthzSnapshotProvider</c> per request and that
+    /// graph reaches the same singleton, long before any endpoint is entered. So the factory does
+    /// not make this endpoint survive a broken key; nothing in the current pipeline does. It keeps
+    /// the whitelist slice from being the <i>next</i> way in, and it is honest about the flag being
+    /// additive: a capability that cannot be constructed degrades the flag, never the answer.
+    /// </para>
+    /// </summary>
+    private async Task<bool> IsWhitelistedTestConsumerAsync(
+        bool internalCaller, int userId, CancellationToken cancellationToken)
+    {
+        if (internalCaller)
+        {
+            return false;
+        }
+
+        TestWhitelistAppService whitelist;
+
+        try
+        {
+            whitelist = testWhitelist();
+        }
+        catch (Exception ex)
+        {
+            // The capability could not even be constructed. That is a deployment fault in a
+            // different slice, and reporting it here would turn one missing configuration section
+            // into a platform-wide authentication failure. False is the fail-closed answer: it
+            // hides the test company's products.
+            logger.LogWarning(
+                ex,
+                "The test whitelist could not be constructed, so consumer account {UserId} is "
+                + "reported as a non-test account.",
+                userId);
+
+            return false;
+        }
+
+        // No try/catch around the read itself: IsTestUserAsync answers false rather than throwing,
+        // on purpose, precisely so that this caller cannot be taken down by it.
+        return await whitelist.IsTestUserAsync(userId, cancellationToken);
     }
 
     /// <summary>
@@ -97,15 +181,22 @@ public sealed class TokenValidationAppService(
     /// </para>
     /// <para>
     /// <b>A row that belongs to a different account is a refusal</b>, and a row that is not there
-    /// is not. Only consumer device logins write
-    /// <c>user_sessions</c>; a back-office credential has a <c>sid</c> with no row behind it yet.
-    /// Refusing on absence would take the entire back office down over a table it does not populate,
-    /// which is the failure mode this repository has had three times. Absence is logged and passed
-    /// over; a row that exists and is revoked is refused.
+    /// is not. A back-office credential minted before its plane started writing
+    /// <c>user_sessions</c> has a <c>sid</c> with no row behind it, and refusing on absence would
+    /// take the entire back office down over a table it did not populate - the failure mode this
+    /// repository has had three times. Absence is logged and passed over; a row that exists and is
+    /// revoked is refused.
+    /// </para>
+    /// <para>
+    /// <b>"A different account" means the whole subject, not the id.</b> Comparing ids alone made
+    /// a back-office token presenting a consumer session's <c>sid</c> - the two planes number
+    /// their accounts independently, so the integers match - take its liveness verdict and its
+    /// device fields from a consumer's row: a signed-out consumer session would refuse a live
+    /// operator's token, and a live one would report somebody else's device to a relying service.
     /// </para>
     /// </summary>
     private async Task<UserSession?> FindLiveSessionAsync(
-        string sessionId, int userId, CancellationToken cancellationToken)
+        string sessionId, SessionSubject subject, CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(sessionId))
         {
@@ -123,7 +214,7 @@ public sealed class TokenValidationAppService(
             return null;
         }
 
-        if (session.UserId != userId)
+        if (!session.BelongsTo(subject))
         {
             // The row exists but belongs to somebody else, so nothing about it may be reported and
             // it certainly must not answer this token's liveness question. Reachable only through a
@@ -135,8 +226,8 @@ public sealed class TokenValidationAppService(
                 "Session {SessionId} belongs to account {Owner}, not to the presenting account "
                 + "{Caller}; refusing to describe the token.",
                 sessionId,
-                session.UserId,
-                userId);
+                session.Subject,
+                subject);
 
             throw new UnauthorizedException(
                 ErrorCodes.InvalidToken, "This credential is not valid. Sign in again.");

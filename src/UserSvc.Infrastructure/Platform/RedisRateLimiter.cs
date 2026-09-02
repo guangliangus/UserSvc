@@ -33,7 +33,15 @@ namespace UserSvc.Infrastructure.Platform;
 /// non-obvious reason: <c>RedisTimeoutException</c> derives from <see cref="TimeoutException"/> and
 /// <c>RedisCommandException</c> derives straight from <see cref="Exception"/>, so catching
 /// <c>RedisException</c> alone would miss every timeout - which is the failure fail-open exists
-/// for.
+/// for. There is a fourth, found by running this service rather than by reading it:
+/// <c>TaskCanceledException</c>, which the first command a fresh process issues can throw while the
+/// multiplexer is still connecting. See the comment on that catch clause in
+/// <see cref="TryAcquireAsync"/>.
+/// </para>
+/// <para>
+/// All three operations share the key layout of <see cref="BuildKey"/>, which is what lets
+/// <see cref="ResetAsync"/> clear exactly the counters the other two wrote. A reset that computed
+/// its own keys would delete nothing and report success.
 /// </para>
 /// </summary>
 public sealed class RedisRateLimiter(
@@ -80,6 +88,26 @@ public sealed class RedisRateLimiter(
         return { count, pttl }
         """;
 
+    /// <summary>
+    /// The read half, in the same reply shape so one parser serves both.
+    /// <para>
+    /// It is a script and not a plain <c>GET</c> plus <c>PTTL</c> because the two have to describe
+    /// the same instant: read separately, a counter can expire between them and the caller is told
+    /// "three used, and no deadline", which <see cref="RateLimitDecision.From"/> turns into a
+    /// full-window <c>Retry-After</c> for a window that had already reset.
+    /// </para>
+    /// <para>
+    /// <c>tonumber(...) or 0</c> is what makes a missing key mean "nothing counted yet" rather than
+    /// an unexpected reply shape - and a peek on a subject nobody has touched is the common case,
+    /// not the exception.
+    /// </para>
+    /// </summary>
+    private const string ReadWindowScript =
+        """
+        local count = tonumber(redis.call('GET', KEYS[1])) or 0
+        return { count, redis.call('PTTL', KEYS[1]) }
+        """;
+
     private readonly string _keyPrefix = options.Value.KeyPrefix;
 
     public async Task<RateLimitDecision> TryAcquireAsync(
@@ -105,7 +133,7 @@ public sealed class RedisRateLimiter(
                 [redisKey],
                 [(long)policy.Window.TotalMilliseconds]);
 
-            return Interpret(reply, dimension, policy);
+            return Interpret(reply, dimension, policy, counted: true);
         }
         catch (RedisException ex)
         {
@@ -119,7 +147,127 @@ public sealed class RedisRateLimiter(
         {
             return FailOpen(dimension, policy, ex);
         }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The fourth one, and the one nothing in the type hierarchy hints at. Observed live:
+            // the first ScriptEvaluateAsync a freshly started process issues threw
+            // TaskCanceledException - not RedisTimeoutException - while the multiplexer was still
+            // establishing itself under AsyncTimeout of 500 ms, and the sign-in it was protecting
+            // answered 500 INTERNAL_ERROR. A limiter that 500s the endpoint it guards is the exact
+            // outcome the whole fail-open design exists to prevent, and it happened on the first
+            // login after every deployment.
+            //
+            // The filter is what keeps this honest: if OUR token is the cancelled one, the caller
+            // has gone away and the cancellation is theirs to see, not something to swallow into a
+            // rate-limit decision nobody will read.
+            return FailOpen(dimension, policy, ex);
+        }
     }
+
+    public async Task<RateLimitDecision> PeekAsync(
+        string dimension,
+        string key,
+        RateLimitPolicy policy,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dimension);
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(policy);
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var redisKey = BuildKey(_keyPrefix, dimension, key, policy.Window);
+
+        try
+        {
+            var reply = await connection.GetDatabase().ScriptEvaluateAsync(
+                ReadWindowScript, [redisKey], []);
+
+            return Interpret(reply, dimension, policy, counted: false);
+        }
+        catch (RedisException ex)
+        {
+            return FailOpen(dimension, policy, ex);
+        }
+        catch (RedisTimeoutException ex)
+        {
+            return FailOpen(dimension, policy, ex);
+        }
+        catch (RedisCommandException ex)
+        {
+            return FailOpen(dimension, policy, ex);
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            return FailOpen(dimension, policy, ex);
+        }
+    }
+
+    /// <summary>
+    /// Deletes the counters, in one round trip, and never lets a failure reach the caller.
+    /// <para>
+    /// One <c>DEL</c> with every key rather than one per window: the two windows of a subject are
+    /// cleared together or the surviving one keeps refusing an identifier that has just
+    /// authenticated correctly - a lockout that outlives the right password, with the minute
+    /// counter visibly empty beside it.
+    /// </para>
+    /// <para>
+    /// Swallowed for the reason the port states: this runs after the sign-in has already been
+    /// decided, so a bookkeeping write cannot be allowed to fail it. Warning rather than Error,
+    /// because the cost is bounded by the window and the request itself was served correctly.
+    /// </para>
+    /// </summary>
+    public async Task ResetAsync(
+        string dimension,
+        string key,
+        IReadOnlyList<RateLimitPolicy> policies,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dimension);
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(policies);
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (policies.Count == 0)
+        {
+            return;
+        }
+
+        var keys = new RedisKey[policies.Count];
+        for (var index = 0; index < policies.Count; index++)
+        {
+            keys[index] = BuildKey(_keyPrefix, dimension, key, policies[index].Window);
+        }
+
+        try
+        {
+            await connection.GetDatabase().KeyDeleteAsync(keys, CommandFlags.None);
+        }
+        catch (Exception ex) when (IsStoreFailure(ex, cancellationToken))
+        {
+            logger.LogWarning(
+                ex,
+                "Redis could not clear the rate-limit counters for dimension {Dimension}; the "
+                + "accumulated count stands until the window expires, so this subject may still be "
+                + "refused despite having just succeeded.",
+                dimension);
+        }
+    }
+
+    /// <summary>
+    /// The four shapes a StackExchange.Redis failure arrives in, in one filter, so the reset path
+    /// cannot drift from the two counting paths. <c>OperationCanceledException</c> is included only
+    /// when it did not come from the caller's own token - see the note in
+    /// <see cref="TryAcquireAsync"/>.
+    /// </summary>
+    private static bool IsStoreFailure(Exception exception, CancellationToken cancellationToken) =>
+        exception switch
+        {
+            RedisException or RedisTimeoutException or RedisCommandException => true,
+            OperationCanceledException => !cancellationToken.IsCancellationRequested,
+            _ => false,
+        };
 
     /// <summary>
     /// Builds the counter's key. Public because the layout is a deployment fact - operators grep
@@ -189,7 +337,8 @@ public sealed class RedisRateLimiter(
     /// one outcome the whole fail-open design exists to avoid.
     /// </para>
     /// </summary>
-    private RateLimitDecision Interpret(RedisResult reply, string dimension, RateLimitPolicy policy)
+    private RateLimitDecision Interpret(
+        RedisResult reply, string dimension, RateLimitPolicy policy, bool counted)
     {
         try
         {
@@ -198,14 +347,21 @@ public sealed class RedisRateLimiter(
                 var count = (long)parts[0];
                 var timeToLiveMilliseconds = (long)parts[1];
 
-                // The script normalizes PTTL's -1 (no expiry) into the window it just set, so a
-                // non-positive value reaching here means the key vanished between the INCR and the
-                // read (-2) - still no usable deadline, which From() turns into the full window.
+                // The counting script normalizes PTTL's -1 (no expiry) into the window it just set,
+                // so a non-positive value reaching here means the key vanished between the INCR and
+                // the read (-2) - still no usable deadline, which From() turns into the full window.
+                // The reading script normalizes nothing: -2 is the ordinary answer for a subject
+                // nobody has counted yet, and a peek on one is allowed, so the deadline is not read.
                 var timeToLive = timeToLiveMilliseconds > 0
                     ? TimeSpan.FromMilliseconds(timeToLiveMilliseconds)
                     : TimeSpan.Zero;
 
-                return RateLimitDecision.From(count, policy, timeToLive);
+                // The one difference between the two operations, and it lives here rather than at
+                // the two call sites: a count has already been added to the counter, a peek has
+                // not, so the peek asks about the request that would come next.
+                return counted
+                    ? RateLimitDecision.From(count, policy, timeToLive)
+                    : RateLimitDecision.Peek(count, policy, timeToLive);
             }
         }
         catch (InvalidCastException ex)

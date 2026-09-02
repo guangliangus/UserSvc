@@ -46,6 +46,10 @@ public sealed class ServiceFixture : IAsyncLifetime
     /// rows the service wrote rather than what an ORM says about them.</summary>
     public string PostgresConnectionString { get; private set; } = string.Empty;
 
+    /// <summary>Configuration string of the throwaway Redis, so a second host can be pointed at
+    /// the same instance.</summary>
+    public string RedisConfiguration { get; private set; } = string.Empty;
+
     /// <summary>The hosted service's own container. Resolving <c>IOptions</c> or a repository from
     /// here reads exactly what the running API is using.</summary>
     public IServiceProvider Services => Factory.Services;
@@ -84,16 +88,16 @@ public sealed class ServiceFixture : IAsyncLifetime
         await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync());
 
         PostgresConnectionString = _postgres.GetConnectionString();
-        var redisConfiguration = _redis.GetConnectionString();
+        RedisConfiguration = _redis.GetConnectionString();
 
         await ApplySchemaAsync();
         _truncateStatement = await BuildTruncateStatementAsync();
 
-        var redisOptions = ConfigurationOptions.Parse(redisConfiguration);
+        var redisOptions = ConfigurationOptions.Parse(RedisConfiguration);
         redisOptions.AllowAdmin = true;
         _redisProbe = await ConnectionMultiplexer.ConnectAsync(redisOptions);
 
-        _factory = new UserSvcApplicationFactory(PostgresConnectionString, redisConfiguration);
+        _factory = new UserSvcApplicationFactory(PostgresConnectionString, RedisConfiguration);
 
         // Forces the host to build and start, which is what runs FirstPartyClientSeeder. Doing it
         // here rather than lazily inside the first test keeps that cost out of one arbitrary
@@ -149,6 +153,43 @@ public sealed class ServiceFixture : IAsyncLifetime
 
     /// <summary>An HTTP client with no credentials at all.</summary>
     public HttpClient CreateClient() => Factory.CreateClient();
+
+    /// <summary>
+    /// A <b>second</b> host over the same containers, configured differently. The caller owns it
+    /// and must dispose it.
+    /// <para>
+    /// It exists for one kind of test: proving that a deployment missing a capability's
+    /// configuration still serves everything else. That claim cannot be made from a request - it is
+    /// a property of a host - and it is the rule docs/architecture.md records having been broken
+    /// three times, so it is worth being able to state.
+    /// </para>
+    /// <para>
+    /// Sharing the containers is safe and deliberate: the reset between tests is the same one, the
+    /// first-party client seeder re-applies the same descriptor on every boot rather than inserting
+    /// a second row, and the two hosts are never asked to serve the same request. What is not safe
+    /// is holding one open across tests, which is why it is not cached here.
+    /// </para>
+    /// </summary>
+    /// <param name="overrides">Host settings to override, applied last so they win.</param>
+    /// <param name="peerAddress">
+    /// A client address to stamp on every request this host serves, or null for the default -
+    /// which is no address at all, because that is what <c>TestServer</c> gives a connection it
+    /// never made. Every per-source rate-limit budget in the service disables itself when there is
+    /// no address to attribute to, so this is what a test about one has to ask for.
+    /// </param>
+    internal UserSvcApplicationFactory CreateHost(
+        IReadOnlyDictionary<string, string> overrides, string? peerAddress = null)
+    {
+        ArgumentNullException.ThrowIfNull(overrides);
+
+        if (!IsRunning)
+        {
+            throw new InvalidOperationException(FixtureNotStarted);
+        }
+
+        return new UserSvcApplicationFactory(
+            PostgresConnectionString, RedisConfiguration, overrides, peerAddress);
+    }
 
     /// <summary>
     /// An HTTP client carrying the Development header identity. It exercises the same pipeline a
@@ -209,6 +250,25 @@ public sealed class ServiceFixture : IAsyncLifetime
         await connection.OpenAsync();
         await using var command = Command(connection, sql, arguments);
         return Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Runs a statement whose first column is an integer and returns it - an
+    /// <c>INSERT ... RETURNING id</c>, in practice.
+    /// <para>
+    /// It exists because <c>iam</c> is deliberately outside the between-tests truncation (see
+    /// <see cref="BuildTruncateStatementAsync"/>), so its serial ids climb across the assembly and
+    /// no seed may assume a literal one. Reading the id back is the only honest way to name the row
+    /// that was just written.
+    /// </para>
+    /// </summary>
+    public async Task<int> InsertReturningIdAsync(string sql, params object[] arguments)
+    {
+        await using var connection = new NpgsqlConnection(PostgresConnectionString);
+        await connection.OpenAsync();
+        await using var command = Command(connection, sql, arguments);
+
+        return Convert.ToInt32(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
     }
 
     /// <summary>Reads a single-column result set as strings. Nulls come back as the empty string,
@@ -278,6 +338,17 @@ public sealed class ServiceFixture : IAsyncLifetime
     /// seeded once, by a hosted service at host startup; truncating it would turn every token
     /// request after the first test into <c>invalid_client</c>.
     /// </para>
+    /// <para>
+    /// The <c>iam</c> schema is included <b>selectively</b>, by name, and the list is the point.
+    /// Its runtime tables - accounts, their login identities, tenant memberships, role bindings and
+    /// the audit trail - have to go, or a back-office test cannot reuse an address (the partial
+    /// unique index on an ACTIVE e-mail identity refuses it) and "no audit row was written" is
+    /// unanswerable. Its catalogue tables - menus, permissions, roles and the two grant tables -
+    /// have to stay: they are contract data applied once by <c>db/0007_iam_seed.sql</c> at fixture
+    /// start, so truncating them would leave every role binding pointing at nothing and every
+    /// permission check refusing, from the second test onwards. A wildcard over the schema cannot
+    /// tell those two sets apart, which is why this one is spelled out.
+    /// </para>
     /// </summary>
     private async Task<string> BuildTruncateStatementAsync()
     {
@@ -288,8 +359,11 @@ public sealed class ServiceFixture : IAsyncLifetime
             """
             SELECT quote_ident(schemaname) || '.' || quote_ident(tablename)
             FROM pg_tables
-            WHERE schemaname IN ('identity', 'openiddict')
-              AND NOT (schemaname = 'openiddict' AND tablename = 'openiddict_applications')
+            WHERE (schemaname IN ('identity', 'openiddict')
+                   AND NOT (schemaname = 'openiddict' AND tablename = 'openiddict_applications'))
+               OR (schemaname = 'iam'
+                   AND tablename IN ('backend_users', 'backend_identities', 'tenant_members',
+                                     'user_tenant_roles', 'iam_audit_logs'))
             ORDER BY 1
             """,
             connection);

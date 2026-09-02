@@ -58,6 +58,16 @@ public sealed class AvatarAppService(
     /// allocate more than the cap allows.</summary>
     private const int ReadChunkBytes = 16 * 1024;
 
+    /// <summary>What the caller was doing, for the one refusal that cannot come from the store.
+    /// <para>
+    /// The object store is shared with feedback attachments, so its own 501 names the store rather
+    /// than a feature (see <see cref="IObjectStorage.PutAsync"/>). This is the avatar half of that
+    /// sentence, and it lives here because this is the only place that knows an avatar is what was
+    /// being uploaded.
+    /// </para>
+    /// </summary>
+    private const string UnavailableMessage = "Avatar upload is not available on this deployment.";
+
     /// <summary>Enough for every signature <see cref="AvatarImageRules.Sniff"/> knows.</summary>
     private const int SniffBytes = 16;
 
@@ -171,11 +181,26 @@ public sealed class AvatarAppService(
 
         using var stream = new MemoryStream(content, writable: false);
 
-        var url = await storage.PutAsync(
-            objectName,
-            stream,
-            new ObjectHttpHeaders(mediaType, AvatarImageRules.CacheControl, AvatarImageRules.ContentDisposition),
-            cancellationToken).ConfigureAwait(false);
+        Uri url;
+
+        try
+        {
+            url = await storage.PutAsync(
+                objectName,
+                stream,
+                new ObjectHttpHeaders(mediaType, AvatarImageRules.CacheControl, AvatarImageRules.ContentDisposition),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (AppException ex) when (ex.ErrorCode == ErrorCodes.NotImplemented)
+        {
+            // The store refuses in its own words, because one store serves this endpoint and the
+            // feedback attachments alike and it has no way to tell them apart. Naming what the
+            // caller was doing is this service's job and only this service's job: the port would
+            // have to know about features to do it, which is the dependency the port exists to
+            // stop. Status and error code are carried over untouched - the same condition,
+            // reported in a sentence the person who tried to change their picture can act on.
+            throw new AppException(ErrorCodes.NotImplemented, UnavailableMessage, ex.StatusCode, ex);
+        }
 
         logger.LogInformation(
             "Stored a new avatar for user {UserId} as {ObjectName} ({MediaType}, {ByteCount} bytes).",

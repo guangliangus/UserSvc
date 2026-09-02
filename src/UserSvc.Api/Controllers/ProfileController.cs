@@ -28,7 +28,7 @@ public sealed class ProfileController(ProfileAppService profiles, ICurrentUser c
     public Task<ProfileResponse> Get(CancellationToken cancellationToken) =>
         // Decision 09: success returns the DTO itself, with no { success, data } envelope, and
         // failures bubble up to AppExceptionHandler. Controllers carry no try/catch.
-        profiles.GetAsync(currentUser.RequireUserId(), cancellationToken);
+        profiles.GetAsync(currentUser.RequireConsumerId(), cancellationToken);
 
     /// <summary>Update the current user's profile. Omitted fields are left unchanged.</summary>
     [HttpPatch]
@@ -36,5 +36,5 @@ public sealed class ProfileController(ProfileAppService profiles, ICurrentUser c
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     public Task<ProfileResponse> Update(UpdateProfileRequest request, CancellationToken cancellationToken) =>
-        profiles.UpdateAsync(currentUser.RequireUserId(), request, cancellationToken);
+        profiles.UpdateAsync(currentUser.RequireConsumerId(), request, cancellationToken);
 }

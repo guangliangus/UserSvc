@@ -28,7 +28,22 @@ public sealed class UserSession : Entity
     /// trustworthy session identifier.</summary>
     public string SessionId { get; private set; } = string.Empty;
 
+    /// <summary>
+    /// The subject id <b>within</b> <see cref="Realm"/>. On its own it identifies nobody: the two
+    /// realms number their accounts independently, so this is only ever half of a subject. Read it
+    /// through <see cref="Subject"/> or compare with <see cref="BelongsTo"/>.
+    /// </summary>
     public int UserId { get; private set; }
+
+    /// <summary>
+    /// Which account table <see cref="UserId"/> points into — one of <see cref="SessionRealms"/>.
+    /// <para>
+    /// It is a column and not an inference because it cannot be inferred: an id present in both
+    /// <c>identity.users</c> and <c>iam.backend_users</c> is two different people, and the row is
+    /// the only place that knows which one signed in.
+    /// </para>
+    /// </summary>
+    public string Realm { get; private set; } = string.Empty;
 
     /// <summary>
     /// The OpenIddict authorization id every token issued for this session hangs off. Signing the
@@ -64,13 +79,44 @@ public sealed class UserSession : Entity
 
     public bool IsActive => Status == SessionStatuses.Active;
 
+    /// <summary>
+    /// Who this session belongs to, as the one value the repository and the application layer pass
+    /// around. Not mapped — it is <see cref="Realm"/> and <see cref="UserId"/> read together, which
+    /// is the only way they mean anything.
+    /// </summary>
+    public SessionSubject Subject => SessionSubject.For(Realm, UserId);
+
+    /// <summary>
+    /// Whether this session belongs to <paramref name="subject"/>. <b>Both halves must match.</b>
+    /// Comparing ids alone is what let a session be listed, evicted and signed out from the wrong
+    /// plane; this method exists so no call site has to remember the second comparison.
+    /// </summary>
+    public bool BelongsTo(SessionSubject subject)
+    {
+        ArgumentNullException.ThrowIfNull(subject);
+
+        return UserId == subject.UserId && string.Equals(Realm, subject.Realm, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Open a session for a subject on a device.
+    /// <para>
+    /// The subject is a <see cref="SessionSubject"/> rather than an <see cref="int"/> so that a
+    /// session cannot be created without saying which realm its id belongs to. That is not
+    /// bookkeeping: the realm is half of the row's identity, and a row missing it is a row that
+    /// belongs to two people at once.
+    /// </para>
+    /// </summary>
     public static UserSession Start(
         string sessionId,
-        int userId,
+        SessionSubject subject,
         DeviceDescriptor device,
         string authorizationId,
         DateTimeOffset now)
     {
+        ArgumentNullException.ThrowIfNull(subject);
+        ArgumentNullException.ThrowIfNull(device);
+
         if (string.IsNullOrWhiteSpace(sessionId))
         {
             throw new DomainRuleException("SESSION_ID_REQUIRED", "Session id must be supplied by the server.");
@@ -88,7 +134,8 @@ public sealed class UserSession : Entity
         return new UserSession
         {
             SessionId = sessionId,
-            UserId = userId,
+            UserId = subject.UserId,
+            Realm = subject.Realm,
             AuthorizationId = authorizationId,
             DeviceId = device.DeviceId,
             DeviceName = device.DeviceName,
@@ -127,7 +174,7 @@ public sealed class UserSession : Entity
         Status = SessionStatuses.Revoked;
         RevokedBy = reason;
         RevokedAt = now;
-        Raise(new SessionRevoked(SessionId, UserId, reason, now));
+        Raise(new SessionRevoked(SessionId, Realm, UserId, reason, now));
     }
 
     /// <summary>
@@ -138,7 +185,7 @@ public sealed class UserSession : Entity
     /// </summary>
     public void RevokeAsReplayed(DateTimeOffset now)
     {
-        Raise(new RefreshTokenReplayDetected(SessionId, UserId, DeviceId, now));
+        Raise(new RefreshTokenReplayDetected(SessionId, Realm, UserId, DeviceId, now));
         Revoke(RevocationReasons.TokenReplay, now);
     }
 }

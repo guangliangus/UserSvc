@@ -156,9 +156,23 @@ public sealed class RiskControlService(
         return 0
         """;
 
-    private readonly RiskControlOptions _options = options.Value;
+    /// <summary>
+    /// The validated section, read at the point of use and never in a field initializer.
+    /// <para>
+    /// A field initializer runs in the constructor, and <see cref="IOptions{TOptions}.Value"/> is
+    /// where DataAnnotations validation happens - so reading it there makes merely
+    /// <i>constructing</i> this class throw, taking down every caller that has this one in its
+    /// dependency graph rather than only the capability whose configuration is missing. That is
+    /// the failure docs/architecture.md records, and it stays fixed here even though this section
+    /// is validated at startup today: the shape must not be lying around for the day somebody
+    /// removes <c>ValidateOnStart</c> from it, which has already happened to four sections in this
+    /// service. <see cref="IOptions{TOptions}.Value"/> caches, so a property costs nothing.
+    /// </para>
+    /// </summary>
+    private RiskControlOptions _options => options.Value;
 
-    private readonly string _keyPrefix = redisOptions.Value.KeyPrefix;
+    /// <summary>The Redis key prefix, read at the point of use for the reason above.</summary>
+    private string _keyPrefix => redisOptions.Value.KeyPrefix;
 
     /// <summary>The send threshold as a limiter policy: see the class remarks for the minus one.</summary>
     private RateLimitPolicy SendCodePolicy => new(_options.SendCodeWindow, _options.SendCodeThreshold - 1);

@@ -36,14 +36,30 @@ public sealed class SessionAppService(
     IOptions<AuthSessionOptions> options,
     ILogger<SessionAppService> logger)
 {
-    private readonly AuthSessionOptions _options = options.Value;
+    /// <summary>
+    /// Read at the point of use, never in a field initializer or constructor (docs/architecture.md:
+    /// "a missing capability may only break itself"). <c>IOptions.Value</c> is where
+    /// DataAnnotations validation runs, so binding it into a field makes merely <i>constructing</i>
+    /// this service throw - and this service is a constructor dependency of the token endpoint and
+    /// of account deregistration, neither of which has anything to do with a session lifetime being
+    /// out of range. <c>.Value</c> is cached, so reading it per use costs nothing.
+    /// </summary>
+    private AuthSessionOptions Options => options.Value;
 
+    /// <summary>
+    /// The signed-in devices of one subject, most recently seen first.
+    /// <para>
+    /// It takes a <see cref="SessionSubject"/> and not a user id because the two planes number
+    /// their accounts independently: listing by id alone put back-office sessions on a consumer's
+    /// devices screen, where signing one out revoked an operator's credential.
+    /// </para>
+    /// </summary>
     public async Task<IReadOnlyList<DeviceSessionResponse>> ListDevicesAsync(
-        int userId,
+        SessionSubject subject,
         string currentSessionId,
         CancellationToken cancellationToken)
     {
-        var active = await sessions.ListActiveByUserAsync(userId, cancellationToken);
+        var active = await sessions.ListActiveBySubjectAsync(subject, cancellationToken);
 
         return [.. active
             .OrderByDescending(s => s.LastSeenAt)
@@ -85,7 +101,10 @@ public sealed class SessionAppService(
             throw new ForbiddenException(ErrorCodes.AccountDisabled, "The account is not active.");
         }
 
-        await StartCoreAsync(userId, sessionId, authorizationId, device, cancellationToken);
+        // The realm is stated by which entry point was called, not by an argument the caller might
+        // omit: this one confirmed the subject against identity.users, so it is a consumer.
+        await StartCoreAsync(
+            SessionSubject.Consumer(userId), sessionId, authorizationId, device, cancellationToken);
     }
 
     /// <summary>
@@ -106,19 +125,30 @@ public sealed class SessionAppService(
         string authorizationId,
         DeviceDescriptor device,
         CancellationToken cancellationToken) =>
-        StartCoreAsync(userId, sessionId, authorizationId, device, cancellationToken);
+        StartCoreAsync(
+            SessionSubject.BackOffice(userId), sessionId, authorizationId, device, cancellationToken);
 
-    /// <summary>The session bookkeeping both planes share, once the caller has established that the
-    /// subject may sign in. Neither plane's account table is touched from here.</summary>
+    /// <summary>
+    /// The session bookkeeping both planes share, once the caller has established that the subject
+    /// may sign in. Neither plane's account table is touched from here.
+    /// <para>
+    /// <b>The realm arrives as part of the subject, and this is the seam that fixes it.</b> The two
+    /// public entry points above are the only callers and each one knows which plane it speaks for,
+    /// so the realm is decided where it is known rather than defaulted where it is not. Everything
+    /// below - superseding the same device, and evicting past the device cap - reads only this
+    /// subject's own realm, so a consumer signing in can no longer displace an operator who happens
+    /// to share the integer.
+    /// </para>
+    /// </summary>
     private async Task StartCoreAsync(
-        int userId,
+        SessionSubject subject,
         string sessionId,
         string authorizationId,
         DeviceDescriptor device,
         CancellationToken cancellationToken)
     {
         var now = clock.UtcNow;
-        var active = await sessions.ListActiveByUserAsync(userId, cancellationToken);
+        var active = await sessions.ListActiveBySubjectAsync(subject, cancellationToken);
 
         var displaced = active.Where(s => s.DeviceId == device.DeviceId).ToList();
         foreach (var previous in displaced)
@@ -131,12 +161,12 @@ public sealed class SessionAppService(
         // The least recently seen session gives way, which is what a "signed-in devices" screen
         // shows the user anyway.
         var remaining = active.Count - displaced.Count + 1;
-        if (remaining > _options.MaxActiveDevices)
+        if (remaining > Options.MaxActiveDevices)
         {
             var evicted = active
                 .Except(displaced)
                 .OrderBy(s => s.LastSeenAt)
-                .Take(remaining - _options.MaxActiveDevices)
+                .Take(remaining - Options.MaxActiveDevices)
                 .ToList();
 
             foreach (var session in evicted)
@@ -147,7 +177,7 @@ public sealed class SessionAppService(
             displaced.AddRange(evicted);
         }
 
-        sessions.Add(UserSession.Start(sessionId, userId, device, authorizationId, now));
+        sessions.Add(UserSession.Start(sessionId, subject, device, authorizationId, now));
         await unitOfWork.SaveChangesAsync(cancellationToken);
 
         // Best effort on purpose. The sessions above are already committed as revoked, so their
@@ -161,6 +191,12 @@ public sealed class SessionAppService(
     /// seen. Returns <c>false</c> when the session is gone or revoked, which is how a sign-out on
     /// another device invalidates this refresh chain in the same second rather than whenever the
     /// revocation is noticed.
+    /// <para>
+    /// <b>No realm, on purpose.</b> The refresh request carries a <c>sid</c> and nothing else this
+    /// method could scope by, and a <c>sid</c> is unique across the whole table for both planes.
+    /// Deriving a realm here to add to the predicate would be inventing a second thing that can be
+    /// wrong, and its failure mode - a live session reported dead - would sign the device out.
+    /// </para>
     /// </summary>
     public async Task<bool> TryTouchAsync(string sessionId, CancellationToken cancellationToken)
     {
@@ -175,10 +211,18 @@ public sealed class SessionAppService(
         return true;
     }
 
-    /// <summary>Sign one device out. Revoking an already-revoked session succeeds idempotently
-    /// rather than returning 404.</summary>
+    /// <summary>
+    /// Sign one device out. Revoking an already-revoked session succeeds idempotently rather than
+    /// returning 404.
+    /// <para>
+    /// The session is found by <c>sid</c>, which needs no realm, and the ownership check then
+    /// compares the <b>whole</b> subject. Comparing ids alone meant an operator could sign out the
+    /// consumer session that shared their id, and a consumer the operator's - a cross-plane
+    /// revocation that looked, from either side, like signing out one's own device.
+    /// </para>
+    /// </summary>
     public async Task RevokeDeviceAsync(
-        int userId,
+        SessionSubject subject,
         string sessionId,
         string reason,
         CancellationToken cancellationToken)
@@ -186,9 +230,10 @@ public sealed class SessionAppService(
         var session = await sessions.FindBySessionIdAsync(sessionId, cancellationToken)
                       ?? throw new NotFoundException(ErrorCodes.SessionNotFound, "Session was not found.");
 
-        // Cross-user access answers 404, not 403 — otherwise the status-code difference lets a
-        // caller probe whether a session exists.
-        if (session.UserId != userId)
+        // Somebody else's session answers 404, not 403 — otherwise the status-code difference lets a
+        // caller probe whether a session exists. "Somebody else" includes the same id in the other
+        // realm, which is a different person.
+        if (!session.BelongsTo(subject))
         {
             throw new NotFoundException(ErrorCodes.SessionNotFound, "Session was not found.");
         }
@@ -196,13 +241,25 @@ public sealed class SessionAppService(
         session.Revoke(reason, clock.UtcNow);
         await unitOfWork.SaveChangesAsync(cancellationToken);
         await tokenChains.RevokeChainAsync(session.AuthorizationId, cancellationToken);
-        await revocationStore.RevokeAsync(sessionId, _options.AccessTokenLifetime, cancellationToken);
+        await revocationStore.RevokeAsync(sessionId, Options.AccessTokenLifetime, cancellationToken);
     }
 
-    /// <summary>Sign every device out. Used on password change and on a detected leak.</summary>
-    public async Task RevokeAllAsync(int userId, string reason, CancellationToken cancellationToken)
+    /// <summary>
+    /// Sign every device of one subject out. Used on password change, on deregistration and on a
+    /// detected leak.
+    /// <para>
+    /// Scoped to the subject's own realm. A sweep keyed on the id alone was the most damaging of
+    /// the cross-realm reads: closing a consumer account would have signed an operator who shared
+    /// the id out of the back office, with <c>DEREGISTERED</c> in the audit trail of a person who
+    /// deregistered nothing.
+    /// </para>
+    /// </summary>
+    public async Task RevokeAllAsync(
+        SessionSubject subject,
+        string reason,
+        CancellationToken cancellationToken)
     {
-        var active = await sessions.ListActiveByUserAsync(userId, cancellationToken);
+        var active = await sessions.ListActiveBySubjectAsync(subject, cancellationToken);
         if (active.Count == 0)
         {
             return;
@@ -286,7 +343,7 @@ public sealed class SessionAppService(
                 }
 
                 await revocationStore.RevokeAsync(
-                    session.SessionId, _options.AccessTokenLifetime, cancellationToken);
+                    session.SessionId, Options.AccessTokenLifetime, cancellationToken);
             }
             catch (AppException ex)
             {

@@ -230,12 +230,12 @@ public sealed class BackOfficePasswordSignInTests
     }
 
     /// <summary>
-    /// The throttle runs before anything else, because everything after it costs a database read or
-    /// 30 ms of Argon2. Its refusal carries the wait, which is the only thing that turns a 429 into
-    /// something a client can act on.
+    /// The lockout check runs before anything else, because everything after it costs a database
+    /// read or 50 ms of Argon2. Its refusal carries the wait, which is the only thing that turns a
+    /// 429 into something a client can act on.
     /// </summary>
     [Fact]
-    public async Task TheThrottleRefusesBeforeAnythingIsRead()
+    public async Task TheLockoutCheckRefusesBeforeAnythingIsRead()
     {
         _harness.WithPasswordAccount();
         _harness.WithRateLimitRefusal(TimeSpan.FromSeconds(42));
@@ -252,11 +252,12 @@ public sealed class BackOfficePasswordSignInTests
     }
 
     /// <summary>
-    /// A refused minute window stops there. Spending the hour window's budget on a request that was
-    /// never served is how a one-minute throttle silently becomes an hour-long one.
+    /// A refused window stops there rather than reading the next one. It costs no budget now that
+    /// the gate is a read, but the ordering is still the contract: the first refusal is the one the
+    /// caller is told about, and it decides which of the two messages they get.
     /// </summary>
     [Fact]
-    public async Task ARefusedWindowDoesNotSpendTheNextWindowsBudget()
+    public async Task ARefusedWindowDoesNotEvaluateTheNextOne()
     {
         _harness.WithPasswordAccount();
         _harness.WithRateLimitRefusal(TimeSpan.FromSeconds(5));
@@ -265,7 +266,7 @@ public sealed class BackOfficePasswordSignInTests
             _harness.Sut.SignInWithPasswordAsync(
                 Request(), BackOfficeSignInContext.None, CancellationToken.None));
 
-        await _harness.Limiter.Received(1).TryAcquireAsync(
+        await _harness.Limiter.Received(1).PeekAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>());
     }
 
@@ -275,14 +276,14 @@ public sealed class BackOfficePasswordSignInTests
     /// consumer sign-in.
     /// </summary>
     [Fact]
-    public async Task TheThrottleIsKeyedOnTheNormalizedAddressInABackOfficeDimension()
+    public async Task TheLockoutCheckIsKeyedOnTheNormalizedAddressInABackOfficeDimension()
     {
         _harness.WithPasswordAccount();
 
         await _harness.Sut.SignInWithPasswordAsync(
             Request(email: "  Alice.Chen@LionTravel.com "), BackOfficeSignInContext.None, CancellationToken.None);
 
-        await _harness.Limiter.Received().TryAcquireAsync(
+        await _harness.Limiter.Received().PeekAsync(
             "backoffice-sign-in",
             SignInTestHarness.CorporateEmail,
             Arg.Any<RateLimitPolicy>(),

@@ -58,6 +58,12 @@ public sealed class FeedbackAppService(
     /// </summary>
     private const string ImageContentDisposition = "inline";
 
+    /// <summary>What the caller was doing, for the refusal a deployment with no object store
+    /// answers. Submitting a report with no photo attached never reaches the store and is
+    /// unaffected, which is why this names the images rather than feedback as a whole.</summary>
+    private const string ImagesUnavailableMessage =
+        "Attaching images to feedback is not available on this deployment.";
+
     /// <summary>
     /// What lands in <c>created_by</c> / <c>updated_by</c>. The person is already identified by
     /// <c>user_id</c>, so the audit columns record the only other thing worth recording: that no
@@ -234,11 +240,7 @@ public sealed class FeedbackAppService(
                 // using block is the only thing that closes it.
                 await using var content = image.File.Open();
 
-                var url = await storage.PutAsync(
-                    objectName,
-                    content,
-                    new ObjectHttpHeaders(image.ContentType, ImageCacheControl, ImageContentDisposition),
-                    cancellationToken);
+                var url = await StoreAsync(objectName, content, image.ContentType, cancellationToken);
 
                 uploaded.Add(new StoredImage(objectName, url.ToString()));
             }
@@ -254,6 +256,38 @@ public sealed class FeedbackAppService(
         }
 
         return uploaded;
+    }
+
+    /// <summary>
+    /// One image into the store, with this feature's name on the one refusal that has to carry it.
+    /// <para>
+    /// The store is shared with avatar uploads and cannot tell which of the two is calling, so its
+    /// own 501 names the store and not a feature - see <see cref="IObjectStorage.PutAsync"/>.
+    /// Teaching the adapter the difference would make one use case's wording an adapter's business
+    /// and point the dependency back up the way the port exists to prevent, so the sentence is
+    /// composed here instead, where "this is a photo attached to a feedback report" is already
+    /// known. The status and the error code are carried over unchanged: it is the same condition,
+    /// said to the person who was actually attaching a photo.
+    /// </para>
+    /// </summary>
+    private async Task<Uri> StoreAsync(
+        string objectName,
+        Stream content,
+        string contentType,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await storage.PutAsync(
+                objectName,
+                content,
+                new ObjectHttpHeaders(contentType, ImageCacheControl, ImageContentDisposition),
+                cancellationToken);
+        }
+        catch (AppException ex) when (ex.ErrorCode == ErrorCodes.NotImplemented)
+        {
+            throw new AppException(ErrorCodes.NotImplemented, ImagesUnavailableMessage, ex.StatusCode, ex);
+        }
     }
 
     /// <summary>

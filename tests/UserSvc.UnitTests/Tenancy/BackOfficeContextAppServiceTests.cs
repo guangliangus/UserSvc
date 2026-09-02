@@ -93,6 +93,13 @@ public sealed class BackOfficeContextAppServiceTests
             CancellationToken.None));
 
         ex.ErrorCode.ShouldBe(ErrorCodes.TenantNotAuthorized);
+
+        // Ratified, and a stated deviation from porting spec 09 section 3.3: the spec's
+        // "BadRequest" named an error kind that the service being replaced answered with HTTP 200,
+        // so there is no 400 on the wire to preserve - and this error code already means 403 on
+        // every gated route here. Pinned in a test because a status is a contract, and the
+        // reasoning behind it lives in the XML doc of the method under test.
+        ex.StatusCode.ShouldBe(403);
     }
 
     [Fact]
@@ -154,7 +161,7 @@ public sealed class BackOfficeContextAppServiceTests
                 Arg.Any<IReadOnlyCollection<string>>(),
                 Arg.Any<IReadOnlyCollection<string>>(),
                 Arg.Any<CancellationToken>())
-            .Returns([new TenantMasterDataEntry(TenantTypes.Company, "C1", Usable: false,
+            .Returns([new TenantMasterDataEntry(TenantTypes.Company, "C1", TenantMasterDataEntry.Verdicts.NotUsable,
                 new Dictionary<string, string>())]);
 
         var ex = await Should.ThrowAsync<ConflictException>(() => Sut.SelectContextAsync(
@@ -223,6 +230,7 @@ public sealed class BackOfficeContextAppServiceTests
             CancellationToken.None));
 
         ex.ErrorCode.ShouldBe(ErrorCodes.TenantNotAuthorized);
+        ex.StatusCode.ShouldBe(403, "a dimension nobody granted is refused, not corrected");
         await _members.DidNotReceive().FindByUserAndTenantAsync(
             Arg.Any<int>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
@@ -276,9 +284,9 @@ public sealed class BackOfficeContextAppServiceTests
                 Arg.Any<CancellationToken>())
             .Returns(
             [
-                new TenantMasterDataEntry(TenantTypes.Company, "C1", true,
+                new TenantMasterDataEntry(TenantTypes.Company, "C1", TenantMasterDataEntry.Verdicts.Usable,
                     new Dictionary<string, string> { ["zh-TW"] = "Sunshine" }),
-                new TenantMasterDataEntry(TenantTypes.Company, "C2", false,
+                new TenantMasterDataEntry(TenantTypes.Company, "C2", TenantMasterDataEntry.Verdicts.NotUsable,
                     new Dictionary<string, string>()),
             ]);
 
@@ -363,6 +371,41 @@ public sealed class BackOfficeContextAppServiceTests
         result.MenuRoutes.ShouldBeNull();
         result.Scopes.ShouldBeNull();
         result.ActiveTenant!.CompanyCode.ShouldBe("C1", "the context itself still comes from the token");
+    }
+
+    [Fact]
+    public async Task ASnapshotRefusalClearsTheShellInsteadOfLeavingItStale()
+    {
+        // The opposite direction from the test above, and the whole reason the two are told apart:
+        // "you are not a member of this tenant" is a decision, not a hiccup. Null would tell the
+        // shell to keep the sidebar of a tenant this account has been removed from, which is the
+        // one thing this endpoint exists to correct.
+        _snapshots.GetOrComputeAsync(
+                42, Arg.Any<ActClaim>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(new ForbiddenException(
+                ErrorCodes.TenantNotAuthorized, "This account is not a member of this tenant."));
+
+        var result = await Sut.GetMeAsync(
+            new BackOfficeCaller(42, "somebody", new ActClaim(ActTypes.Company, "C1")),
+            CancellationToken.None);
+
+        result.Roles.ShouldNotBeNull().ShouldBeEmpty();
+        result.Permissions.ShouldNotBeNull().ShouldBeEmpty();
+        result.Menus.ShouldNotBeNull().ShouldBeEmpty();
+        result.MenuRoutes.ShouldNotBeNull().ShouldBeEmpty();
+
+        // Both dimensions stated and empty, never absent: an absent dimension is read downstream
+        // as "unrestricted".
+        result.Scopes.ShouldNotBeNull();
+        result.Scopes[TenantTypes.Company].Values.ShouldBeEmpty();
+        result.Scopes[TenantTypes.Company].IsGlobal.ShouldBeFalse();
+        result.Scopes[TenantTypes.Supplier].Values.ShouldBeEmpty();
+        result.Scopes[TenantTypes.Supplier].IsGlobal.ShouldBeFalse();
+
+        result.ActiveTenant!.CompanyCode.ShouldBe(
+            "C1", "the shell still has to say which context it just lost");
+        result.IsTenantAdmin.ShouldBeFalse();
+        result.Tenants.ShouldBeEmpty("and the switcher no longer offers it");
     }
 
     [Fact]

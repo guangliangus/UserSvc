@@ -38,6 +38,16 @@ public interface IObjectStorage
     /// answered a 5xx, 500 when it refused a request that we built wrong, and 501 when this
     /// deployment has no storage configured at all.
     /// </para>
+    /// <para>
+    /// <b>The 501's message names the store, never the feature.</b> One store serves every caller
+    /// that has bytes to keep, and an adapter cannot know whether it is holding an avatar or a
+    /// photo attached to a complaint - teaching it to know would point the dependency the wrong way
+    /// down and make one feature's wording an adapter's business. A caller whose users should be
+    /// told what they were doing therefore catches the refusal - the error code is
+    /// <see cref="Errors.ErrorCodes.NotImplemented"/> - and rewords it with its own subject,
+    /// keeping the status and the error code. That knowledge lives in the use case and nowhere
+    /// else.
+    /// </para>
     /// </summary>
     /// <param name="objectName">Path-like name within the configured container or bucket, without a
     /// leading slash - for example <c>42/1750000000000.png</c>.</param>

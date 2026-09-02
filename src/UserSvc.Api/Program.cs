@@ -124,6 +124,16 @@ builder.Services.AddScoped<SupplierLinkAppService>();
 builder.Services.AddScoped<ConsumerSummaryService>();
 builder.Services.AddScoped<ConsumerLookupAppService>();
 builder.Services.AddScoped<TestWhitelistAppService>();
+
+// The factory beside it, because TokenValidationAppService takes a Func<TestWhitelistAppService>
+// rather than the service itself - docs/architecture.md, "inject Func<T> not T when a client's
+// construction could fail", so that a whitelist whose own configuration is missing breaks the
+// whitelist and not every token validation. Without this line the container refuses to build at
+// all: ValidateOnBuild cannot resolve the Func, so the host never starts and every integration
+// test dies in the factory rather than in an assertion.
+builder.Services.AddTransient<Func<TestWhitelistAppService>>(
+    provider => provider.GetRequiredService<TestWhitelistAppService>);
+
 builder.Services.AddSingleton<OAuthStateService>();
 builder.Services.AddSingleton<SocialBindingTokenService>();
 builder.Services.AddScoped<RegistrationAppService>();

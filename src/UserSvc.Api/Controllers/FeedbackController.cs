@@ -62,7 +62,7 @@ public sealed class FeedbackController(FeedbackAppService feedback, ICurrentUser
         CancellationToken cancellationToken) =>
         // 200 rather than 201: there is no endpoint that reads a submission back, so there is no
         // Location to point a 201 at, and the clients were written against 200.
-        feedback.SubmitAsync(currentUser.RequireUserId(), request, ReadImages(), cancellationToken);
+        feedback.SubmitAsync(currentUser.RequireConsumerId(), request, ReadImages(), cancellationToken);
 
     /// <summary>
     /// The attached images, adapted onto the port the application layer speaks.

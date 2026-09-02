@@ -12,6 +12,7 @@ using UserSvc.Application.Security;
 using UserSvc.Domain.BackOffice;
 using UserSvc.Domain.Suppliers;
 using UserSvc.Domain.Tenancy;
+using static UserSvc.Application.Ports.Tenancy.TenantMasterDataEntry;
 
 namespace UserSvc.Application.Features.BackOffice.Suppliers;
 
@@ -44,10 +45,18 @@ public sealed class SupplierLinkAppService(
     ILogger<SupplierLinkAppService> logger)
 {
     /// <summary>
-    /// 422, not 400. The request is well formed and the code names a real supplier; what fails is a
-    /// rule about that supplier's state, and nothing the caller can retype fixes it - somebody has
-    /// to approve it in the master data first. The architecture's status grouping is by "what should
-    /// the client do next", and that is the difference between this and the two not-found codes.
+    /// 422, not the 400 the Go service put in its envelope. The request is well formed and the code
+    /// names a real supplier; what fails is a rule about that supplier's state, and nothing the
+    /// caller can retype fixes it - somebody has to approve it in the master data first. The
+    /// architecture's status grouping is by "what should the client do next", and that is exactly
+    /// the difference between this and the two not-found codes, which a different code <i>would</i>
+    /// fix.
+    /// <para>
+    /// <b>No client is broken by the difference.</b> Spec 12 section 4.2 is explicit that the Go
+    /// endpoint answered <b>HTTP 200</b> for this outcome and carried the 400 inside a soft
+    /// envelope, so no caller has ever branched on 400 here; what they branch on is
+    /// <c>SUPPLIER_NOT_APPROVED</c>, which is unchanged.
+    /// </para>
     /// </summary>
     private const int UnprocessableEntity = 422;
 
@@ -345,7 +354,11 @@ public sealed class SupplierLinkAppService(
     }
 
     /// <summary>
-    /// Refuses a mounting the product master data does not vouch for.
+    /// Refuses a mounting the product master data does not vouch for, with <b>one error code per
+    /// reason</b>: a supplier code the master data has never heard of is <c>SUPPLIER_NOT_FOUND</c>,
+    /// a real supplier that is not approved is <c>SUPPLIER_NOT_APPROVED</c>, and either kind of
+    /// unusable company is <c>COMPANY_NOT_FOUND</c>. The first two were one code until the port
+    /// could tell them apart.
     /// <para>
     /// The write path is the one place these codes are checked at all - there is no foreign key
     /// behind either column, because the rows they name live in another service - so an unreachable
@@ -369,48 +382,71 @@ public sealed class SupplierLinkAppService(
 
         if (entries is null)
         {
+            // 502, not the 503 the Go service answered. Both say "come back later" and both carry
+            // the same errorCode, which is the branch a client actually reads - but the status has
+            // to mean one thing across the whole service. UpstreamException is 502 everywhere here
+            // (see docs/architecture.md: an upstream's 5xx or timeout is a 502), and 503 is this
+            // service saying it is itself unavailable - which it is not: it is healthy, and one
+            // upstream is not. Answering 503 from one endpoint would also tell every proxy, health
+            // check and retry-everything client that the service is down when only mountings are.
+            // The one thing worth keeping from the Go shape - "nothing was written, retry" - is
+            // said by the errorCode and by this detail.
             throw new UpstreamException(
                 ErrorCodes.UpstreamUnavailable,
                 "The product master data could not be reached, so the supplier and company codes "
                 + "could not be verified. No mounting was changed.");
         }
 
-        var supplier = entries.FirstOrDefault(entry =>
-            entry.TenantType == TenantTypes.Supplier && entry.TenantCode == supplierCode);
+        // Absent from the answer and present-as-unknown are the same fact - the master data holds
+        // no such tenant - and the port says so: a caller must read them identically.
+        var supplier = Verdict(entries, TenantTypes.Supplier, supplierCode);
+        var company = Verdict(entries, TenantTypes.Company, companyCode);
 
-        if (supplier is null)
+        if (supplier == Verdicts.Unknown)
         {
             throw new BadRequestException(
                 ErrorCodes.SupplierNotFound,
                 $"The product master data knows no supplier {supplierCode}.");
         }
 
-        if (!supplier.Usable)
+        if (supplier != Verdicts.Usable)
         {
-            // The port collapses "exists" and "is approved" into one verdict, so this is the only
-            // place the two Go codes cannot both be reproduced. NOT_APPROVED is the one reported,
-            // because the operator picks the code off a list of suppliers that do exist and the
-            // failure they actually hit is an unapproved one. Distinguishing them needs a wider
-            // master-data port, which belongs to the slice that owns it.
+            // The supplier exists; its state is what forbids the mounting. The only non-usable
+            // state the master data has for a supplier is "not approved", and anything else it
+            // grows is refused here too rather than waved through.
             throw new AppException(
                 ErrorCodes.SupplierNotApproved,
                 $"Supplier {supplierCode} is not approved, so it cannot be mounted.",
                 UnprocessableEntity);
         }
 
-        var company = entries.FirstOrDefault(entry =>
-            entry.TenantType == TenantTypes.Company && entry.TenantCode == companyCode);
-
-        // An inactive company reports COMPANY_NOT_FOUND as well: a company that has been switched
-        // off is not somewhere a supplier may be mounted, and the contract exposes one outcome for
-        // "this company cannot take a mounting".
-        if (company is null || !company.Usable)
+        // The company keeps ONE error code for both of its failures, and that is a contract
+        // decision rather than a limit of the port: neither a company the master data has never
+        // heard of nor one that has been switched off is somewhere a supplier may hang, the
+        // operator's next move is the same for both, and the Go contract publishes a single code
+        // (spec 12 section 3.1.4 step 4, and the deliberate-quirks list). Only the detail differs,
+        // so the operator is not left guessing which of the two they hit.
+        if (company != Verdicts.Usable)
         {
             throw new BadRequestException(
                 ErrorCodes.CompanyNotFound,
-                $"Company {companyCode} does not exist in the product master data, or is not active.");
+                company == Verdicts.Unknown
+                    ? $"The product master data knows no company {companyCode}."
+                    : $"Company {companyCode} is not active, so a supplier cannot be mounted onto it.");
         }
     }
+
+    /// <summary>
+    /// What the master data said about one code, with an entry it did not mention read as
+    /// <see cref="Verdicts.Unknown"/> - the port's own instruction, and the
+    /// fail-closed direction for a write that has no foreign key behind it.
+    /// </summary>
+    private static Verdicts Verdict(
+        IReadOnlyList<TenantMasterDataEntry> entries, string tenantType, string tenantCode) =>
+        entries.FirstOrDefault(entry =>
+                entry.TenantType == tenantType && entry.TenantCode == tenantCode)
+            ?.Verdict
+        ?? Verdicts.Unknown;
 
     /// <summary>
     /// Batch-loads the display name and primary email address of the given administrator ids.

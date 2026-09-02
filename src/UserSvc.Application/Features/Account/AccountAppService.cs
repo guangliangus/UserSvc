@@ -60,13 +60,18 @@ public sealed class AccountAppService(
         var user = await users.FindByIdAsync(userId, cancellationToken)
                    ?? throw new NotFoundException(ErrorCodes.UserNotFound, "The account was not found.");
 
+        // The id was just confirmed against identity.users, so the realm is a fact here rather
+        // than an argument: the session sweep below must not reach the back-office session that
+        // happens to share this integer, whose holder deregistered nothing.
+        var subject = SessionSubject.Consumer(userId);
+
         // Three things at once, all of them immediate: the session rows become REVOKED so the next
         // refresh fails, the OpenIddict authorization behind each session is revoked so the refresh
         // token stops being a credential at all, and the Redis revocation set kills the access
         // tokens already in the wild. It raises on failure, and being raised here - before anything
         // about the account has changed - is the point: an account whose tokens could not be killed
         // must not be quietly closed while its holder keeps working.
-        await sessions.RevokeAllAsync(userId, RevocationReasons.Deregistered, cancellationToken);
+        await sessions.RevokeAllAsync(subject, RevocationReasons.Deregistered, cancellationToken);
 
         if (user.Status == UserStatuses.Disabled)
         {
@@ -115,6 +120,6 @@ public sealed class AccountAppService(
         // session would outlive the account. The window is milliseconds and the sweep costs one
         // indexed query that normally returns nothing, which is a cheap price for not leaving a live
         // session on a closed account.
-        await sessions.RevokeAllAsync(userId, RevocationReasons.Deregistered, cancellationToken);
+        await sessions.RevokeAllAsync(subject, RevocationReasons.Deregistered, cancellationToken);
     }
 }

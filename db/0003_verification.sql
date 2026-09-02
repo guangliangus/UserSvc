@@ -64,9 +64,24 @@ CREATE INDEX IF NOT EXISTS ix_verification_codes_target_hash_purpose_verificatio
     ON identity.verification_codes (target_hash, purpose, verification_ticket_hash)
     WHERE consumed_at IS NULL;
 
--- The two risk-control fallback counts. Unfiltered on purpose: they count history, including the
--- consumed rows the indexes above deliberately exclude.
+-- The unfiltered (target_hash, created_at) index. Its primary reader is the miss classification on
+-- a FAILED verify: that query filters on (target_hash, purpose, code_hash) with NO state predicate,
+-- so the two partial indexes above (WHERE consumed_at IS NULL) cannot serve it, and rows are never
+-- deleted here, so without this index every wrong code scans a table that only grows. Measured with
+-- EXPLAIN ANALYZE at ~400k rows: bitmap index scan ~2 ms with this index, parallel seq scan ~34 ms
+-- without - and the failed-verify path is exactly where a brute-force attacker lives, so the scan
+-- would be a cheap DoS as well as slow. The risk-control target-dimension fallback COUNT rides the
+-- same index, but the index earns its place on the verify path alone.
 CREATE INDEX IF NOT EXISTS ix_verification_codes_target_hash_created_at
     ON identity.verification_codes (target_hash, created_at);
-CREATE INDEX IF NOT EXISTS ix_verification_codes_device_id_hash_created_at
-    ON identity.verification_codes (device_id_hash, created_at);
+
+-- The device-dimension fallback index is dropped, not created. The "count recent sends from the
+-- database when Redis is down" fallback was never wired: nothing calls
+-- IVerificationCodeRepository.CountInWindow, and risk control counts in Redis and fails open by
+-- contract. So device_id_hash was written by every send and read by nothing, and this index was
+-- pure write amplification - a second secondary index maintained on every INSERT (measured ~46 MB
+-- at ~0.8 M rows) for a query that never runs. DROP IF EXISTS keeps the script idempotent and
+-- re-runnable and removes the index on the live database on the next apply. If the device-dimension
+-- fallback is ever actually implemented, recreate this index and prove it is the one the COUNT uses
+-- with EXPLAIN; the target index above already covers the target dimension.
+DROP INDEX IF EXISTS identity.ix_verification_codes_device_id_hash_created_at;

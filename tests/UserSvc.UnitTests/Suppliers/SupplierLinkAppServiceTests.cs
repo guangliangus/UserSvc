@@ -14,6 +14,7 @@ using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Application.Security;
 using UserSvc.Domain.Suppliers;
 using UserSvc.Domain.Tenancy;
+using static UserSvc.Application.Ports.Tenancy.TenantMasterDataEntry;
 using Xunit;
 
 namespace UserSvc.UnitTests.Suppliers;
@@ -301,10 +302,16 @@ public sealed class SupplierLinkAppServiceTests
             Arg.Any<UserSvc.Domain.Iam.IamAuditLog>(), Arg.Any<CancellationToken>());
     }
 
+    /// <summary>
+    /// A supplier that exists and is not approved. <b>Not</b> the same answer as a supplier the
+    /// master data has never heard of - the two were one code until the port could tell them
+    /// apart, and the operator's next move differs: one of them means "get it approved", the other
+    /// means "you typed the wrong code".
+    /// </summary>
     [Fact]
     public async Task AnUnapprovedSupplierIsRefusedWith422()
     {
-        MasterData(supplierUsable: false, companyUsable: true);
+        MasterData(supplier: Verdicts.NotUsable);
 
         var error = await Should.ThrowAsync<AppException>(() => Sut.UpdateLinkAsync(
             ManagingCaller(), "S1", new UpdateSupplierLinkRequest { CompanyCode = "C1" },
@@ -315,19 +322,90 @@ public sealed class SupplierLinkAppServiceTests
         _added.ShouldBeEmpty();
     }
 
+    /// <summary>
+    /// A supplier the master data reports as not existing is SUPPLIER_NOT_FOUND, not
+    /// SUPPLIER_NOT_APPROVED. This is the case a boolean port could not express: the entry is
+    /// present and unusable either way, so the endpoint used to tell an operator to go and get a
+    /// supplier approved that the master data has never heard of.
+    /// </summary>
     [Fact]
-    public async Task AnInactiveCompanyIsRefusedAsCompanyNotFound()
+    public async Task ASupplierTheMasterDataDoesNotKnowIsNotFoundRatherThanNotApproved()
     {
-        MasterData(supplierUsable: true, companyUsable: false);
+        MasterData(supplier: Verdicts.Unknown);
 
         var error = await Should.ThrowAsync<BadRequestException>(() => Sut.UpdateLinkAsync(
             ManagingCaller(), "S1", new UpdateSupplierLinkRequest { CompanyCode = "C1" },
             CancellationToken.None));
 
-        // One code for "no such company" and "switched off": neither is somewhere a supplier may
-        // hang, and the operator's next move is the same.
-        error.ErrorCode.ShouldBe(ErrorCodes.CompanyNotFound);
+        error.ErrorCode.ShouldBe(ErrorCodes.SupplierNotFound);
+        error.StatusCode.ShouldBe(400);
+        error.Message.ShouldContain("knows no supplier");
         _added.ShouldBeEmpty();
+    }
+
+    /// <summary>
+    /// The other shape of "never heard of it": the master data answered and mentioned neither code.
+    /// The port says the two shapes must read identically, so an omitted entry is the unknown
+    /// verdict and not a usable one.
+    /// </summary>
+    [Fact]
+    public async Task AMasterDataAnswerThatMentionsNoCodesIsSupplierNotFound()
+    {
+        MasterDataMentioningNothing();
+
+        var error = await Should.ThrowAsync<BadRequestException>(() => Sut.UpdateLinkAsync(
+            ManagingCaller(), "S1", new UpdateSupplierLinkRequest { CompanyCode = "C1" },
+            CancellationToken.None));
+
+        error.ErrorCode.ShouldBe(ErrorCodes.SupplierNotFound);
+        _added.ShouldBeEmpty();
+    }
+
+    /// <summary>
+    /// A company the master data has never heard of, and one that has been switched off, answer the
+    /// <b>same</b> error code - the Go contract publishes one for both and neither is somewhere a
+    /// supplier may hang - and different details, which is all the port's extra precision is spent
+    /// on here.
+    /// </summary>
+    [Fact]
+    public async Task AnUnknownCompanyAndAnInactiveOneShareTheirCodeAndNotTheirDetail()
+    {
+        MasterData(company: Verdicts.Unknown);
+
+        var unknown = await Should.ThrowAsync<BadRequestException>(() => Sut.UpdateLinkAsync(
+            ManagingCaller(), "S1", new UpdateSupplierLinkRequest { CompanyCode = "C1" },
+            CancellationToken.None));
+
+        MasterData(company: Verdicts.NotUsable);
+
+        var inactive = await Should.ThrowAsync<BadRequestException>(() => Sut.UpdateLinkAsync(
+            ManagingCaller(), "S1", new UpdateSupplierLinkRequest { CompanyCode = "C1" },
+            CancellationToken.None));
+
+        unknown.ErrorCode.ShouldBe(ErrorCodes.CompanyNotFound);
+        inactive.ErrorCode.ShouldBe(ErrorCodes.CompanyNotFound);
+        unknown.Message.ShouldContain("knows no company");
+        inactive.Message.ShouldContain("not active");
+        _added.ShouldBeEmpty();
+    }
+
+    /// <summary>
+    /// The supplier is judged before the company, so an operator who got both codes wrong is told
+    /// about the one in the path first. Pinned because both are refusals and the order is the only
+    /// thing that decides which code the client sees.
+    /// </summary>
+    [Fact]
+    public async Task TheSupplierVerdictIsReportedAheadOfTheCompanyOne()
+    {
+        MasterData(
+            supplier: Verdicts.NotUsable,
+            company: Verdicts.Unknown);
+
+        var error = await Should.ThrowAsync<AppException>(() => Sut.UpdateLinkAsync(
+            ManagingCaller(), "S1", new UpdateSupplierLinkRequest { CompanyCode = "C1" },
+            CancellationToken.None));
+
+        error.ErrorCode.ShouldBe(ErrorCodes.SupplierNotApproved);
     }
 
     [Fact]
@@ -553,9 +631,13 @@ public sealed class SupplierLinkAppServiceTests
         Status = TenantMemberStatuses.Active,
     };
 
+    /// <summary>
+    /// What the master data says about the two codes a mounting names. The default is the happy
+    /// answer; each verdict is passed explicitly by the test that cares about it.
+    /// </summary>
     private void MasterData(
-        bool supplierUsable = true,
-        bool companyUsable = true,
+        Verdicts supplier = Verdicts.Usable,
+        Verdicts company = Verdicts.Usable,
         string supplierCode = "S1",
         string companyCode = "C1") =>
         _masterData.ValidateAsync(
@@ -564,9 +646,20 @@ public sealed class SupplierLinkAppServiceTests
                 Arg.Any<CancellationToken>())
             .Returns(new List<TenantMasterDataEntry>
             {
-                new(TenantTypes.Supplier, supplierCode, supplierUsable, new Dictionary<string, string>()),
-                new(TenantTypes.Company, companyCode, companyUsable, new Dictionary<string, string>()),
+                new(TenantTypes.Supplier, supplierCode, supplier, new Dictionary<string, string>()),
+                new(TenantTypes.Company, companyCode, company, new Dictionary<string, string>()),
             });
+
+    /// <summary>
+    /// A master data that answered, but mentioned neither code - the other shape of "never heard of
+    /// it", and the one a real adapter produces when the upstream simply omits an unknown code.
+    /// </summary>
+    private void MasterDataMentioningNothing() =>
+        _masterData.ValidateAsync(
+                Arg.Any<IReadOnlyCollection<string>>(),
+                Arg.Any<IReadOnlyCollection<string>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(new List<TenantMasterDataEntry>());
 
     private async Task<UserSvc.Domain.Iam.IamAuditLog> CapturedAuditAsync()
     {

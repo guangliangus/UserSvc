@@ -71,7 +71,7 @@ public sealed class AvatarController(AvatarAppService avatars, ICurrentUser curr
         await using var content = avatar.OpenReadStream();
 
         return await avatars.UploadAsync(
-            currentUser.RequireUserId(),
+            currentUser.RequireConsumerId(),
             new AvatarUpload(content, avatar.ContentType, avatar.Length),
             cancellationToken);
     }

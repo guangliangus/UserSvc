@@ -63,11 +63,22 @@ public sealed class SupplierLinkController(
     /// exist and be active. A null, omitted or blank one unmounts, and does so idempotently.
     /// </para>
     /// <para>
-    /// The business failures are real status codes rather than a soft envelope: 400
-    /// <c>SUPPLIER_NOT_FOUND</c> / <c>COMPANY_NOT_FOUND</c> (fix the code), 422
-    /// <c>SUPPLIER_NOT_APPROVED</c> (the supplier's state is wrong, not the request), 409
-    /// <c>SUPPLIER_ALREADY_LINKED</c> (already where you asked for), and 502 when the master data
-    /// cannot be reached - the one case where nothing was written and retrying later is right.
+    /// The business failures are real status codes rather than a soft envelope, and each reason has
+    /// its own code: 400 <c>SUPPLIER_NOT_FOUND</c> (the master data has never heard of this
+    /// supplier) and 400 <c>COMPANY_NOT_FOUND</c> (no such company, or one that is not active - one
+    /// code for both, deliberately), 422 <c>SUPPLIER_NOT_APPROVED</c> (a real supplier whose state
+    /// forbids the mounting - the request is fine, so no edit to it helps), 409
+    /// <c>SUPPLIER_ALREADY_LINKED</c> (already where you asked for), and 502
+    /// <c>UPSTREAM_SERVICE_UNAVAILABLE</c> when the master data cannot be reached - the one case
+    /// where nothing was written and retrying later is right.
+    /// </para>
+    /// <para>
+    /// Two of those statuses differ from the numbers the Go service put inside its always-200
+    /// envelope (400 for the unapproved supplier, 503 for the unreachable master data). The
+    /// <c>errorCode</c> - which is what the Go clients branched on, since they only ever saw HTTP
+    /// 200 for the first - is identical in every case. 422 says "the request is not the problem",
+    /// and 502 is what this whole service answers when an upstream fails; 503 would claim this
+    /// service is the one that is unavailable.
     /// </para>
     /// </summary>
     [HttpPut("suppliers/{code}/link")]

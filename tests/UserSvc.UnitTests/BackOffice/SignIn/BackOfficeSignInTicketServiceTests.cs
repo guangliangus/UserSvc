@@ -1,3 +1,7 @@
+using System.Buffers.Text;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using Shouldly;
 using UserSvc.Application.Errors;
@@ -63,15 +67,75 @@ public sealed class BackOfficeSignInTicketServiceTests
         opened.ToActClaim().ShouldBeNull();
     }
 
-    /// <summary>A no-authority sign-in and a pre-tenant sign-in both carry no act. What separates
-    /// them is the scope the redeemer grants, which is not this record's decision.</summary>
+    /// <summary>
+    /// A no-authority sign-in and a pre-tenant sign-in both carry no act, and they must still be
+    /// told apart: the first one is <b>finished</b> and gets a real credential with an empty
+    /// authority surface, the second is half a sign-in and gets a pre-tenant one. When
+    /// <c>ContextRequired</c> was <c>ActType.Length == 0</c> it answered true for both, so the
+    /// REST response said <c>contextRequired: false, grantedScope: backoffice</c> while the token
+    /// endpoint minted <c>backoffice_pre_tenant</c> - and a freshly created operator could sign in
+    /// and never get a usable credential.
+    /// </summary>
     [Fact]
-    public void ASignInWithNoAuthorityAlsoCarriesNoContext()
+    public void ASignInWithNoAuthorityIsFinishedRatherThanPreTenant()
     {
-        var ticket = BackOfficeSignInTicket.ForContext(57, "operator", 3, act: null);
+        var settled = BackOfficeSignInTicket.ForContext(57, "operator", 3, act: null);
+        var preTenant = BackOfficeSignInTicket.PreTenant(57, "operator", 3);
 
-        ticket.ContextRequired.ShouldBeTrue();
-        ticket.ToActClaim().ShouldBeNull();
+        settled.ToActClaim().ShouldBeNull();
+        preTenant.ToActClaim().ShouldBeNull("both outcomes carry no act - that is the point");
+
+        settled.ContextRequired.ShouldBeFalse();
+        preTenant.ContextRequired.ShouldBeTrue();
+    }
+
+    /// <summary>The distinction is only worth anything if it survives being signed and reopened by
+    /// the pod that redeems the ticket, which is a different process from the one that minted
+    /// it.</summary>
+    [Fact]
+    public void TheFinishedSignInFlagSurvivesTheRoundTrip()
+    {
+        var opened = Sut().Open(Sut().Issue(
+            BackOfficeSignInTicket.ForContext(57, "operator", 3, act: null)));
+
+        opened.ContextSettled.ShouldBeTrue();
+        opened.ContextRequired.ShouldBeFalse();
+        opened.ToActClaim().ShouldBeNull();
+    }
+
+    /// <summary>
+    /// A ticket minted by a build that did not write the flag has no <c>cs</c> member, so it
+    /// deserializes to false and is read as a sign-in still owing a context: a five-minute
+    /// credential reaching two endpoints. That is the direction the default has to fall. The
+    /// opposite phrasing would have upgraded every in-flight pre-tenant ticket to a full
+    /// back-office token with a refresh chain for the two minutes after a deployment.
+    /// </summary>
+    [Fact]
+    public void ATicketFromABuildThatWroteNoFlagIsReadAsStillOwingAContext()
+    {
+        // A finished no-authority sign-in, then the flag deleted and the payload re-signed with the
+        // real key - so the absent member is the only thing that can change the reading.
+        var issued = Sut().Issue(BackOfficeSignInTicket.ForContext(57, "operator", 3, act: null));
+        var json = Encoding.UTF8.GetString(
+            Base64Url.DecodeFromChars(issued.AsSpan(0, issued.IndexOf('.', StringComparison.Ordinal))));
+
+        json.ShouldContain("\"cs\":true");
+
+        var opened = Sut().Open(ReSign(Regex.Replace(json, ",?\"cs\":true", string.Empty)));
+
+        opened.ContextSettled.ShouldBeFalse();
+        opened.ContextRequired.ShouldBeTrue();
+    }
+
+    /// <summary>Re-signs a hand-edited payload with the real key, so that what the test changed is
+    /// the only thing the reader can object to.</summary>
+    private static string ReSign(string json)
+    {
+        var bytes = Encoding.UTF8.GetBytes(json);
+        byte[] signed = [.. Encoding.ASCII.GetBytes("usersvc/back-office-sign-in/v1"), .. bytes];
+
+        return Base64Url.EncodeToString(bytes) + "." + Base64Url.EncodeToString(
+            HMACSHA256.HashData(Convert.FromHexString(Key), signed));
     }
 
     [Fact]
@@ -184,6 +248,66 @@ public sealed class BackOfficeSignInTicketServiceTests
     [Fact]
     public void ConstructingTheServiceWithNoKeyDoesNotThrow() =>
         Should.NotThrow(() => Sut(string.Empty));
+
+    /// <summary>
+    /// Every ticket carries an id, and no two carry the same one - which is what the consume-once
+    /// marker is keyed on. Two tickets sharing an id would mean redeeming either spent both.
+    /// </summary>
+    [Fact]
+    public void EveryTicketCarriesADistinctId()
+    {
+        var ids = Enumerable
+            .Range(0, 32)
+            .Select(_ => Sut().Open(Sut().Issue(BackOfficeSignInTicket.PreTenant(57, "operator", 3))).TicketId)
+            .ToList();
+
+        ids.ShouldAllBe(id => id.Length >= 22);
+        ids.Distinct(StringComparer.Ordinal).Count().ShouldBe(ids.Count);
+    }
+
+    /// <summary>
+    /// The id is written by the issuer, exactly like the expiry. A caller that chose its own could
+    /// reuse one - deliberately, to make a second ticket the first redemption had already spent,
+    /// or to burn an id somebody else was about to be issued.
+    /// </summary>
+    [Fact]
+    public void TheIssuerDecidesTheIdAndTheCallerCannotChooseIt()
+    {
+        var chosen = BackOfficeSignInTicket.PreTenant(57, "operator", 3) with
+        {
+            TicketId = "an-id-the-caller-picked",
+        };
+
+        Sut().Open(Sut().Issue(chosen)).TicketId.ShouldNotBe("an-id-the-caller-picked");
+    }
+
+    /// <summary>
+    /// A ticket with no id cannot be claimed in the marker store, so it cannot be shown to be
+    /// unredeemed - and the fail-closed answer to that is to refuse it. The only ticket that can be
+    /// in this state is one an older build minted, so the blast radius is a two-minute window after
+    /// a deployment in which a sign-in that straddled the upgrade is answered "sign in again". That
+    /// beats accepting unlimited replays of every ticket minted before the marker existed.
+    /// </summary>
+    [Fact]
+    public void ATicketFromABuildThatWroteNoIdDoesNotOpen()
+    {
+        // Re-signed with the real key, so the missing id is the only thing that can refuse it.
+        var issued = Sut().Issue(BackOfficeSignInTicket.PreTenant(57, "operator", 3));
+        var payload = issued[..issued.IndexOf('.', StringComparison.Ordinal)];
+        var json = Encoding.UTF8.GetString(Base64Url.DecodeFromChars(payload));
+
+        json.ShouldContain("\"jti\"");
+
+        var bytes = Encoding.UTF8.GetBytes(
+            Regex.Replace(json, "\"jti\":\"[^\"]*\"", "\"jti\":\"\""));
+
+        byte[] signed = [.. Encoding.ASCII.GetBytes("usersvc/back-office-sign-in/v1"), .. bytes];
+        var resigned = Base64Url.EncodeToString(bytes) + "." + Base64Url.EncodeToString(
+            HMACSHA256.HashData(Convert.FromHexString(Key), signed));
+
+        Should.Throw<UnauthorizedException>(() => Sut().Open(resigned))
+            .ErrorCode.ShouldBe(ErrorCodes.InvalidToken);
+    }
 
     /// <summary>
     /// The two scope names the sign-in response advertises are the same two the API layer's

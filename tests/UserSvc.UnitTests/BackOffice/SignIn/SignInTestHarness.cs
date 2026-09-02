@@ -114,6 +114,17 @@ internal sealed class SignInTestHarness
                 Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
             .Returns(call => new RateLimitDecision(true, 9, TimeSpan.Zero));
 
+        Limiter.PeekAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(call => new RateLimitDecision(true, 9, TimeSpan.Zero));
+
+        // Claimed by default: a fresh ticket has never been redeemed. A substitute answering false
+        // would refuse every redemption in this file, and the tests asserting that a first
+        // redemption works would pass only because they assert on the wrong thing.
+        Markers.TryClaimAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+
         StaffDirectory.VerifyOtpAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new StaffOtpVerification(true, "0000", string.Empty, "ok"));
 
@@ -146,6 +157,8 @@ internal sealed class SignInTestHarness
     public IIamAuditLogRepository AuditLog { get; } = Substitute.For<IIamAuditLogRepository>();
 
     public IRateLimiter Limiter { get; } = Substitute.For<IRateLimiter>();
+
+    public ISingleUseMarkerStore Markers { get; } = Substitute.For<ISingleUseMarkerStore>();
 
     public IStaffDirectory StaffDirectory { get; } = Substitute.For<IStaffDirectory>();
 
@@ -215,6 +228,7 @@ internal sealed class SignInTestHarness
             Standing,
             AuditLog,
             Limiter,
+            Markers,
             Protector,
             PasswordHasher,
             Tickets,
@@ -307,12 +321,40 @@ internal sealed class SignInTestHarness
                 Arg.Any<CancellationToken>())
             .Returns(new List<TenantMasterDataEntry>
             {
-                new(tenantType, tenantCode, Usable: false, new Dictionary<string, string>()),
+                new(
+                    tenantType,
+                    tenantCode,
+                    TenantMasterDataEntry.Verdicts.NotUsable,
+                    new Dictionary<string, string>(StringComparer.Ordinal)),
             });
 
-    public void WithRateLimitRefusal(TimeSpan retryAfter) =>
+    /// <summary>
+    /// Refuses the read-only lockout check, which is what the password door gates on. It leaves
+    /// <c>TryAcquireAsync</c> allowing, because a refusal there is not a gate any more - the door
+    /// uses it only to tally a failure that has already happened.
+    /// </summary>
+    public void WithRateLimitRefusal(TimeSpan retryAfter)
+    {
+        Limiter.PeekAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(new RateLimitDecision(false, 0, retryAfter));
+
         Limiter.TryAcquireAsync(
                 Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(new RateLimitDecision(false, 0, retryAfter));
+    }
+
+    /// <summary>Refuses only the counting call, which is the one-time-password door's gate.</summary>
+    public void WithAttemptLimitRefusal(TimeSpan retryAfter) =>
+        Limiter.TryAcquireAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
+            .Returns(new RateLimitDecision(false, 0, retryAfter));
+
+    /// <summary>Refuses the lockout check for one dimension only, so a test can tell a per-address
+    /// refusal from a per-source one.</summary>
+    public void WithRateLimitRefusalOn(string dimension, TimeSpan retryAfter) =>
+        Limiter.PeekAsync(
+                dimension, Arg.Any<string>(), Arg.Any<RateLimitPolicy>(), Arg.Any<CancellationToken>())
             .Returns(new RateLimitDecision(false, 0, retryAfter));
 
     /// <summary>The tenancy slice's view of an account row, which the context funnel reads.</summary>

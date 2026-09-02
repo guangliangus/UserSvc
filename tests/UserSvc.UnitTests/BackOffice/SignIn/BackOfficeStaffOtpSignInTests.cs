@@ -344,6 +344,7 @@ public sealed class BackOfficeStaffOtpSignInTests
             harness.Standing,
             harness.AuditLog,
             harness.Limiter,
+            harness.Markers,
             harness.Protector,
             harness.PasswordHasher,
             harness.Tickets,

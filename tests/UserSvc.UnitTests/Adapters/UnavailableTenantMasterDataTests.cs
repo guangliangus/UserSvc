@@ -6,9 +6,15 @@ using Xunit;
 namespace UserSvc.UnitTests.Adapters;
 
 /// <summary>
-/// The two master-data placeholders refuse in different shapes, and the difference is the whole
-/// point: one port has a vocabulary for "not reached" and the other does not, so answering the
-/// second one at all would be inventing a fact.
+/// The last refusing placeholder in the service. The company and supplier registers belong to the
+/// product master data, which is somebody else's tables, so this one cannot be replaced by reading
+/// our own database - unlike the supplier-link stand-in that used to be tested beside it, which
+/// the real repository replaced in wave 6 and which has now been deleted rather than left lying
+/// around unregistered.
+/// <para>
+/// What is pinned here is the <i>shape</i> of the refusal: this port has a vocabulary for "could
+/// not be reached", and answering anything else would be inventing a fact.
+/// </para>
 /// </summary>
 public sealed class UnavailableTenantMasterDataTests
 {
@@ -24,25 +30,12 @@ public sealed class UnavailableTenantMasterDataTests
     }
 
     /// <summary>
-    /// The supplier-link stand-in degrades instead of refusing, and the reason is where the port
-    /// sits rather than what it means. It is read from inside
-    /// <c>TenantContextAppService.ComputeAsync</c> - the one funnel every authority decision comes
-    /// through - so a throw took down permissions, menus and roles for every caller acting in a
-    /// company or supplier context, on endpoints that never read a supplier link. The empty answer
-    /// can only narrow a data-scope envelope, never widen one, so it fails closed where the throw
-    /// failed open (<c>GET /back-office/me</c> answered <c>menus: null</c>, which the shell reads
-    /// as "this backend does not gate menus").
+    /// Constructing it reads no configuration and touches nothing, which is what lets it be
+    /// registered on every deployment: a placeholder that could fail while being built would take
+    /// out the container rather than the capability it stands in for.
     /// </summary>
     [Fact]
-    public async Task TheSupplierLinkDirectoryNarrowsTheEnvelopeRatherThanFailingTheRequest()
-    {
-        var directory = new UnavailableSupplierCompanyLinkDirectory(
-            NullLogger<UnavailableSupplierCompanyLinkDirectory>.Instance);
-
-        (await directory.ListSupplierCodesByCompanyAsync("C001", CancellationToken.None))
-            .ShouldBeEmpty();
-
-        (await directory.FindCompanyCodeBySupplierAsync("S9", CancellationToken.None))
-            .ShouldBeNull();
-    }
+    public void ConstructingItReadsNothing() =>
+        Should.NotThrow(() => new UnavailableTenantMasterDataDirectory(
+            NullLogger<UnavailableTenantMasterDataDirectory>.Instance));
 }

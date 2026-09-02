@@ -559,8 +559,9 @@ public sealed class LionTravelAccessTokenCache(
 
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
 
-    private string _token = string.Empty;
-    private DateTimeOffset _expiresAt = DateTimeOffset.MinValue;
+    /// <summary>The in-process half of the cache. Swapped, never mutated in place - see
+    /// <see cref="CachedToken"/>.</summary>
+    private CachedToken _cached = CachedToken.None;
 
     /// <summary>
     /// The Redis key, read at the point of use rather than in a field initializer.
@@ -609,8 +610,7 @@ public sealed class LionTravelAccessTokenCache(
 
             var (token, ttl) = await mint(cancellationToken).ConfigureAwait(false);
 
-            _token = token;
-            _expiresAt = now + ttl;
+            Volatile.Write(ref _cached, new CachedToken(token, now + ttl));
 
             await TryWriteRedisAsync(token, ttl).ConfigureAwait(false);
 
@@ -627,8 +627,7 @@ public sealed class LionTravelAccessTokenCache(
     /// rather than a failure.</summary>
     public async Task InvalidateAsync()
     {
-        _token = string.Empty;
-        _expiresAt = DateTimeOffset.MinValue;
+        Volatile.Write(ref _cached, CachedToken.None);
 
         try
         {
@@ -640,8 +639,35 @@ public sealed class LionTravelAccessTokenCache(
         }
     }
 
-    private string TryRead(DateTimeOffset now) =>
-        _token.Length > 0 && now < _expiresAt ? _token : string.Empty;
+    /// <summary>
+    /// The in-process copy, if there is one that is still good. One read of one reference, so the
+    /// token and the expiry that authorises it are always the same refresh's.
+    /// </summary>
+    private string TryRead(DateTimeOffset now)
+    {
+        var cached = Volatile.Read(ref _cached);
+
+        return cached.Token.Length > 0 && now < cached.ExpiresAt ? cached.Token : string.Empty;
+    }
+
+    /// <summary>
+    /// A token and the instant it stops being usable, as <b>one</b> object.
+    /// <para>
+    /// Two fields could not be read as a pair: a reader outside the refresh gate could take the
+    /// token from one refresh and the expiry from the next, and a
+    /// <see cref="DateTimeOffset"/> is sixteen bytes, so it is not even read atomically by itself -
+    /// a reader could see an instant that was never written. Both are answered by making the pair a
+    /// single immutable reference that a refresh swaps in one assignment: a reader sees the state
+    /// entirely before or entirely after, and there is no third possibility to reason about.
+    /// </para>
+    /// </summary>
+    /// <param name="Token">The cached token, or empty when there is none.</param>
+    /// <param name="ExpiresAt">When it stops being usable. Past for an empty token.</param>
+    private sealed record CachedToken(string Token, DateTimeOffset ExpiresAt)
+    {
+        /// <summary>No token: the state before the first mint and after an invalidation.</summary>
+        public static readonly CachedToken None = new(string.Empty, DateTimeOffset.MinValue);
+    }
 
     private async Task<string> TryReadRedisAsync()
     {

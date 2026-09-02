@@ -159,6 +159,46 @@ refresh token 会返回 `400 invalid_grant` **并撤销该 authorization 下的�
 配置缺失映射为 500 `NOT_CONFIGURED`（不是 `INTERNAL_ERROR`），`detail` 里带上缺失的段名——
 运维读到它就知道去看密钥，而不是去读代码。
 
+### 后来又被违反了四次，所以现在有守卫
+
+上面三条是靠人记住的，然后又出了四次：第 4、5 次是 `OAuthStateService` 与
+`SocialBindingTokenService` 在**字段初始化器**里读 `.Value`，害得一个纯数据库的解绑接口报 500
+说签名密钥不对；第 6 次是 `RedisSingleUseMarkerStore` 同样的形状；第 7 次是
+`Program.cs` 少了 `Func<TestWhitelistAppService>` 的注册，容器直接构建不出来。
+
+所以现在有 `tests/UserSvc.ArchitectureTests/OptionsReadSiteTests.cs`：它扫 `src/`，
+**任何新增的「字段初始化器里读 `IOptions<T>.Value`」都会让构建失败**。文件里列了当前仍存在的
+9 处（都压在 `ValidateOnStart()` 的段上，所以是形状不是故障），并且第二个测试要求这张清单只能变短
+——修好了却还留在清单里，会让守卫看起来比实际更紧。
+
+修法就是上表那一行：把字段换成同名的表达式体属性，调用点一行都不用改。
+
+## 两个身份平面共用一个令牌颁发者，所以 `sub` 不能单独用
+
+`identity.users` 与 `iam.backend_users` **各自独立编号**，而两个平面由同一个 OpenIddict 颁发令牌，
+所以后台运营 5 号与 C 端用户 5 号是两个人、同一个整数，且后台的 access token 能满足
+一个裸 `[Authorize]`。
+
+实测（wave 7 审计，跑起来才发现的）：`sub=1` 的后台令牌能 200 读到 C 端用户 1 的
+`GET /api/v1/user/profile`；`DELETE /api/v1/account` 会关掉那个 C 端账号并踢掉他所有设备。
+请求本身没有任何畸形。
+
+两条强制做法：
+
+| 层 | 做法 |
+|---|---|
+| 会话表 | `identity.user_sessions.realm`（`CONSUMER` \| `BACKOFFICE`），聚合与仓储只收 `SessionSubject`，没有默认值也没有回落 |
+| 端点 | C 端端点取 id 一律走 `ICurrentUser.RequireConsumerId()`，不是 `RequireUserId()`；后台令牌得到 403 `FORBIDDEN` |
+
+`ICurrentUser.Realm` 由令牌**已授予的 scope** 推导（`backoffice` / `backoffice_pre_tenant`），
+不看 id 的形状——和 `ValidatedTokenFacts.IsInternal`、和两条后台授权策略是同一个信号。
+**不要**改成「没有 act claim 就当 C 端」：缺失同时也是降级令牌、畸形令牌和外来令牌的样子，
+基于缺失的判断是 fail-open。
+
+`sid` 是例外，且是有意的：它是服务端生成的 GUID，两个平面共用一个全表唯一索引，所以单凭 `sid`
+就能定到唯一一行。刷新与重放路径手里只有 `sid`，在那里再要一个 realm 等于多造一个可能出错的东西，
+而它出错的样子是「活着的会话被报成已失效」，也就是把设备登出。
+
 ## 测试宿主不要向操作系统要密钥
 
 `AuthToken:UseEphemeralKeys` 存在的原因值得记下来：探测「能不能打开 CurrentUser/My 存储」
@@ -187,3 +227,39 @@ Go 服务不用 RabbitMQ，本服务也不引。但 `identity.outbox_messages` �
 ## 数据库
 
 `db/README.md`。要点：**应用永不改库**，DDL 手动先行，脚本幂等。
+
+## 发码接口的两个「是否已注册」枚举预言机
+
+`POST /api/v1/verification/send` 会按 `purpose` 走不同的前置校验
+（`VerificationAppService.EnsureTargetSuitsPurposeAsync`），其中两个 purpose 的**错误码本身**
+就把「某个手机号/邮箱是否已注册」告诉了一个匿名调用方。这是从 Go 服务原样移植的**客户端契约**，
+不是缺陷；写在这里，是为了让「要不要关」由拥有客户端契约的人**一次性**决定，而不是被每个 reviewer
+反复重新发现。
+
+**泄露了什么、对谁泄露、在哪些 purpose 上：**
+
+| purpose | 命中已注册时 | 命中未注册时 | 因此暴露给匿名调用方的事实 |
+|---|---|---|---|
+| `reset_password` | 正常发码（200） | `400 UNREGISTERED` | 该标识符**是否已注册**（成功=已注册，报错=未注册） |
+| `bind` | `409 IDENTITY_ALREADY_BOUND` | 正常发码（200） | 该标识符**是否已绑定/已注册**（报错=已注册，成功=未注册） |
+| `auth` / `backoffice_auth` | 不查库，无差异 | 不查库，无差异 | 无——注册与验证码登录共用，发码时本就不该知道目标是否存在 |
+| `backoffice_reset_password` | 目前恒 `501 NOT_IMPLEMENTED` | 同左 | 暂无（B 端身份平面未移植）。一旦 `assertBackOfficeResetTarget` 落地，它会用 `UNREGISTERED` / `ACCOUNT_DISABLED` 暴露**后台**身份的同类事实，届时本表要补一行 |
+
+两个路由都是 `[AllowAnonymous]`，所以泄露对象是**任意匿名调用方**。`/verify` 不做身份查询，
+不在此列。
+
+**今天真正约束这个抓取的是什么：**风控**排在前置校验之前**跑
+（`SendVerificationCodeAsync` 里顺序是 限流 → 载荷校验 → 风控 → purpose 前置校验）。也就是：
+每 IP 的发码预算（默认 100/min、500/hr）与每目标/每设备的风控节流，都在那次「会暴露是否注册」的
+查库**之前**就已生效。攻击者想逐个枚举，先撞的是这套节流，而不是预言机本身。
+
+**关掉它对客户端的代价：**
+
+- 移动端**现在就分支**在这两个错误码上：重置密码流程用 `UNREGISTERED` 提示「该账号未注册」，
+  绑定流程用 `IDENTITY_ALREADY_BOUND` 提示「已被占用」。直接删掉会让这两个提示消失，属于**破坏性**
+  契约变更。
+- 要「正确」关闭，得让**所有接收标识符的流程**统一成一句「若该地址已注册，验证码已在路上」
+  式的无差别应答——不只是本接口，还包括 auth 切片里的**注册**与**绑定**接口，它们今天从别的路径
+  漏出同一个信号。只在本接口关、别处不关，等于什么都没买到。因此这是一次**跨接口、跨所有生成客户端**
+  的协同契约变更，得连带 OpenAPI schema 与各端分支逻辑一起改。
+- 决策归属：拥有客户端契约的人。在此之前，保留现状是**有意**的，別在移植/评审中单方面改动。

@@ -94,7 +94,7 @@ public sealed class SocialIdentityController(
         WechatSignInRequest request,
         CancellationToken cancellationToken)
     {
-        await social.BindWechatAsync(currentUser.RequireUserId(), request, cancellationToken);
+        await social.BindWechatAsync(currentUser.RequireConsumerId(), request, cancellationToken);
 
         // 204 rather than 200 with a body: binding is idempotent and there is nothing to report
         // that the linked-accounts endpoint does not already say.
@@ -112,7 +112,7 @@ public sealed class SocialIdentityController(
         WechatMiniSignInRequest request,
         CancellationToken cancellationToken)
     {
-        await social.BindWechatMiniAsync(currentUser.RequireUserId(), request, cancellationToken);
+        await social.BindWechatMiniAsync(currentUser.RequireConsumerId(), request, cancellationToken);
 
         return NoContent();
     }
@@ -155,7 +155,7 @@ public sealed class SocialIdentityController(
     [ProducesResponseType(StatusCodes.Status409Conflict)]
     public async Task<IActionResult> LineBind(LineSignInRequest request, CancellationToken cancellationToken)
     {
-        await social.BindLineAsync(currentUser.RequireUserId(), request, cancellationToken);
+        await social.BindLineAsync(currentUser.RequireConsumerId(), request, cancellationToken);
 
         return NoContent();
     }
@@ -218,7 +218,7 @@ public sealed class SocialIdentityController(
         FirebaseSignInRequest request,
         CancellationToken cancellationToken)
     {
-        await social.BindFirebaseAsync(currentUser.RequireUserId(), request, cancellationToken);
+        await social.BindFirebaseAsync(currentUser.RequireConsumerId(), request, cancellationToken);
 
         return NoContent();
     }
@@ -257,7 +257,7 @@ public sealed class SocialIdentityController(
         CancellationToken cancellationToken)
     {
         await social.UnbindAsync(
-            currentUser.RequireUserId(),
+            currentUser.RequireConsumerId(),
             identityType,
             provider ?? SocialProviders.None,
             cancellationToken);

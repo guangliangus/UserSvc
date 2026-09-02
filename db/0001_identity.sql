@@ -68,11 +68,25 @@ CREATE INDEX IF NOT EXISTS ix_user_identities_user_id
     ON identity.user_identities (user_id);
 
 -- --------------------------------------------------------- user_sessions
+--
+-- user_id ALONE IDENTIFIES NOBODY. It holds an id from one of two tables that number their rows
+-- independently - identity.users (consumers) and iam.backend_users (back office) - so realm is the
+-- other half of the subject and every index keyed on the subject leads with it. See the realm
+-- column below.
+--
+-- current_refresh_token_hash and refresh_expires_at are NOT created here any more. 0002 drops both
+-- (OpenIddict owns refresh tokens now) and has been applied everywhere, so creating them here only
+-- meant a fresh database grew two columns for one script's worth of time, the generated EF script
+-- reported them as gate-04 drift, and - because CREATE TABLE IF NOT EXISTS skips an existing table
+-- while the CREATE INDEX below did not skip a missing column - re-running this script against any
+-- database that had had 0002 applied failed outright. 0002's DROP ... IF EXISTS statements stay
+-- where they are as the record of the change and are now no-ops.
 CREATE TABLE IF NOT EXISTS identity.user_sessions
 (
-    id                         SERIAL NOT NULL,
+    id                         SERIAL      NOT NULL,
     session_id                 TEXT        NOT NULL,
     user_id                    INTEGER     NOT NULL,
+    realm                      TEXT        NOT NULL,
     device_id                  TEXT        NOT NULL,
     device_name                TEXT        NOT NULL DEFAULT '',
     platform                   TEXT        NOT NULL,
@@ -81,32 +95,120 @@ CREATE TABLE IF NOT EXISTS identity.user_sessions
     user_agent                 TEXT        NOT NULL DEFAULT '',
     status                     TEXT        NOT NULL DEFAULT 'ACTIVE',
     revoked_by                 TEXT        NOT NULL DEFAULT '',
-    current_refresh_token_hash TEXT        NOT NULL DEFAULT '',
     created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
-    refresh_expires_at         TIMESTAMPTZ NOT NULL,
     revoked_at                 TIMESTAMPTZ,
-    CONSTRAINT pk_user_sessions PRIMARY KEY (id)
+    CONSTRAINT pk_user_sessions PRIMARY KEY (id),
+    CONSTRAINT chk_user_sessions_realm CHECK (realm IN ('CONSUMER', 'BACKOFFICE'))
 );
+
+-- ----------------------------------------------- user_sessions · realm
+-- NO DEFAULT ON THE COLUMN, and that is the whole point of the three steps below.
+--
+-- A default is the database quietly answering a question the writer failed to answer, which is the
+-- bug being fixed one layer down: the reason this column exists is that a session was creatable
+-- without saying whose it was. With no default, an INSERT that omits realm fails on the NOT NULL
+-- instead of being labelled CONSUMER and looking correct. The domain aggregate cannot be
+-- constructed without a realm either; this is the same rule where it can actually be enforced.
+--
+-- A default would also be needed only to make the column addable to a populated table, and it is
+-- not: adding it NULLABLE costs nothing (PostgreSQL rewrites no rows), the existing rows are then
+-- labelled deliberately, and SET NOT NULL closes it. Nothing is ever labelled by omission.
+ALTER TABLE identity.user_sessions
+    ADD COLUMN IF NOT EXISTS realm TEXT;
+
+-- Label rows written before the column existed, FROM EVIDENCE AND PER ROW rather than in bulk.
+-- ADD COLUMN ... DEFAULT 'CONSUMER' would have stamped every existing row, and on the live database
+-- nine of the twenty-two were back-office sessions (read 2026-09-02). A mislabelled row does not
+-- fail loudly - a refresh only looks a session up by its sid, which is realm-free - it just stops
+-- being manageable by its owner and becomes revocable by a stranger who shares its integer.
+--
+-- The evidence is the OpenIddict authorization the session already points at: a back-office grant
+-- asks for the 'backoffice' scope and a consumer device login does not. Only NULL rows are touched,
+-- so a re-run cannot relabel a row the application has since written itself.
+--
+-- The guard is for script order. On a fresh database 0002 has not run yet, so neither the openiddict
+-- schema nor user_sessions.authorization_id exists - and there is nothing to label either, because
+-- the table was just created. The UPDATE is inside the IF for that reason: PL/pgSQL parses a
+-- statement when it first reaches it, so on a fresh database the reference to authorization_id is
+-- never parsed. Where the openiddict schema does exist, 0002 has run and so has that column.
+DO $realm_backfill$
+BEGIN
+    IF to_regclass('openiddict.openiddict_authorizations') IS NULL THEN
+        RETURN;
+    END IF;
+
+    UPDATE identity.user_sessions s
+       SET realm = CASE
+                       WHEN a.scopes LIKE '%"backoffice"%' THEN 'BACKOFFICE'
+                       ELSE 'CONSUMER'
+                   END
+      FROM openiddict.openiddict_authorizations a
+     WHERE s.realm IS NULL
+       AND a.id::text = s.authorization_id;
+END
+$realm_backfill$;
+
+-- A row whose authorization is gone carries no evidence of its realm, so its realm is not guessed
+-- at: it is revoked. That puts it outside every partial index and outside every active-session
+-- query, so the label it has to carry can no longer be read by any code path, and it costs its
+-- holder one sign-in. Guessing instead would hand somebody a stranger's device to sign out.
+UPDATE identity.user_sessions
+   SET realm      = 'CONSUMER',
+       status     = 'REVOKED',
+       revoked_by = 'ADMIN',
+       revoked_at = COALESCE(revoked_at, now())
+ WHERE realm IS NULL;
+
+ALTER TABLE identity.user_sessions
+    ALTER COLUMN realm SET NOT NULL;
+
+-- ADD CONSTRAINT has no IF NOT EXISTS; a fresh database already carries it from CREATE TABLE.
+DO $realm_check$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'chk_user_sessions_realm'
+           AND conrelid = 'identity.user_sessions'::regclass
+    ) THEN
+        ALTER TABLE identity.user_sessions
+            ADD CONSTRAINT chk_user_sessions_realm CHECK (realm IN ('CONSUMER', 'BACKOFFICE'));
+    END IF;
+END
+$realm_check$;
 
 COMMENT ON TABLE  identity.user_sessions IS 'One sign-in on one device = one row = one refresh token family chain';
 COMMENT ON COLUMN identity.user_sessions.session_id IS 'The access token sid claim; server-generated and the only trustworthy session id';
 COMMENT ON COLUMN identity.user_sessions.device_id IS 'Client-reported and forgeable: display and de-duplication only, never a security boundary';
+COMMENT ON COLUMN identity.user_sessions.user_id IS 'Subject id within realm; identity.users.id or iam.backend_users.id';
+COMMENT ON COLUMN identity.user_sessions.realm IS 'CONSUMER | BACKOFFICE';
 COMMENT ON COLUMN identity.user_sessions.status IS 'ACTIVE | REVOKED';
 COMMENT ON COLUMN identity.user_sessions.revoked_by IS
     'SELF | OTHER_DEVICE | SUPERSEDED | PASSWORD_CHANGE | ADMIN | TOKEN_REPLAY';
 COMMENT ON COLUMN identity.user_sessions.last_seen_at IS 'Updated on token refresh only; writing on every request is write amplification';
 
+-- Realm-free on purpose, and the only index here that is. A session_id is a server-generated GUID
+-- and this index is what makes it resolve to exactly one row across both planes; per-realm
+-- uniqueness would let one sid name two sessions, and the refresh, replay and sign-out paths hold
+-- nothing but the sid.
 CREATE UNIQUE INDEX IF NOT EXISTS ix_user_sessions_session_id
     ON identity.user_sessions (session_id);
-CREATE INDEX IF NOT EXISTS ix_user_sessions_user_id
-    ON identity.user_sessions (user_id);
--- One user on one device may hold at most one active session.
-CREATE UNIQUE INDEX IF NOT EXISTS ix_user_sessions_user_id_device_id
-    ON identity.user_sessions (user_id, device_id) WHERE status = 'ACTIVE';
--- Refresh looks a session up by its current hash; indexing active rows keeps revoked ones out.
-CREATE INDEX IF NOT EXISTS ix_user_sessions_current_refresh_token_hash
-    ON identity.user_sessions (current_refresh_token_hash) WHERE status = 'ACTIVE';
+
+-- The subject's whole session history, active and revoked - the one read the partial index below
+-- cannot serve. Realm leads: both columns are always equality predicates, so its two distinct
+-- values cost nothing in that position, and a user_id-only prefix is exactly the cross-realm
+-- lookup this column exists to remove.
+DROP INDEX IF EXISTS identity.ix_user_sessions_user_id;
+CREATE INDEX IF NOT EXISTS ix_user_sessions_realm_user_id
+    ON identity.user_sessions (realm, user_id);
+
+-- One subject on one device may hold at most one active session - and one subject is
+-- (realm, user_id). Keyed on user_id alone this index made consumer 100 and back-office 100
+-- collide from the same device_id, so whichever of them signed in second could not sign in at all;
+-- the device-limit eviction and "sign out my other devices" both walk it and both crossed planes.
+DROP INDEX IF EXISTS identity.ix_user_sessions_user_id_device_id;
+CREATE UNIQUE INDEX IF NOT EXISTS ix_user_sessions_realm_user_id_device_id
+    ON identity.user_sessions (realm, user_id, device_id) WHERE status = 'ACTIVE';
 
 -- -------------------------------------------------------- outbox_messages
 -- Decision 16: rows here are inserted in the same transaction as the business row. This is the

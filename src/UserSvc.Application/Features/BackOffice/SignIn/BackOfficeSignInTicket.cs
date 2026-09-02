@@ -27,13 +27,17 @@ namespace UserSvc.Application.Features.BackOffice.SignIn;
 /// </para>
 /// <para>
 /// <b>It is a bearer credential for the account it names.</b> Hence a two-minute life, hence a
-/// domain-separated HMAC, and hence <see cref="ExpiresAt"/> being written by the issuer rather
-/// than read from the caller. What it is <i>not</i> is single-use: this service has no
-/// consume-once store to put one in, so a stolen ticket can be redeemed more than once inside its
-/// window. The cost is bounded by what redemption produces - a device session that supersedes the
-/// previous one on the same device id, so the second redemption evicts the first rather than
-/// running beside it - and by the window itself. See the follow-ups: a redemption marker in the
-/// revocation store is the fix.
+/// domain-separated HMAC, and hence <see cref="ExpiresAt"/> and <see cref="TicketId"/> being
+/// written by the issuer rather than read from the caller.
+/// </para>
+/// <para>
+/// <b>And hence single-use.</b> Being self-contained is what makes it cheap and is also what makes
+/// it replayable: any replica with the key can verify it, and nothing anywhere remembers that it
+/// has been spent. <see cref="TicketId"/> plus a fail-closed claim in
+/// <see cref="Ports.Platform.ISingleUseMarkerStore"/> is the smallest state that closes that -
+/// one key per ticket, expiring when the ticket does. The redemption path claims it before it does
+/// anything else; a second redemption inside the window is refused with the same words as an
+/// expired one.
 /// </para>
 /// </summary>
 /// <param name="UserId">The back-office account. An <c>iam.backend_users</c> id, never a consumer
@@ -67,11 +71,57 @@ public sealed record BackOfficeSignInTicket(
     public long ExpiresAt { get; init; }
 
     /// <summary>
+    /// This ticket's own id, and the thing the consume-once marker is keyed on. Set by
+    /// <see cref="BackOfficeSignInTicketService.Issue"/> from a cryptographic random source;
+    /// whatever a caller supplies is overwritten.
+    /// <para>
+    /// <b>Unpredictable rather than merely unique.</b> A counter or a timestamp would be unique
+    /// enough to key a marker on and would also let anybody claim the id of a ticket that has not
+    /// been issued yet - burning a sign-in for somebody who has not made it, over and over. It is
+    /// not derivable from the account either: two sign-ins by one operator are two tickets, and
+    /// redeeming the first must not spend the second.
+    /// </para>
+    /// </summary>
+    [JsonPropertyName("jti")]
+    public string TicketId { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Written by <see cref="ForContext"/> when the sign-in <b>finished</b> even though it resolved
+    /// to no acting context - an account that is not yet ACTIVE, or one nobody has added to a
+    /// tenant. It is what separates that outcome from a sign-in that still has a choice to make,
+    /// and both look identical in <see cref="ActType"/>.
+    /// <para>
+    /// <b>It has to be on the ticket, because the redeemer is the party that needs it and cannot
+    /// derive it.</b> <see cref="ContextRequired"/> used to be <c>ActType.Length == 0</c>, which is
+    /// true of both outcomes, so the token endpoint minted a pre-tenant credential for a sign-in
+    /// the REST response had already reported as complete (<c>contextRequired: false</c>,
+    /// <c>grantedScope: backoffice</c>) and audited as an arrival. A client obeying that response
+    /// and asking for <c>backoffice</c> was then refused <c>invalid_scope</c>; a client asking for
+    /// nothing got a five-minute token that answers 403 on <c>/back-office/me</c>. Either way a
+    /// freshly created operator could sign in and never obtain a usable credential - the exact
+    /// failure the two "hand them a session anyway" branches of the decision tree exist to prevent.
+    /// </para>
+    /// <para>
+    /// <b>False is the safe default, which is why the flag is phrased this way round.</b> A ticket
+    /// minted by an older build carries no <c>cs</c> member, so it deserializes to <c>false</c> and
+    /// is read as "still needs a context" - a five-minute credential reaching two endpoints. The
+    /// opposite phrasing would have turned every in-flight pre-tenant ticket into a full
+    /// back-office token with a refresh chain for the two minutes after a deployment.
+    /// </para>
+    /// </summary>
+    [JsonPropertyName("cs")]
+    public bool ContextSettled { get; init; }
+
+    /// <summary>
     /// True when this sign-in has not chosen a context and the token minted from it must therefore
     /// be a pre-tenant one.
+    /// <para>
+    /// Both halves are needed: an empty <see cref="ActType"/> alone also describes a finished
+    /// sign-in that resolved to no authority. See <see cref="ContextSettled"/>.
+    /// </para>
     /// </summary>
     [JsonIgnore]
-    public bool ContextRequired => ActType.Length == 0;
+    public bool ContextRequired => ActType.Length == 0 && !ContextSettled;
 
     /// <summary>
     /// The act claim this ticket resolves to, or null for a pre-tenant sign-in and for an account
@@ -90,12 +140,19 @@ public sealed record BackOfficeSignInTicket(
     public static BackOfficeSignInTicket PreTenant(int userId, string actorName, int tokenVersion) =>
         new(userId, actorName, tokenVersion, string.Empty, string.Empty, string.Empty, false);
 
-    /// <summary>A ticket for a sign-in that resolved to one context - or, when <paramref name="act"/>
-    /// is null, to no authority at all.</summary>
+    /// <summary>A ticket for a sign-in that <b>finished</b> - either by resolving to one context,
+    /// or, when <paramref name="act"/> is null, by establishing that this account holds no
+    /// authority at all. Both mint a full back-office token; the second one's authority surface is
+    /// simply empty, which is what lets the shell render and say why.</summary>
     public static BackOfficeSignInTicket ForContext(
         int userId, string actorName, int tokenVersion, ActClaim? act) =>
         act is null
-            ? PreTenant(userId, actorName, tokenVersion)
+            ? new(userId, actorName, tokenVersion, string.Empty, string.Empty, string.Empty, false)
+              {
+                  // The one difference from PreTenant, and the whole point of this branch: the
+                  // sign-in is over, so the credential minted from this ticket is a real one.
+                  ContextSettled = true,
+              }
             : new(userId, actorName, tokenVersion, act.Type, act.Code, act.Dimension, act.IsAdmin);
 }
 
@@ -124,6 +181,13 @@ public sealed class BackOfficeSignInTicketService(
     /// the whole authentication decision rides on this signature.</summary>
     private const int MinimumKeyBytes = 32;
 
+    /// <summary>
+    /// 16 random bytes for the ticket id: 128 bits, the same size as a version-4 GUID and for the
+    /// same reason - the marker store's guarantee is only as good as the id being unguessable and
+    /// never colliding with a ticket somebody else is holding.
+    /// </summary>
+    private const int TicketIdBytes = 16;
+
     public string Issue(BackOfficeSignInTicket ticket)
     {
         ArgumentNullException.ThrowIfNull(ticket);
@@ -134,6 +198,11 @@ public sealed class BackOfficeSignInTicketService(
         var payload = ticket with
         {
             ExpiresAt = (clock.UtcNow + settings.SignInTicketLifetime).ToUnixTimeSeconds(),
+
+            // Minted here and not by the caller, exactly like the expiry: a caller that chose its
+            // own id could reuse one, and two tickets sharing an id means redeeming either spends
+            // both.
+            TicketId = Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(TicketIdBytes)),
         };
 
         var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, BackOfficeSignInJson.Default.BackOfficeSignInTicket);
@@ -198,8 +267,15 @@ public sealed class BackOfficeSignInTicketService(
             throw Invalid();
         }
 
+        // A ticket with no id cannot be claimed in the marker store, so it cannot be established
+        // that it has not already been redeemed - and the fail-closed answer to that is to refuse
+        // it. The only ticket that can be in this state is one an older build minted, so the
+        // consequence is bounded: for the two minutes after a deployment, a sign-in that crossed
+        // the upgrade is answered "sign in again". That is the correct trade against accepting an
+        // unbounded number of replays of any ticket minted before the marker existed.
         if (payload is null
             || payload.UserId <= 0
+            || string.IsNullOrEmpty(payload.TicketId)
             || clock.UtcNow.ToUnixTimeSeconds() > payload.ExpiresAt)
         {
             throw Invalid();
