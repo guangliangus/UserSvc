@@ -5,6 +5,9 @@ using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using UserSvc.Application.Ports.Auth;
+using UserSvc.Application.Ports.BackOffice;
+using UserSvc.Application.Ports.Iam;
+using UserSvc.Application.Ports.Tenancy;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Ports.Users;
@@ -57,11 +60,28 @@ public static class DependencyInjection
         services.AddScoped<IUserSessionRepository, UserSessionRepository>();
         services.AddScoped<IVerificationCodeRepository, VerificationCodeRepository>();
         services.AddScoped<IVerificationTicketConsumer, VerificationCodeRepository>();
+
+        // --- Back-office (schema "iam") ---
+        services.AddScoped<IBackendUserRepository, BackendUserRepository>();
+        services.AddScoped<IBackendIdentityRepository, BackendIdentityRepository>();
+        services.AddScoped<IRoleRepository, RoleRepository>();
+        services.AddScoped<IPermissionRepository, PermissionRepository>();
+        services.AddScoped<IMenuRepository, MenuRepository>();
+        services.AddScoped<IRoleMenuRepository, RoleMenuRepository>();
+        services.AddScoped<IRolePermissionRepository, RolePermissionRepository>();
+        services.AddScoped<IIamAuditLogRepository, IamAuditLogRepository>();
+        services.AddScoped<ITenantMemberRepository, TenantMemberRepository>();
+        // Two slices each declared an IUserTenantRoleRepository over this one table - the RBAC
+        // slice's five-method version and the tenancy slice's three-method one. Only the latter has
+        // an implementation. Qualified rather than folded here, because reconciling them is a
+        // deliberate refactor and not something to smuggle into a registration line.
+        services.AddScoped<UserSvc.Application.Ports.Tenancy.IUserTenantRoleRepository, UserTenantRoleRepository>();
         services.AddSingleton<IClock, SystemClock>();
 
         AddRedis(services, configuration);
         AddNotificationClient(services, configuration);
         AddRiskControl(services);
+        AddStaffDirectory(services);
 
         return services;
     }
@@ -96,6 +116,16 @@ public static class DependencyInjection
     private static void AddRiskControl(IServiceCollection services)
     {
         services.AddSingleton<IRiskControlService, PlaceholderRiskControlService>();
+    }
+
+    /// <summary>
+    /// The corporate staff directory ships as a port with a refusing placeholder until an adapter
+    /// for the real upstream exists (see <see cref="UnavailableStaffDirectory"/>). Replacing this
+    /// one line with the real adapter is the whole cutover - no calling code changes.
+    /// </summary>
+    private static void AddStaffDirectory(IServiceCollection services)
+    {
+        services.AddSingleton<IStaffDirectory, UnavailableStaffDirectory>();
     }
 
     /// <summary>

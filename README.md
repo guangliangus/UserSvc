@@ -31,7 +31,7 @@ tests/
   UserSvc.ArchitectureTests/  ★ 依赖方向、分层约定、源码语言的机器强制
   UserSvc.UnitTests/          聚合与 AppService，端口全 mock
   UserSvc.IntegrationTests/   Testcontainers：真 Postgres + 真 Redis + 真代码路径
-db/                        手动执行的幂等 DDL（0001 identity / 0002 openiddict）
+db/                        手动执行的幂等 DDL（0001-0003 identity / 0004-0007 iam）
 ```
 
 ## 跑起来
@@ -94,7 +94,7 @@ dotnet test  UserSvc.slnx      # 单元 + 架构守卫
 | 2 | 验证码（Redis 限流、调通知服务） | ✅ |
 | 3 | 认证核心（OpenIddict、设备会话、令牌轮换） | ✅ |
 | 4 | 第三方身份（微信 / Firebase / LINE / Passkey） | ⬜ |
-| 5 | 后台账号 + RBAC + 租户 | ⬜ |
+| 5 | 后台账号 + RBAC + 租户 | 🟡 实体/仓储/DDL/契约种子已落地，跨切片端口待归一 |
 
 阶段 3 已端到端验证：设备登录 → 刷新轮换 → **重放已赎回的 token 触发整链撤销**，会话行标记
 `TOKEN_REPLAY`、两条 outbox 行在同一事务落表、Redis 撤销集写入、被撤销会话的 access token

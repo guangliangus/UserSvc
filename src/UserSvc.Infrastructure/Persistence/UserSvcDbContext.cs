@@ -1,5 +1,8 @@
 using Microsoft.EntityFrameworkCore;
 using UserSvc.Domain.Auth;
+using UserSvc.Domain.BackOffice;
+using UserSvc.Domain.Iam;
+using UserSvc.Domain.Tenancy;
 using UserSvc.Domain.Users;
 using UserSvc.Infrastructure.Persistence.Outbox;
 
@@ -14,6 +17,14 @@ public sealed class UserSvcDbContext(DbContextOptions<UserSvcDbContext> options)
 {
     public const string Schema = "identity";
 
+    /// <summary>
+    /// The back-office (IAM) schema. A different bounded context from <see cref="Schema"/>, with no
+    /// foreign key crossing between them: operator accounts and consumer accounts have separate
+    /// lifecycles and separate id spaces, and the schema boundary is what keeps that separation
+    /// enforceable rather than merely documented.
+    /// </summary>
+    public const string BackOfficeSchema = "iam";
+
     public DbSet<User> Users => Set<User>();
 
     public DbSet<UserIdentity> UserIdentities => Set<UserIdentity>();
@@ -21,6 +32,31 @@ public sealed class UserSvcDbContext(DbContextOptions<UserSvcDbContext> options)
     public DbSet<UserSession> UserSessions => Set<UserSession>();
 
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
+
+    // --- Back-office (schema "iam") ---
+    // A different bounded context from the consumer tables above. They share this context only so
+    // that a role change and its audit entry commit together; no foreign key crosses between the
+    // two schemas.
+
+    public DbSet<BackendUser> BackendUsers => Set<BackendUser>();
+
+    public DbSet<BackendIdentity> BackendIdentities => Set<BackendIdentity>();
+
+    public DbSet<Role> Roles => Set<Role>();
+
+    public DbSet<Permission> Permissions => Set<Permission>();
+
+    public DbSet<Menu> Menus => Set<Menu>();
+
+    public DbSet<RolePermission> RolePermissions => Set<RolePermission>();
+
+    public DbSet<RoleMenu> RoleMenus => Set<RoleMenu>();
+
+    public DbSet<IamAuditLog> IamAuditLogs => Set<IamAuditLog>();
+
+    public DbSet<TenantMember> TenantMembers => Set<TenantMember>();
+
+    public DbSet<UserTenantRole> UserTenantRoles => Set<UserTenantRole>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
