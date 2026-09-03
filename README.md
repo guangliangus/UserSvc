@@ -53,7 +53,7 @@ dotnet run --project src/UserSvc.Api        # http://localhost:5080
 和 `Notification:BaseAddress`**——它们是 `[Required]` 且启动时校验，缺失会拒绝启动，而一个
 `localhost` 默认值会让生产静默连错机器。
 
-API 文档：<http://localhost:5080/swagger>　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>
+API 文档：<http://localhost:5080/swagger>（顶部下拉切换 **Consumer API** / **Back office API**——两份独立文档，各自只含本平面的路径）　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>
 
 ### 拿一个令牌
 

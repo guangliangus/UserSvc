@@ -25,6 +25,16 @@ public static class ErrorCodes
     public const string IdentityAlreadyBound = "IDENTITY_ALREADY_BOUND";
     public const string AlreadyRegistered = "ALREADY_REGISTERED";
 
+    /// <summary>
+    /// Unbinding this sign-in method would leave the account with no way in, so the refusal is the
+    /// only useful answer. The passkey flow has said this since the port under
+    /// <see cref="PasskeyLastLoginMethod"/>; this is the same refusal for every other kind of
+    /// identity, which used to answer the generic <see cref="Conflict"/> and therefore could not be
+    /// translated - one sentence per code cannot cover both "that value is taken" and "you are
+    /// about to lock yourself out".
+    /// </summary>
+    public const string LastLoginMethod = "LAST_LOGIN_METHOD";
+
     // --- Sessions and tokens ---
     public const string SessionNotFound = "SESSION_NOT_FOUND";
     public const string InvalidToken = "INVALID_TOKEN";

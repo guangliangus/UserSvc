@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using UserSvc.Application.Errors;
+using UserSvc.Application.Features.Localization;
 using UserSvc.Application.Ports.External;
 using UserSvc.Application.Ports.Feedback;
 using UserSvc.Application.Ports.Platform;
@@ -75,17 +76,20 @@ public sealed class FeedbackAppService(
     /// <summary>
     /// The active categories, localized for the caller's language.
     /// <para>
-    /// It takes the raw header value rather than a resolved locale so that the normalization is
-    /// covered by this service's own tests instead of depending on whatever the controller happens
-    /// to pass. Nothing here is per-user: the list is the same for everyone in a given language,
-    /// and the endpoint deliberately never learns who is asking.
+    /// <paramref name="language"/> is normalized through <see cref="SupportedLocales"/> - the same
+    /// table the error-message bundles are keyed by, so a client cannot be answered in one language
+    /// by this endpoint and another by the next. It accepts a raw header value as readily as an
+    /// already-negotiated locale, because normalization is idempotent and this service should not
+    /// depend on which of the two its caller happens to hold. Nothing here is per-user: the list is
+    /// the same for everyone in a given language, and the endpoint deliberately never learns who is
+    /// asking.
     /// </para>
     /// </summary>
     public async Task<IReadOnlyList<FeedbackTypeResponse>> ListTypesAsync(
         string? language,
         CancellationToken cancellationToken)
     {
-        var locale = RequestLocales.Normalize(language);
+        var locale = SupportedLocales.Normalize(language);
         var types = await feedback.ListActiveTypesAsync(cancellationToken);
 
         // The repository's order is the drop-down's order and is preserved exactly. An empty

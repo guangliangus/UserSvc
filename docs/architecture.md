@@ -36,6 +36,10 @@ C 端用户 1 的完整 `GET /api/v1/user/profile`；`DELETE /api/v1/account` �
 | 层 | 做法 |
 |---|---|
 | 会话表 | `identity.user_sessions.realm`（`CONSUMER` \| `BACKOFFICE`），聚合与仓储只收 `SessionSubject`，没有默认值也没有回落。`SessionSubject` 没有公开构造函数，所以调用点**没法忘记** realm——这是它和"带默认值的参数"的全部区别 |
+| 路由 | **`/api/v{n}/back-office/**` 是 B 端，其余是 C 端**，前缀即平面。`PlaneSeparationTests` 让"目录在 BackOffice 下但路由不在该前缀"、"路由在该前缀但类不在该目录"两种情况都构建失败。曾经跨在 `/api/v{n}/auth/` 下的五个后台端点已迁走 |
+| 授权 | B 端 controller 必须带 `BackOfficePolicies.BackOffice` 或 `TenantSelection`（或整类 `[AllowAnonymous]`，登录门）。**裸 `[Authorize]` 不算**——两个平面同一个 OpenIddict 实例，消费者令牌照样满足它。`RbacController` / `MenuController` 就是这么漏的：消费者 1 的设备令牌 200 读到全部 11 个角色、39 条权限和整棵菜单树，并 201 建出一个角色，因为 `iam.backend_users` 的 1 号恰好是平台超管 |
+| 契约 | 两个平面**不共用任何 request/response 类型**，同样由 `PlaneSeparationTests` 强制。今天两边长得一样也各写各的：后台要加的字段会变成 App 必须被告知忽略的字段 |
+| 文档 | OpenAPI 出两份——`/openapi/v1.json` 只含 C 端，`/openapi/back-office-v1.json` 只含 B 端，`/connect/token` 因为给两个平面发令牌而故意同时出现在两份里 |
 | 端点 | C 端端点取 id 一律走 `ICurrentUser.RequireConsumerId()`，不是 `RequireUserId()`；后台令牌得到 403 `FORBIDDEN`（不是 401：调用方已认证，请求也没什么可改的） |
 
 ### realm 这一列为什么没有 DEFAULT
@@ -388,7 +392,89 @@ Go 服务不用 RabbitMQ，本服务也不引。但 `identity.outbox_messages` �
 而且不报任何错。
 
 当前没有消费者，所以 outbox 是一份持久事件日志（重放检测这类安全事件值得留痕）。等真正的集成机制定下来，
-加一个投递器读它即可，业务代码一行不动。
+加一个投递器读它即可，业务代码一行不动。那个投递器最可能就是下一节这个队列的第一个 handler——
+它要的正好是「带重试、和造成它的那次写在同一个事务里入队」，见
+[`known-open.md` 第 9 条](known-open.md)。
+
+## 异步任务：`identity.task_queues`，机制齐、默认关、还没有 handler
+
+Go 的 `internal/service/task`（runner + fixer + 仓储六个操作）整体移过来了，队列表是
+`identity.task_queues`（`db/0014_task_queues.sql`，脚本头里逐条写了 schema 选择、为什么物理删、
+索引为什么不照抄 Go 的）。RabbitMQ 两边都不引：**这张表给的正是 broker 给不了的东西**——
+造成这份工作的那一行和记录这份工作的那一行，在同一个事务里提交。
+
+今天**没有任何 handler**，因此也没有生产者和消费者。Go 那边唯一的 handler 是 FCM 主题同步，
+按用户的明确划分属于 notification service，所以这里只移机制。缺口和它的代价见
+[`known-open.md` 第 9 条](known-open.md)。
+
+### `Tasks:WorkerCount = 0` 是出厂默认，也是 kill switch
+
+runner 和 reclaim 两个 `BackgroundService` 各自读它，为 0 就直接 `return`：不轮询、不起定时器、
+不占连接，各打一行日志说自己关着。这一条让一个镜像服务两种部署形态（决策 02）：API pod 留 0，
+worker pod 给正数，撤掉 worker 是改配置而不是发版。
+
+**这个检查必须在 runner 自己里面。** Go 把它放在调用方（`fcm_topic_sync/lifecycle.go:29`），而
+`task/runner.go:45` 反过来把 `WorkerCount <= 0` 提升成 1 —— 于是第二个队列、第二个 lifecycle、
+或者任何直接从配置构造 runner 的测试，都会在配置说"不要 worker"的地方拿到一个活的 worker。
+
+实测（2026-09-03，真宿主 + 活库 `lion_user`）：注册了 handler、表里躺着一行已到期的任务、
+不给任何 `Tasks__*` 覆盖 —— 12 秒零投递，`popped_by` 是空串，`pg_stat_user_tables.idx_scan`
+一次没动。只把 `Tasks__WorkerCount` 改成 1，同一批行立刻被领走、处理、删掉。
+
+### handler 必须幂等，而且 Delete/ReArm 归 handler 不归 runner
+
+投递是 at-least-once，而且原因是结构性的：handler 先做副作用、再记录做过了，这两步之间 pod 会被
+OOM kill。行还是 popped，reclaim 放开它，**同一个任务带着已经做完的副作用再来一次**。
+
+`HandleAsync` 因此返回裸 `Task`，不返回结果让 runner 去解释。三个理由：
+① handler 自己的写和它的 `DeleteAsync` 可以共用一个事务，runner 事后再删就必然是第二个事务，
+那个崩溃窗口就永久关不掉了；② "失败"不是一件事 —— payload 坏了要永久 Delete、远端 503 要带
+backoff ReArm、部分成功要只重试剩下的，只有 handler 分得清；③ 重试预算是领域状态，
+只有 handler 知道这一次有没有取得进展。
+
+**runner 对异常只做一件事：记日志。** 行留在 popped，`Tasks:StalePoppedTimeout` 之后由 reclaim
+放开，所以抛异常等于选了「慢速重试」——**而且这个重试没有上限**。实测：一个每次都抛的 handler
+在 40 秒里被投递 11 次，`Tasks:MaxAttempts=2` 完全没有作用，因为**这条路上没有任何东西在计数**。
+`MaxAttempts` 只是一个配置值加一行启动日志；真要生效得靠 handler 自己的计数器（自己的表或
+`payload_json`）加自己的 `DeleteAsync`。终态是删除而不是留一行：那个 `(queue_name, task_id)`
+槽位必须腾出来，否则同一个对象再也不能重新入队。
+
+### stale 回收故意不碰重试计数，代价是容忍重复执行
+
+reclaim 只把 popped 超过 `StalePoppedTimeout` 的行放开，其余一概不动，也不按队列过滤（崩掉的 pod
+在服务哪个队列，它没留下任何痕迹）。不动 attempt 计数是决定不是遗漏：崩之前已经做过副作用的
+worker 不该因为崩了而丢预算，崩之前什么都没做的 worker 也没花掉预算。`deliver_on` 同样不动——
+Go 在这里写 `NOW()`，等于把等得最久的那一行排到本优先级带的最后。
+
+代价写清楚：**reclaim 分不清「worker 死了」和「worker 还在跑，只是比超时慢」**，于是它会放开一个
+仍在执行中的任务的行。实测（`TaskTimeout=0`、`StalePoppedTimeout=4s`、一个不返回的 handler）：
+同一行 15 秒里被投递 4 次（每 5 秒一次，也就是超时加一个 reclaim tick），4 个副本同时在跑，
+把这个 pod 的 worker 槽位全占满，之后队列里别的任务一个也不动。
+
+所以 **`Tasks:TaskTimeout` 必须明显小于 `Tasks:StalePoppedTimeout`**，出厂是 5 分钟对 10 分钟：
+差出来的那 5 分钟是"被取消的 handler 收摊"的窗口。两个值最初都写成 10 分钟（等于没有余量），
+是这一轮实测出来才改的，`TaskQueueOptionsTests` 现在守着它。handler 拿到的 `CancellationToken`
+只表示"你超时了"，**永远不表示"要关机了"**：关机不打断在飞的任务，只停止领新的然后等
+（`Tasks:DrainTimeout`，5 秒，Go 的 `APP_SHUTDOWN_TIMEOUT`；这两个 hosted service 在 `Program.cs`
+里注册在最后，所以反序停止时它们最先被 drain）。
+
+### 时钟只有一个，是 PostgreSQL 的
+
+入队、re-arm、stale cutoff、`deliver_on <= now()` 全部由数据库求值，port 收 `TimeSpan` 而不是绝对
+时刻。Go 混用了两个（`Pop` 比服务器的 `NOW()`，`ReArmTx` 和 `RecoverStale` 用 pod 的 `time.Now()`）：
+pod 时钟漂多少，每个 backoff 窗口和每个 cutoff 就错多少，而症状（重试早了/晚了）读起来像调参问题。
+
+### 部署顺序：DDL 先行，代码后发。发反了会很吵，但看得见
+
+决策 14 在这里有具体后果。实测：在 `db/0001`–`0013` 已应用、`0014` 没应用的库上启动 —— 宿主正常起、
+`/health/live` 与 `/health/ready` 都 200，队列每个 short poll 打一条 Error，指名
+`42P01: relation "identity.task_queues" does not exist`。这是**故意吵**：默认 2 秒一条，
+一天四万多条；但一个静默降级的队列会让人以为任务已经跑过了。补上脚本即恢复，不用重启。
+
+`Tasks` 段本身写坏也只弄坏队列。实测四种坏法（`ShortPollInterval=banana`、`WorkerCount=lots`、
+`WorkerCount=4096` 越界、整段给成一个标量）：宿主都起得来、consumer 文档 31 个路径都在、
+真实请求照样返回带 `errorCode` 和 `traceId` 的 RFC 9457 400，只有队列关着，
+并打一行指名 `Tasks` 段的 Error。第四种（标量）绑成默认值，于是走 kill switch 那条路。
 
 ## 日志抽象可以进内环，日志实现不行
 
@@ -432,7 +518,7 @@ startup project 必须是 `UserSvc.Infrastructure`：`Microsoft.EntityFrameworkC
 | `reset_password` | 正常发码（200） | `400 UNREGISTERED` | 该标识符**是否已注册**（成功=已注册，报错=未注册） |
 | `bind` | `409 IDENTITY_ALREADY_BOUND` | 正常发码（200） | 该标识符**是否已绑定/已注册**（报错=已注册，成功=未注册） |
 | `auth` / `backoffice_auth` | 不查库，无差异 | 不查库，无差异 | 无——注册与验证码登录共用，发码时本就不该知道目标是否存在 |
-| `backoffice_reset_password` | 正常发码（200） | **也是 200，同一句 `Verification code sent successfully`**，且不写 code 行、不发信 | 错误码这一层**没有**——这是本表唯一一个有意关掉的，理由与残留的两条侧信道见下一节。说实话的地方只剩**提交那头**（`POST /api/v1/auth/back-office/password-reset` 仍答 `400 UNREGISTERED` / `403 ACCOUNT_DISABLED`），而走到那里必须先持有一张对着该邮箱铸出来的 ticket |
+| `backoffice_reset_password` | 正常发码（200） | **也是 200，同一句 `Verification code sent successfully`**，且不写 code 行、不发信 | 错误码这一层**没有**——这是本表唯一一个有意关掉的，理由与残留的两条侧信道见下一节。说实话的地方只剩**提交那头**（`POST /api/v1/back-office/auth/password-reset` 仍答 `400 UNREGISTERED` / `403 ACCOUNT_DISABLED`），而走到那里必须先持有一张对着该邮箱铸出来的 ticket |
 
 两个路由都是 `[AllowAnonymous]`，所以泄露对象是**任意匿名调用方**。`/verify` 不做身份查询，
 不在此列。
@@ -469,7 +555,7 @@ startup project 必须是 `UserSvc.Infrastructure`：`Microsoft.EntityFrameworkC
 - 它问的表是**运营目录**，不是客户库。匿名调用方逐个确认「某个企业邮箱是不是运营账号」，
   得到的是一份**对后台控制台有权限的人名单**——企业邮箱本身是可猜的，所以这一步把可猜的命名空间
   换成了确定的特权用户清单。这比 C 端「这个人是不是客户」重一档。
-- **决定性的一条是内部一致性。** 同一个平面的密码门（`POST /api/v1/auth/back-office/login`）
+- **决定性的一条是内部一致性。** 同一个平面的密码门（`POST /api/v1/back-office/auth/login`）
   已经为关掉同一个预言机付过钱：未知邮箱与错密码的响应完全相同，`BackOfficePasswordTiming`
   还专门在 miss 上补跑一次 Argon2id，因为实测未知邮箱 3.6ms、错密码 52.3ms。发码这头答
   `UNREGISTERED`，等于从另一个端点把那笔钱原样退回去——两个端点问的是同一张表的同一个问题。

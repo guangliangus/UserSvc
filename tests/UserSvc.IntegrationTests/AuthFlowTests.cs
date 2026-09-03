@@ -53,7 +53,7 @@ public sealed class AuthFlowTests(ServiceFixture fixture) : IntegrationTest(fixt
     /// The consumer plane and the back-office plane number their accounts independently, and this
     /// grant authenticates the consumer one. Before it was checked, a device login that simply added
     /// <c>scope=backoffice</c> to the form came back with a token that answered
-    /// <c>GET /api/v1/user/profile</c> as consumer <c>N</c> and <c>GET /api/v1/auth/tenants</c> with
+    /// <c>GET /api/v1/user/profile</c> as consumer <c>N</c> and <c>GET /api/v1/back-office/tenants</c> with
     /// back-office account <c>N</c>'s tenant memberships - one credential, two different people.
     /// </summary>
     [RequiresDockerTheory]

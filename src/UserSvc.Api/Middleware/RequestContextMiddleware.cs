@@ -162,22 +162,37 @@ public sealed class RequestContextMiddleware(RequestDelegate next)
         }
     }
 
-    private static bool IsGated(PathString path, IReadOnlyList<string> gatedPrefixes)
+    /// <summary>
+    /// Whether the header requirement can never apply to this path, whatever the configuration
+    /// says. Internal because <c>RequestHeadersOperationTransformer</c> has to ask the same
+    /// question: a document that offered these headers on the OAuth endpoint would be describing a
+    /// contract this middleware does not enforce there.
+    /// </summary>
+    internal static bool IsExempt(PathString path)
     {
-        if (gatedPrefixes.Count == 0)
-        {
-            return false;
-        }
-
         var value = path.Value ?? string.Empty;
 
         foreach (var exempt in NeverRequired)
         {
             if (PathPrefix.Matches(value, exempt))
             {
-                return false;
+                return true;
             }
         }
+
+        return false;
+    }
+
+    /// <summary>Whether the four headers are mandatory on this path. Internal for the same reason
+    /// as <see cref="IsExempt"/>: the document's <c>required</c> flag is this exact answer.</summary>
+    internal static bool IsGated(PathString path, IReadOnlyList<string> gatedPrefixes)
+    {
+        if (gatedPrefixes.Count == 0 || IsExempt(path))
+        {
+            return false;
+        }
+
+        var value = path.Value ?? string.Empty;
 
         foreach (var prefix in gatedPrefixes)
         {
@@ -206,17 +221,17 @@ public sealed class RequestContextMiddleware(RequestDelegate next)
 
         if (request.Platform.Length == 0)
         {
-            missing.Add("X-Platform");
+            missing.Add(RequestContextAccessor.PlatformHeader);
         }
 
         if (request.DeviceId.Length == 0)
         {
-            missing.Add("X-Device-ID");
+            missing.Add(RequestContextAccessor.DeviceIdHeader);
         }
 
         if (request.RequestId.Length == 0)
         {
-            missing.Add("X-Request-ID");
+            missing.Add(RequestContextAccessor.RequestIdHeader);
         }
 
         if (request.RawLanguage.Length == 0)

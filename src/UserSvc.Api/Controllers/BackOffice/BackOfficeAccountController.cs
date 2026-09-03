@@ -21,7 +21,7 @@ namespace UserSvc.Api.Controllers.BackOffice;
 /// status or a token: the account it just changed belongs to whoever proved the mailbox, and the
 /// only thing this endpoint could add to a bare "done" is a fact about an account that an anonymous
 /// caller has no business collecting. Signing in afterwards happens where it always does,
-/// <c>POST /auth/back-office/login</c> then <c>/connect/token</c>.
+/// <c>POST /back-office/auth/login</c> then <c>/connect/token</c>.
 /// </para>
 /// <para>
 /// <b>The refusals here name what happened, and the send-code half of the same flow does not.</b>
@@ -34,7 +34,7 @@ namespace UserSvc.Api.Controllers.BackOffice;
 [ApiController]
 [AllowAnonymous]
 [ApiVersion("1.0")]
-[Route("api/v{version:apiVersion}/auth/back-office")]
+[Route("api/v{version:apiVersion}/back-office/auth")]
 [Produces("application/json")]
 public sealed class BackOfficeAccountController(BackOfficeAccountAppService accounts) : ControllerBase
 {

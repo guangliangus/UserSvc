@@ -24,7 +24,7 @@ namespace UserSvc.Api.Controllers.BackOffice;
 /// </summary>
 [ApiController]
 [ApiVersion("1.0")]
-[Route("api/v{version:apiVersion}")]
+[Route("api/v{version:apiVersion}/back-office")]
 [Produces("application/json")]
 public sealed class TenantContextController(BackOfficeContextAppService contexts) : ControllerBase
 {
@@ -32,7 +32,7 @@ public sealed class TenantContextController(BackOfficeContextAppService contexts
     /// The contexts this session may enter. Answers for a pre-tenant token too - it is what the
     /// chooser screen is built from.
     /// </summary>
-    [HttpGet("auth/tenants")]
+    [HttpGet("tenants")]
     [Authorize(Policy = BackOfficePolicies.TenantSelection)]
     [ProducesResponseType<TenantListResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
@@ -66,7 +66,7 @@ public sealed class TenantContextController(BackOfficeContextAppService contexts
     /// <response code="403">TENANT_NOT_AUTHORIZED or TENANT_DISABLED - this account may not enter
     /// this tenant, and no correction to the request changes that.</response>
     /// <response code="409">TENANT_INACTIVE - the tenant is switched off in the master data.</response>
-    [HttpPost("auth/context")]
+    [HttpPost("context")]
     [Authorize(Policy = BackOfficePolicies.TenantSelection)]
     [ProducesResponseType<TenantContextResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
@@ -90,7 +90,7 @@ public sealed class TenantContextController(BackOfficeContextAppService contexts
     /// themselves, so authentication is the whole boundary here.
     /// </para>
     /// </summary>
-    [HttpGet("back-office/me")]
+    [HttpGet("me")]
     [Authorize(Policy = BackOfficePolicies.BackOffice)]
     [ProducesResponseType<BackOfficeMeResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]

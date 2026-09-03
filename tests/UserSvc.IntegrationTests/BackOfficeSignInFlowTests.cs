@@ -26,7 +26,7 @@ namespace UserSvc.IntegrationTests;
 /// endpoints and both back-office grants answered 500 <c>NOT_CONFIGURED</c> in <i>every</i>
 /// deployment, and no environment variable could fix it because nothing read the section. Twenty-odd
 /// endpoints were unreachable. The service had 1,281 passing tests and not one of them touched
-/// <c>POST /api/v1/auth/back-office/login</c> or either back-office grant - which is the only
+/// <c>POST /api/v1/back-office/auth/login</c> or either back-office grant - which is the only
 /// reason it survived to be found by a human reading configuration code.
 /// </para>
 /// <para>

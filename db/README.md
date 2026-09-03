@@ -36,7 +36,7 @@ createdb gate04_model && psql -v ON_ERROR_STOP=1 -d gate04_model -f model.sql
 
 然后对比三份投影：列（`information_schema.columns`：名字 / 类型 / 可空 / 默认值）、
 约束（`pg_constraint` + `pg_get_constraintdef`）、索引（`pg_indexes`）。
-2026-09-02 实测：275 列、230 约束、DDL 81 个索引 / 模型 80 个。
+2026-09-03 实测（`db/0014` 的 `identity.task_queues` 已在内）：288 列、244 约束（这个数把 PostgreSQL 18 记进 `pg_constraint` 的 `NOT NULL` 也算上了）、DDL 85 个索引 / 模型 84 个。门禁 04 自己报的是同一批对象的另一种投影：db/ 侧 410 个、模型侧 409 个。
 
 ## 门禁 04 的已知例外
 
@@ -45,7 +45,7 @@ createdb gate04_model && psql -v ON_ERROR_STOP=1 -d gate04_model -f model.sql
 | 对象 | 为什么两边不同 |
 |---|---|
 | `iam.uk_roles_owner_code` | `UNIQUE (owner_type, COALESCE(owner_code, ''), code)` —— 表达式索引，EF Core 无法建模。活库里就是这个形状：`owner_code` 可空，而 `NULL <> NULL`，不加 `COALESCE` 就拦不住同一个 SYSTEM 角色码重复。服务层另有一道全局唯一性检查，比它更严 |
-| **列默认值（一整类，52 处）** | 见下节。**默认值的比对是单向的** |
+| **列默认值（一整类，61 处）** | 见下节。**默认值的比对是单向的** |
 | `iam.*` 与 `identity.user_passkeys` / `identity.feedback*` 的可空字符串列 | 见下节。两边**一致**，只是不符合"尽量 NOT NULL"，写在这里免得每次评审重新发现 |
 | `identity.feedback_types.code` 是 TEXT 主键 | 不符合"自增主键，不用业务字段做主键"。两边一致。它是客户端提交的值、也是 `feedback.type_code` 的外键目标，换成代理键要同时改外键和已发布的 wire 契约，什么也换不来。这个理由跟表里有没有行无关 |
 
@@ -53,8 +53,10 @@ createdb gate04_model && psql -v ON_ERROR_STOP=1 -d gate04_model -f model.sql
 
 ### 例外一：列默认值，比对是单向的
 
-`db/*.sql` 里有 52 个列默认值（`now()` · `''::text` · `'ACTIVE'::text` · `0` · `false` ·
-`'{}'::jsonb`）在 EF 模型里没有对应声明（2026-09-02 实测；类型和可空性零差异）。这**不是漂移**：
+`db/*.sql` 里有 61 个列默认值（`now()` · `''::text` · `'ACTIVE'::text` · `0` · `false` ·
+`'{}'::jsonb`）在 EF 模型里没有对应声明（2026-09-03 实测；类型和可空性零差异。原本是 52 个，
+`db/0014` 的 `identity.task_queues` 又加了 9 个——那张表的默认值**全部只写在 DDL 里**，
+正是下面这张表里安全的那个方向）。这**不是漂移**：
 
 - 列默认值是**数据库**给"不是 EF 的写入者"兜底的——手写脚本、psql、运维改数据。它属于 DDL。
 - EF 只在一种情况下需要知道它：**它要故意不把这列写进 INSERT**。EF 判断"要不要写"的办法是拿

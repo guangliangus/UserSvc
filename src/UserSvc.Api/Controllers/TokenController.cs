@@ -172,7 +172,7 @@ public sealed class TokenController(
         // carried both would be read as two different people by two halves of this service.
         // Measured before this check existed: a device login for consumer 2 that simply asked for
         // scope=backoffice came back with a token that answered GET /api/v1/user/profile as consumer
-        // 2 AND GET /api/v1/auth/tenants with back-office account 2's tenant memberships. Refusing
+        // 2 AND GET /api/v1/back-office/tenants with back-office account 2's tenant memberships. Refusing
         // rather than quietly dropping the scope, because a client that asked for this is confused
         // about which plane it is on and should be told so.
         var backOfficeScopes = request.GetScopes()

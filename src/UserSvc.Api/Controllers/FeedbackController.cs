@@ -1,6 +1,7 @@
 using Asp.Versioning;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using UserSvc.Api.Middleware;
 using UserSvc.Application.Features.Feedback;
 using UserSvc.Application.Ports.Feedback;
 using UserSvc.Application.Ports.Platform;
@@ -28,19 +29,23 @@ namespace UserSvc.Api.Controllers;
 [Produces("application/json")]
 public sealed class FeedbackController(FeedbackAppService feedback, ICurrentUser currentUser) : ControllerBase
 {
-    /// <summary>The language the labels come back in. Anything unrecognised falls back to English.</summary>
-    private const string LanguageHeader = "X-Language";
-
     /// <summary>
     /// The feedback categories, in the order the drop-down should render them.
+    /// <para>
+    /// The language comes from the request context, which is the same negotiation every error
+    /// message in the service goes through: <c>X-Language</c> first, then <c>Accept-Language</c>,
+    /// then English. This route used to read <c>X-Language</c> off the request itself, and the
+    /// difference was visible - a browser that sent only <c>Accept-Language: ja</c> was refused in
+    /// Japanese and offered an English drop-down on the very next call.
+    /// </para>
     /// </summary>
-    /// <response code="200">The active categories, localized to <c>X-Language</c>. Possibly empty.</response>
+    /// <response code="200">The active categories, in the negotiated language. Possibly empty.</response>
     /// <response code="401">No valid token.</response>
     [HttpGet("types")]
     [ProducesResponseType<IReadOnlyList<FeedbackTypeResponse>>(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     public Task<IReadOnlyList<FeedbackTypeResponse>> ListTypes(CancellationToken cancellationToken) =>
-        feedback.ListTypesAsync(Request.Headers[LanguageHeader].ToString(), cancellationToken);
+        feedback.ListTypesAsync(RequestContextAccessor.LocaleOf(HttpContext), cancellationToken);
 
     /// <summary>
     /// Submit feedback, with up to five images attached on the repeated <c>images</c> field.

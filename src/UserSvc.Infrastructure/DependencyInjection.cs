@@ -71,6 +71,13 @@ public static class DependencyInjection
         services.AddScoped<IVerificationCodeRepository, VerificationCodeRepository>();
         services.AddScoped<IVerificationTicketConsumer, VerificationCodeRepository>();
 
+        // The generic async task queue (db/0014_task_queues.sql). Scoped, like every other
+        // repository here, so a producer's business write and its enqueue share one context and
+        // therefore one transaction. Registering the adapter costs nothing at rest: it opens no
+        // connection and starts no poller - the runner's worker count is the switch that does
+        // that, and it ships at zero.
+        services.AddScoped<ITaskQueue, TaskQueueRepository>();
+
         // --- Back-office (schema "iam") ---
         services.AddScoped<IBackendUserRepository, BackendUserRepository>();
         services.AddScoped<IBackendIdentityRepository, BackendIdentityRepository>();

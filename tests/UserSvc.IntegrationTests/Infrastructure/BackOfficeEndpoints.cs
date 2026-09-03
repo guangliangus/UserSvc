@@ -6,7 +6,7 @@ using System.Text.Json;
 namespace UserSvc.IntegrationTests.Infrastructure;
 
 /// <summary>
-/// One entry of the context switcher, as a sign-in or <c>/auth/tenants</c> reports it.
+/// One entry of the context switcher, as a sign-in or <c>/back-office/tenants</c> reports it.
 /// </summary>
 /// <param name="TenantType">company | supplier.</param>
 /// <param name="TenantCode">The tenant's code, or <c>*</c> for a whole-dimension entry.</param>
@@ -15,7 +15,7 @@ namespace UserSvc.IntegrationTests.Infrastructure;
 internal sealed record TenantOption(string TenantType, string TenantCode, bool ScopeAll, bool IsAdmin);
 
 /// <summary>
-/// What <c>POST /api/v1/auth/back-office/login</c> answered, in the shape the assertions need.
+/// What <c>POST /api/v1/back-office/auth/login</c> answered, in the shape the assertions need.
 /// <para>
 /// Parsed field by field out of a <see cref="JsonDocument"/> rather than deserialized into
 /// <c>BackOfficeSignInResponse</c>, following the convention <see cref="ProblemDetailsBody"/> and
@@ -81,14 +81,14 @@ internal sealed record BackOfficeMeBody(
 internal static class BackOfficeEndpoints
 {
     public static readonly Uri PasswordLoginPath =
-        new("/api/v1/auth/back-office/login", UriKind.Relative);
+        new("/api/v1/back-office/auth/login", UriKind.Relative);
 
     public static readonly Uri StaffOtpLoginPath =
-        new("/api/v1/auth/back-office/otp-login", UriKind.Relative);
+        new("/api/v1/back-office/auth/otp-login", UriKind.Relative);
 
-    public static readonly Uri TenantsPath = new("/api/v1/auth/tenants", UriKind.Relative);
+    public static readonly Uri TenantsPath = new("/api/v1/back-office/tenants", UriKind.Relative);
 
-    public static readonly Uri ContextPath = new("/api/v1/auth/context", UriKind.Relative);
+    public static readonly Uri ContextPath = new("/api/v1/back-office/context", UriKind.Relative);
 
     public static readonly Uri MePath = new("/api/v1/back-office/me", UriKind.Relative);
 

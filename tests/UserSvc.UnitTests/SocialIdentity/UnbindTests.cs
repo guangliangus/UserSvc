@@ -70,6 +70,12 @@ public sealed class UnbindTests
     /// <summary>
     /// Without this the owner would be locked out and support could not recover them, because a
     /// social identity is the only thing that could have proved who they are.
+    /// <para>
+    /// The code is pinned because it is the whole reason this refusal has one of its own: it used
+    /// to answer the generic <see cref="ErrorCodes.Conflict"/>, which kept it out of the error
+    /// message bundles - a Thai user was told to add another sign-in method in English or not at
+    /// all.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task TheOnlyWayIntoAnAccountCannotBeUnbound()
@@ -80,7 +86,7 @@ public sealed class UnbindTests
         var thrown = await Should.ThrowAsync<ConflictException>(() =>
             Sut.UnbindAsync(user.Id, IdentityTypes.Line, SocialProviders.None, CancellationToken.None));
 
-        thrown.ErrorCode.ShouldBe(ErrorCodes.Conflict);
+        thrown.ErrorCode.ShouldBe(ErrorCodes.LastLoginMethod);
         _fixture.Store.Identities.ShouldHaveSingleItem().Status.ShouldBe(UserStatuses.Active);
     }
 

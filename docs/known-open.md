@@ -9,8 +9,8 @@
 
 约束本身在 [`architecture.md`](architecture.md)。本文只讲缺口。
 
-核实日期：**2026-09-02**（第 1、3、4、5 条），**2026-09-03**（第 6、7、8 条），
-仓库 HEAD `903d10a`，活库 `lion_user`。
+核实日期：**2026-09-02**（第 1、3、4、5 条），**2026-09-03**（第 6、7、8、9 条），
+仓库 HEAD `903d10a`（第 9 条为 `a66e838` 之后的未提交 wave），活库 `lion_user`。
 每一条都对着代码和活库查过，不是继承来的描述。wave 9 关掉了原第 2 条（后台密码只认
 Argon2id）并重写了第 6 条；它们的代价分别落在新的第 7、8 条上。
 
@@ -138,7 +138,7 @@ SELECT s.realm,
 **第 6 条原来的内容（两头都断、两处注释说假话）在 wave 9 关掉了**，处置写在
 [`architecture.md` 的「`backoffice_reset_password` 为什么反过来关掉了」](architecture.md)：
 发码分支改成调 `BackOfficeResetTargetGate.EvaluateAsync`，提交端有了
-`POST /api/v1/auth/back-office/password-reset`（匿名、204、per-source 预算），
+`POST /api/v1/back-office/auth/password-reset`（匿名、204、per-source 预算），
 两处假注释改成了事实。端到端实测（2026-09-02，本机服务 + 桩通知服务 + 活库）：
 发码 200 → verify 200 拿到 ticket → 提交 204 → `iam.backend_users` 的 hash 变成真的 Argon2id
 （`$argon2id$v=19$m=19456,t=2,p=1`）、`token_version` 0→1、审计表写下
@@ -225,7 +225,7 @@ wave 7 等价化的那三条**仍然等价**——彼此相差 2.6 ms（wave 7 �
 
 | spec 07 §4 的路由 | 对应方法 | 现状 |
 |---|---|---|
-| `POST /api/v1/auth/back-office/register` | `RegisterAsync` | 无路由 |
+| `POST /api/v1/back-office/auth/register` | `RegisterAsync` | 无路由 |
 | `GET /api/v1/back-office/users` | `ListAsync` | 无路由 |
 | `GET /api/v1/back-office/user/options` | `ListOptionsAsync` | 无路由 |
 | `GET /api/v1/back-office/users/{id}`（detail） | 方法本身也没有 | 未实现 |
@@ -240,6 +240,48 @@ wave 7 等价化的那三条**仍然等价**——彼此相差 2.6 ms（wave 7 �
 **关掉它需要什么。** 一个 controller，按 spec 07 §4 接三个路由：register 匿名（域名门在 service 里）、
 两个目录读走 `uam.member.read` 与 `BackOfficePolicies.BackOffice`，`ListOptionsAsync` 按 spec
 故意不要权限码（可见性过滤是它唯一的机密性控制，写在方法注释里）。detail 要先补 app service 方法。
+
+---
+
+## 9 · 异步任务队列有机制、有测试，但**一个生产 handler 都没有**
+
+**开着的是什么。** `identity.task_queues`（`db/0014_task_queues.sql`）、`ITaskQueue` 六个操作、
+`TaskQueueRunner`、`TaskQueueReclaimer`、`ITaskHandler`、`TaskRetryBackoff` 全部就位并且跑通了，
+但**没有任何 `AddTaskHandler<T>()` 调用**，因此这个服务里没有生产者也没有消费者。
+Go 那边唯一的 handler 是 FCM 主题同步，按用户的明确划分属于 notification service，所以这里只移机制。
+出厂 `Tasks:WorkerCount = 0`（Go 也是 0），两个 hosted service 各打一行日志说自己关着就返回。
+约束和实测都在 [`architecture.md` 的「异步任务」一节](architecture.md)。
+
+核实（2026-09-03，跑起来的真宿主 + 活库 `lion_user`）：临时注册一个 handler、
+`Tasks__WorkerCount=1`，三行任务按 priority DESC / deliver_on 的顺序被领走、处理、
+在 handler 自己的事务里删掉，表清空；不给 `Tasks__*` 覆盖时同样一批行 12 秒零投递。
+所以它是**开关关着的活机制**，不是没人跑过的死代码。
+
+**代价是什么。** 三样，按严重程度：
+
+1. **它没有真实负载压过。** 今天的证据是 25 个集成测试、56 个单测和手工跑起来的真宿主，
+   任务全是本仓库自己造的。第一个真 handler 会带来第一批没被预期的形状：
+   payload schema、幂等键怎么选、attempt 计数放哪、handler 崩在哪一半。
+2. **重试没有上限，靠 handler 自觉。** 机制里没有任何东西在计数（实测：每次都抛的 handler
+   40 秒被投递 11 次，`Tasks:MaxAttempts=2` 毫无作用）。第一个 handler 必须自带计数器和
+   `DeleteAsync` 终态，否则一行毒任务会按 `StalePoppedTimeout` 的节奏被永久重试。
+3. **没有任何办法在线问一个 pod「你在消费吗」**，只能翻它的启动日志：没有 health check tag、
+   没有端点、没有 metric（决策 20 的三个信号今天只有 trace 和 log，`src/` 里没有 `WithMetrics`，
+   所以队列深度是一行带 `Depth` 结构化属性的日志，见 `QueueDepthSignal`）。
+   队列关着的时候这不要紧，有 handler 之后就要紧了。
+
+**关掉它需要什么。** 一个真正需要「带重试的后台工作，并且和造成它的那次写原子入队」的能力，
+然后一行 `services.AddTaskHandler<T>()` 加 worker pod 上的 `Tasks:WorkerCount > 0`。
+
+**最可能的第一个就是 outbox 投递器**，而它卡在别的地方：`identity.outbox_messages` 里躺着
+**22 行从来没有被投递过的事件**（2026-09-03 实测活库：22 行、`dispatched_at` 全为 NULL、
+四种事件名、最早 2026-09-01），因为跨服务集成机制用什么**用户还没有决定**（RabbitMQ 已被明确排除）。
+这个队列正是那个投递器要的载体：事件行和任务行在同一个事务里落库，投递失败按 backoff 重排。
+所以本条真正的前置不是写代码，是**那个决策**。决策归属：拥有跨服务集成机制的人。
+
+在那之前，`ITaskHandler` / `TaskQueueOptions` / `db/0014` 的注释里都写着"故意关着，不是忘了"——
+**不要把这句删掉**，它是下一个人判断这堆代码该不该信的唯一依据；本仓库已经被"唯一调用方是自己单测的类型"
+坑过四次，这一次是明知故为，所以要说清楚。
 
 ---
 

@@ -52,11 +52,30 @@ namespace UserSvc.IntegrationTests.Infrastructure;
 /// can have one without switching the lockout on underneath every other test.
 /// </para>
 /// </param>
+/// <param name="configureServices">
+/// Extra service registrations, applied to the container Program.cs has already built.
+/// <para>
+/// It exists for one shape of capability: one whose wiring is <b>a registration rather than a
+/// request</b>, which no HTTP call can reach. The task queue is that shape - its runner discovers
+/// queues from the <c>ITaskHandler</c> implementations somebody registered, and this service ships
+/// with none, deliberately, because the Go original's only handler belongs to the notification
+/// service. So "Program.cs's own wiring really does reach a handler" cannot be proven without
+/// adding one, and adding one to src/ to make a test pass would be exactly the mistake this
+/// repository has made four times: a type whose only caller is its own test.
+/// </para>
+/// <para>
+/// Callbacks registered here run <b>after</b> the application's own registrations, so anything
+/// added is additive and a <c>TryAdd</c> in Program.cs still wins - which is what makes this safe
+/// for adding a handler and wrong for swapping a real adapter out for a fake. One test in this
+/// suite passes it, and it passes a handler.
+/// </para>
+/// </param>
 internal sealed class UserSvcApplicationFactory(
     string postgresConnectionString,
     string redisConfiguration,
     IReadOnlyDictionary<string, string>? overrides = null,
-    string? peerAddress = null) : WebApplicationFactory<Program>
+    string? peerAddress = null,
+    Action<IServiceCollection>? configureServices = null) : WebApplicationFactory<Program>
 {
     /// <summary>Matches appsettings.Development.json, so the Redis keys the assertions look for are
     /// the keys the service actually writes.</summary>
@@ -131,11 +150,15 @@ internal sealed class UserSvcApplicationFactory(
     }
 
     /// <summary>
-    /// Installs the peer-address middleware, when one was asked for.
+    /// Installs the peer-address middleware and any extra registrations, when they were asked for.
     /// <para>
     /// Through <see cref="IStartupFilter"/> rather than a <c>ConfigureWebHost</c> callback because
     /// the address has to be in place before anything reads it, and a startup filter is the one
     /// hook that <b>prepends</b> to the pipeline the application built rather than appending to it.
+    /// </para>
+    /// <para>
+    /// The extra registrations go through the same channel, which is what puts them after
+    /// Program.cs's own - see <c>configureServices</c>.
     /// </para>
     /// </summary>
     protected override IHost CreateHost(IHostBuilder builder)
@@ -146,6 +169,11 @@ internal sealed class UserSvcApplicationFactory(
         {
             builder.ConfigureServices(services => services.AddSingleton<IStartupFilter>(
                 new PeerAddressStartupFilter(IPAddress.Parse(address))));
+        }
+
+        if (configureServices is not null)
+        {
+            builder.ConfigureServices(configureServices);
         }
 
         return base.CreateHost(builder);

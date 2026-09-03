@@ -16,6 +16,14 @@ public sealed class ErrorMessageCatalogTests
     private const int PortedCodeCount = 112;
 
     /// <summary>
+    /// Codes added to the bundles here rather than ported: <c>CONCURRENCY_CONFLICT</c>,
+    /// <c>NOT_IMPLEMENTED</c> and <c>CONFLICT</c>, none of which Go had a message for, plus
+    /// <c>LAST_LOGIN_METHOD</c>, which exists so that <c>CONFLICT</c> could have one. Counted
+    /// separately so the ported figure above stays a statement about the port.
+    /// </summary>
+    private const int AddedCodeCount = 4;
+
+    /// <summary>
     /// The B2B tenant and RBAC vocabulary every operator-facing refusal draws on. A code that falls
     /// back to itself is an untranslated code, not a translation - and these are the ones an
     /// external administrator reads most often, in a language they did not choose.
@@ -43,7 +51,8 @@ public sealed class ErrorMessageCatalogTests
         ErrorCodes.Forbidden, ErrorCodes.NotFound, ErrorCodes.RateLimitExceeded,
         ErrorCodes.UpstreamUnavailable, ErrorCodes.InternalError, ErrorCodes.MissingHeader,
         ErrorCodes.TenantContextRequired, ErrorCodes.InvalidToken, ErrorCodes.ExpiredToken,
-        ErrorCodes.SessionRevoked,
+        ErrorCodes.SessionRevoked, ErrorCodes.ConcurrencyConflict, ErrorCodes.NotImplemented,
+        ErrorCodes.Conflict,
     ];
 
     /// <summary>Every bundle is an embedded resource compiled into the assembly, so the only way to
@@ -54,7 +63,7 @@ public sealed class ErrorMessageCatalogTests
 
     [Fact]
     public void TheWholePortedCatalogueIsPresent() =>
-        ErrorMessageCatalog.All.Count.ShouldBe(PortedCodeCount);
+        ErrorMessageCatalog.All.Count.ShouldBe(PortedCodeCount + AddedCodeCount);
 
     /// <summary>
     /// Adding a language to <see cref="SupportedLocales.All"/> automatically expands the requirement
@@ -131,6 +140,35 @@ public sealed class ErrorMessageCatalogTests
 
         ErrorMessageCatalog.TryTranslate(ErrorCodes.NotConfigured, "ja", out _).ShouldBeFalse();
     }
+
+    /// <summary>
+    /// The generic conflict bucket is translatable only because the one refusal in it that had
+    /// something else to say was given <see cref="ErrorCodes.LastLoginMethod"/>. Both are pinned
+    /// here: if the two ever collapse back into one code, one of these sentences becomes a lie, and
+    /// it would be the one telling a user how to avoid locking themselves out.
+    /// </summary>
+    [Fact]
+    public void TheConflictBucketAndTheLockoutRefusalSayDifferentThings()
+    {
+        var conflict = ErrorMessageCatalog.Translate(ErrorCodes.Conflict, "ja");
+        var lockout = ErrorMessageCatalog.Translate(ErrorCodes.LastLoginMethod, "ja");
+
+        conflict.ShouldNotBe(ErrorCodes.Conflict);
+        lockout.ShouldNotBe(ErrorCodes.LastLoginMethod);
+        conflict.ShouldNotBe(lockout);
+    }
+
+    /// <summary>
+    /// <see cref="ErrorCodes.LastLoginMethod"/> is the general form of
+    /// <c>PASSKEY_LAST_LOGIN_METHOD</c> and deliberately shares its wording - two codes, one
+    /// sentence, because it is the same thing happening to a different credential. Pinned so a
+    /// later edit to one of them does not silently leave the other saying something else.
+    /// </summary>
+    [Fact]
+    public void TheLockoutRefusalReadsTheSameWhicheverCredentialItIsAbout() =>
+        SupportedLocales.Codes.ShouldAllBe(locale =>
+            ErrorMessageCatalog.Translate(ErrorCodes.LastLoginMethod, locale)
+                == ErrorMessageCatalog.Translate(ErrorCodes.PasskeyLastLoginMethod, locale));
 
     /// <summary>
     /// The fallback chain, verbatim from the Go contract: locale, then English, then the code.

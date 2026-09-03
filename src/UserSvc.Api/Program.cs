@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Asp.Versioning;
+using Microsoft.AspNetCore.OpenApi;
 using FluentValidation;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -9,6 +10,7 @@ using UserSvc.Api.Errors;
 using UserSvc.Api.Middleware;
 using UserSvc.Api.Filters;
 using UserSvc.Api.Health;
+using UserSvc.Api.OpenApi;
 using UserSvc.Application.Errors;
 using UserSvc.Application.Features.Auth.TokenValidation;
 using UserSvc.Application.Features.BackOffice.Accounts;
@@ -31,6 +33,7 @@ using UserSvc.Application.Ports.Iam;
 using UserSvc.Application.Ports.Platform;
 using UserSvc.Application.Security;
 using UserSvc.Infrastructure;
+using UserSvc.Infrastructure.Tasks;
 
 // FluentValidation localizes its built-in messages from the ambient thread culture, so on a server
 // whose locale is not English a missing field comes back described in that language - the API's
@@ -92,6 +95,17 @@ builder.Services.AddOptions<BackOfficeAccountOptions>()
 builder.Services.AddOptions<BackOfficeSignInOptions>()
     .Bind(builder.Configuration.GetSection(BackOfficeSignInOptions.SectionName))
     .ValidateDataAnnotations();
+
+// The same lesson as the block above, found the same way - by setting the value and watching
+// nothing happen. Without this Bind, IOptions<RequestContextOptions> hands out a default-
+// constructed instance forever: RequireDeviceHeadersFor is permanently empty, so the header gate
+// cannot be switched on by any configuration a deployment supplies, and the paragraph on that
+// property promising "set it to ["/api/v1"] and the Go behaviour is back" is not true of any
+// deployment. No ValidateOnStart and no DataAnnotations, exactly as that type documents: every
+// setting has a working default, and the middleware degrades to them on its own if the section
+// will not bind.
+builder.Services.AddOptions<RequestContextOptions>()
+    .Bind(builder.Configuration.GetSection(RequestContextOptions.SectionName));
 
 // ---------------------------------------------------------------- Infrastructure (ports -> adapters)
 builder.Services.AddUserSvcInfrastructure(builder.Configuration);
@@ -215,6 +229,52 @@ builder.Services
     })
     .AddOpenApi();
 
+// One OpenAPI document per identity plane, on top of the one-per-version the versioning package
+// already produces. The admin console and the mobile app then each generate a client from a file
+// that holds only their own endpoints, so neither can call the other's by accident and neither has
+// to read past 30 irrelevant paths. The version documents keep their names ('v1'); the back-office
+// ones are 'back-office-v1'. A new API version needs a line here beside its own [ApiVersion].
+// AV0029 fires because the versioning package owns document registration when
+// AddApiVersioning().AddOpenApi() is used, and calling the framework's AddOpenApi beside it is
+// usually a sign the two were wired twice. Here it is deliberate and additive: this registers one
+// EXTRA document that is not a version at all, and the version documents keep coming from the
+// package untouched. Suppressed at the single line rather than in the project file, so a second
+// call somewhere else still gets caught.
+#pragma warning disable AV0029
+builder.Services.AddOpenApi(ApiPlanes.BackOfficeDocument("v1"));
+#pragma warning restore AV0029
+
+// ConfigureAll rather than named calls: the version document names come from the API versions the
+// explorer discovers at run time, so there is no name to write here - a transformer registered
+// against only the names that exist today would silently stop covering v2 on the day it appears.
+builder.Services.ConfigureAll<OpenApiOptions>(options =>
+{
+    options.AddOperationTransformer<RequestHeadersOperationTransformer>();
+    options.AddDocumentTransformer<BearerSecuritySchemeTransformer>();
+    options.AddOperationTransformer<BearerSecurityOperationTransformer>();
+
+    if (ApiPlanes.IsBackOfficeDocument(options.DocumentName, out var versionGroup))
+    {
+        // Self-contained rather than composed: the versioning package configures its own filter by
+        // matching the document name against a version group, and 'back-office-v1' is not one, so
+        // there is nothing here to compose with. The version is read off the path instead - the
+        // same string, written there by SubstituteApiVersionInUrl.
+        options.ShouldInclude = description =>
+            (ApiPlanes.IsBackOffice(description) && ApiPlanes.VersionGroup(description) == versionGroup)
+            || ApiPlanes.IsShared(description);
+
+        return;
+    }
+
+    // A version document: keep whatever the versioning package decided about which version this
+    // route belongs to, and drop the back-office plane on top of it. Replacing the delegate rather
+    // than composing would put every version's endpoints into every version's document.
+    var versioned = options.ShouldInclude;
+
+    options.ShouldInclude = description =>
+        (versioned is null || versioned(description)) && !ApiPlanes.IsBackOffice(description);
+});
+
 // Decision 09: RFC 9457 is the only error contract. There is no envelope.
 // This callback is the last thing to touch the body on every path - the ones AppExceptionHandler
 // maps and the ones it never sees, such as an authentication challenge a middleware answers by
@@ -254,6 +314,25 @@ builder.Services.AddHealthChecks()
     .AddCheck<DatabaseHealthCheck>("postgres", tags: ["ready"])
     .AddCheck<RedisHealthCheck>("redis", tags: ["ready"])
     .AddCheck<IdentifierProtectionHealthCheck>("identifier-protection", tags: ["ready"]);
+
+// ---------------------------------------------------------------- Async work (db/0014_task_queues.sql)
+// The generic task queue's runner and reclaim. LAST among the hosted-service registrations, and the
+// position is the whole shutdown design.
+//
+// The framework cancels every hosted service's stoppingToken BEFORE it awaits any of their
+// StopAsync, so "stop accepting new async work" happens for all of them at once - and then it
+// awaits StopAsync in REVERSE registration order, so these two, registered last, are drained
+// first. Registered inside AddUserSvcInfrastructure they would sit ahead of the two OpenIddict
+// services (OpenIddictRegistration.cs) and be drained after them, which is the wrong way round:
+// the queue is the only hosted service here whose stop has real work to wait for.
+//
+// The bound on that drain is deliberately NOT HostOptions.ShutdownTimeout. That one - 30 seconds,
+// the framework's default, left alone - bounds the whole shutdown, and Kestrel's own request drain
+// is inside it, so lowering it to the Go service's 5s APP_SHUTDOWN_TIMEOUT would shorten HTTP
+// draining on every rolling update to buy the queue nothing. Tasks:DrainTimeout carries that 5s
+// instead, bounding only the queue's share; overrunning it leaves the rows claimed for the reclaim
+// rather than taking the host's budget.
+builder.Services.AddTaskQueueWorkers(builder.Configuration);
 
 var app = builder.Build();
 
@@ -349,7 +428,13 @@ if (app.Environment.IsDevelopment())
                 ? description.GroupName + " (deprecated)"
                 : description.GroupName;
 
-            options.SwaggerEndpoint($"/openapi/{description.GroupName}.json", label);
+            // Two entries per version, one per identity plane. Named rather than numbered because
+            // the picker is the one place a reader chooses which surface they are looking at, and
+            // "v1" twice would make that choice invisible.
+            options.SwaggerEndpoint($"/openapi/{description.GroupName}.json", $"Consumer API {label}");
+            options.SwaggerEndpoint(
+                $"/openapi/{ApiPlanes.BackOfficeDocument(description.GroupName)}.json",
+                $"Back office API {label}");
         }
     });
 }

@@ -6,6 +6,7 @@ using UserSvc.Domain.Iam;
 using UserSvc.Domain.Tenancy;
 using UserSvc.Domain.Users;
 using UserSvc.Infrastructure.Persistence.Outbox;
+using UserSvc.Infrastructure.Persistence.Tasks;
 
 namespace UserSvc.Infrastructure.Persistence;
 
@@ -39,6 +40,19 @@ public sealed class UserSvcDbContext(DbContextOptions<UserSvcDbContext> options)
     public DbSet<UserSession> UserSessions => Set<UserSession>();
 
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
+
+    /// <summary>
+    /// The generic async task queue (db/0014_task_queues.sql). Cross-cutting plumbing rather than
+    /// a user- or back-office concept, so it sits beside <see cref="OutboxMessages"/> in the same
+    /// schema for the same reason.
+    /// <para>
+    /// The set exists so EF knows the entity and can materialise <c>Pop</c>'s <c>RETURNING</c>
+    /// rows. Every write goes through <c>ITaskQueue</c>'s explicit statements, never the change
+    /// tracker - a queue row must be inserted with ON CONFLICT DO NOTHING and claimed with FOR
+    /// UPDATE SKIP LOCKED, and SaveChanges can express neither.
+    /// </para>
+    /// </summary>
+    public DbSet<TaskQueueEntry> TaskQueues => Set<TaskQueueEntry>();
 
     // --- Back-office (schema "iam") ---
     // A different bounded context from the consumer tables above. They share this context only so

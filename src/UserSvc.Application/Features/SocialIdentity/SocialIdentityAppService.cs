@@ -487,7 +487,7 @@ public sealed class SocialIdentityAppService(
             if (string.IsNullOrEmpty(user?.PasswordHash))
             {
                 throw new ConflictException(
-                    ErrorCodes.Conflict,
+                    ErrorCodes.LastLoginMethod,
                     "This is the only way to sign in to this account. Add another one before removing it.");
             }
         }

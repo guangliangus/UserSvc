@@ -100,31 +100,17 @@ public sealed class SupportedLocalesTests
         SupportedLocales.Codes.ShouldBe(["en", "ja", "zh-TW", "zh-CN", "ko", "th", "vi"]);
 
     /// <summary>
-    /// <see cref="UserSvc.Application.Features.Feedback.RequestLocales"/> is the same table, written
-    /// first for the feedback labels and left in place here because moving it would touch another
-    /// slice's files. Two copies of a locale table drift, and the symptom is one endpoint answering
-    /// in a different language from the next - so until it is deleted, this test is what keeps them
-    /// honest.
+    /// The feedback labels are the second caller, and the reason the canonical spelling matters as
+    /// much as the match: their lookup is an <b>exact, case-sensitive</b> key match against a jsonb
+    /// object spelled <c>zh-CN</c> / <c>zh-TW</c>. The feedback slice used to carry its own copy of
+    /// this table for that; the copy is gone, so these are the spellings both the bundles and that
+    /// jsonb are keyed by.
     /// </summary>
     [Theory]
-    [InlineData("en")]
-    [InlineData("EN")]
-    [InlineData("en-US")]
-    [InlineData("ja-JP")]
-    [InlineData("ko-KR")]
-    [InlineData("th")]
-    [InlineData("vi-VN")]
-    [InlineData("zh")]
-    [InlineData("zh_CN")]
-    [InlineData("zh-Hans-CN")]
-    [InlineData("zh-TW")]
-    [InlineData("zh-HK")]
-    [InlineData("zh-MO")]
-    [InlineData("zh-Hant-TW")]
-    [InlineData("de-DE")]
-    [InlineData("engineering")]
-    [InlineData("")]
-    public void ItAgreesWithTheFeedbackTableItSupersedes(string raw) =>
-        SupportedLocales.Normalize(raw)
-            .ShouldBe(UserSvc.Application.Features.Feedback.RequestLocales.Normalize(raw));
+    [InlineData("zh_CN", "zh-CN")]
+    [InlineData("zh-cn", "zh-CN")]
+    [InlineData("zh-hk", "zh-TW")]
+    [InlineData("JA-jp", "ja")]
+    public void NormalizationYieldsTheKeySpellingAndNotTheClientsCasing(string raw, string expected) =>
+        SupportedLocales.Normalize(raw).ShouldBe(expected);
 }

@@ -21,7 +21,7 @@ namespace UserSvc.Api.Controllers.BackOffice;
 /// The client's next call is therefore <c>POST /connect/token</c> with
 /// <c>grant_type=urn:usersvc:params:oauth:grant-type:back-office</c> and the ticket. When
 /// <c>context_required</c> is true that mints a <b>pre-tenant</b> token, which reaches
-/// <c>GET /auth/tenants</c> and <c>POST /auth/context</c> and nothing else; choosing a context is
+/// <c>GET /back-office/tenants</c> and <c>POST /back-office/context</c> and nothing else; choosing a context is
 /// then exchanged for a full back-office token through the second grant. See
 /// <see cref="BackOfficeTokenIssuer"/> for why a scope is what expresses that distinction.
 /// </para>
@@ -37,7 +37,7 @@ namespace UserSvc.Api.Controllers.BackOffice;
 [ApiController]
 [AllowAnonymous]
 [ApiVersion("1.0")]
-[Route("api/v{version:apiVersion}/auth/back-office")]
+[Route("api/v{version:apiVersion}/back-office/auth")]
 [Produces("application/json")]
 public sealed class BackOfficeAuthController(BackOfficeSignInAppService signIns) : ControllerBase
 {

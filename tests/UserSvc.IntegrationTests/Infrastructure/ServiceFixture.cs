@@ -177,8 +177,19 @@ public sealed class ServiceFixture : IAsyncLifetime
     /// never made. Every per-source rate-limit budget in the service disables itself when there is
     /// no address to attribute to, so this is what a test about one has to ask for.
     /// </param>
+    /// <param name="configureServices">
+    /// Extra registrations for that host's container, or null for none.
+    /// <para>
+    /// Only the task-queue tests pass it, and only to register a handler: the runner discovers the
+    /// queues to poll from the registered <c>ITaskHandler</c> types, and this service deliberately
+    /// ships with none, so a registration is the only way into the code path Program.cs wires. The
+    /// factory's own remarks argue why that belongs in a test host rather than in src/.
+    /// </para>
+    /// </param>
     internal UserSvcApplicationFactory CreateHost(
-        IReadOnlyDictionary<string, string> overrides, string? peerAddress = null)
+        IReadOnlyDictionary<string, string> overrides,
+        string? peerAddress = null,
+        Action<IServiceCollection>? configureServices = null)
     {
         ArgumentNullException.ThrowIfNull(overrides);
 
@@ -188,7 +199,7 @@ public sealed class ServiceFixture : IAsyncLifetime
         }
 
         return new UserSvcApplicationFactory(
-            PostgresConnectionString, RedisConfiguration, overrides, peerAddress);
+            PostgresConnectionString, RedisConfiguration, overrides, peerAddress, configureServices);
     }
 
     /// <summary>

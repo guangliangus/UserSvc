@@ -17,7 +17,15 @@ namespace UserSvc.Api.Controllers.BackOffice;
 /// </para>
 /// </summary>
 [ApiController]
-[Authorize]
+// The plane guard, not a permission one. Both are served by one OpenIddict instance, so a
+// consumer access token satisfies a bare [Authorize] here - and its sub is an identity.users id
+// that AdminScopeService then resolves against iam.backend_users, which numbers its rows
+// independently. Measured on a running host before this line existed: a device-grant token for
+// consumer 1 read the whole role and permission catalogue at 200 and created a role at 201,
+// because back-office account 1 happens to be the platform super administrator. The actions below
+// that carry no permission requirement are still open to every back-office user by design; what
+// this asserts is only that the caller is on this plane at all.
+[Authorize(Policy = BackOfficePolicies.BackOffice)]
 [ApiVersion("1.0")]
 [Route("api/v{version:apiVersion}/back-office")]
 [Produces("application/json")]

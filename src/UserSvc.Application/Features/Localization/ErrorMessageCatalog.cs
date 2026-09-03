@@ -45,6 +45,15 @@ public static class ErrorMessageCatalog
     /// that response to the operator reading it. Replacing it with a translated sentence would send
     /// them to read code instead of secrets.
     /// </para>
+    /// <para>
+    /// <see cref="ErrorCodes.Conflict"/> used to be absent for a different reason, and it is worth
+    /// recording how it stopped being: it is the generic bucket, and it carried two unrelated
+    /// details - the unique index that fired, and "this is the only way to sign in to this
+    /// account". One sentence per code cannot cover both, so the second refusal was given
+    /// <see cref="ErrorCodes.LastLoginMethod"/> and the bucket became translatable. <b>That is the
+    /// remedy whenever a code resists translation: split the code, do not write a vaguer
+    /// sentence.</b>
+    /// </para>
     /// </summary>
     private static readonly FrozenDictionary<string, string> Aliases =
         new Dictionary<string, string>(StringComparer.Ordinal)

@@ -87,10 +87,10 @@ public static class RequestContextAccessor
 {
     private const string ItemKey = "usersvc.request-context";
 
-    private const string PlatformHeader = "X-Platform";
-    private const string DeviceIdHeader = "X-Device-ID";
-    private const string DeviceInfoHeader = "X-Device-Info";
-    private const string RequestIdHeader = "X-Request-ID";
+    internal const string PlatformHeader = "X-Platform";
+    internal const string DeviceIdHeader = "X-Device-ID";
+    internal const string DeviceInfoHeader = "X-Device-Info";
+    internal const string RequestIdHeader = "X-Request-ID";
 
     /// <summary>The explicit locale header, and the only one the Go service read.</summary>
     public const string LanguageHeader = "X-Language";
