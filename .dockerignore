@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/TestResults/
+.git/
+.idea/
+tests/
+docs/
+scripts/
+*.user
+.DS_Store

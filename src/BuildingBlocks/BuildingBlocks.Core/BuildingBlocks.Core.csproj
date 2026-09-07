@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Dependency-free abstractions shared by all building blocks: clock, current actor, paging, integration events, distributed lock, error model.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Update="Events\IEventPublisher.cs">
+      <DependentUpon>IntegrationEvent.cs</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+</Project>
