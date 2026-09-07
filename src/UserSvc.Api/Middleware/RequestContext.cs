@@ -39,12 +39,14 @@ public sealed record RequestContext
     /// <summary>
     /// The peer address, as the socket reports it.
     /// <para>
-    /// <b>It is the gateway's address, not the end user's, whenever this service runs behind one</b>
-    /// - nothing in this host registers <c>UseForwardedHeaders</c>, so <c>X-Forwarded-For</c> is not
-    /// consulted. The Go middleware this ports read gin's <c>ClientIP()</c>, which does consult it,
-    /// so this field is deliberately narrower than its ancestor and is not a drop-in source for an
-    /// audit row's actor IP. Configuring the forwarded-headers middleware with the gateway in
-    /// <c>KnownProxies</c> is what would close the gap, and it belongs to the host, not here.
+    /// <b>It is the gateway's address, not the end user's, whenever this service runs behind one
+    /// and the forwarded-headers block is left at its default.</b> The host registers the template's
+    /// <c>AddMsvcForwardedHeaders</c> with <c>ForwardedHeaders:Enabled=false</c>; a deployment
+    /// behind the gateway turns it on and names the ingress CIDR in <c>KnownNetworks</c>, and from
+    /// then on <c>X-Forwarded-For</c> is consulted and this field is the end user's address. The Go
+    /// middleware this ports read gin's <c>ClientIP()</c>, which always consulted it, so until that
+    /// switch is on this field is narrower than its ancestor and is not a drop-in source for an
+    /// audit row's actor IP. The trust decision belongs to the host's configuration, not here.
     /// </para>
     /// </summary>
     public string ClientIp { get; init; } = string.Empty;

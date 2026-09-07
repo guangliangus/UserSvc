@@ -4,6 +4,15 @@
     <ProjectReference Include="../UserSvc.Infrastructure/UserSvc.Infrastructure.csproj" />
   </ItemGroup>
 
+  <!-- Template building blocks, source-synced from the MsTemplate repository (its
+       eng/sync-buildingblocks.sh overwrites src/BuildingBlocks/). Outer ring only: the host consumes
+       them; nothing under Application or Domain may reference them. Which blocks are consumed and
+       which were deliberately not is recorded in docs/architecture.md, "BuildingBlocks". -->
+  <ItemGroup>
+    <ProjectReference Include="../BuildingBlocks/BuildingBlocks.Observability/BuildingBlocks.Observability.csproj" />
+    <ProjectReference Include="../BuildingBlocks/BuildingBlocks.Web/BuildingBlocks.Web.csproj" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
     <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" />

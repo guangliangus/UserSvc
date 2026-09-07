@@ -750,8 +750,9 @@ public sealed class TaskQueueWorkerTests(ServiceFixture fixture) : IntegrationTe
     /// <para>
     /// <b>Behaviour and not the log, deliberately, and this is the note that saves the next reader
     /// the experiment.</b> The kill switch's log line is asserted on the worker-pod tests but is
-    /// unreachable here: <c>Program.cs</c> uses <c>builder.Host.UseSerilog(...)</c>, whose
-    /// <c>writeToProviders</c> defaults to false, so Serilog replaces the logger factory and an
+    /// unreachable here: <c>Program.cs</c> wires Serilog through the template's
+    /// <c>AddMsvcObservability</c>, which calls <c>builder.Host.UseSerilog(...)</c> with
+    /// <c>writeToProviders</c> at its default of false, so Serilog replaces the logger factory and an
     /// <c>ILoggerProvider</c> a test host adds is never called. Passing
     /// <c>writeToProviders: true</c> would make it assertable and was measured before being
     /// rejected: with the Console sink this configuration already has, every line is then written

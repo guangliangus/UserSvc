@@ -19,6 +19,13 @@ public static class ErrorCodes
     public const string UpstreamUnavailable = "UPSTREAM_SERVICE_UNAVAILABLE";
     public const string InternalError = "INTERNAL_ERROR";
 
+    /// <summary>
+    /// The inbound request budget (RequestTimeouts:DefaultTimeoutSeconds) expired: 504. Written by
+    /// the template's request-timeout block, which reads the code from configuration; it is
+    /// declared here so the client contract has one home.
+    /// </summary>
+    public const string RequestTimeout = "REQUEST_TIMEOUT";
+
     // --- Identity and profile ---
     public const string UserNotFound = "USER_NOT_FOUND";
     public const string AccountDisabled = "ACCOUNT_DISABLED";

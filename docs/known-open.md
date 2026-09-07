@@ -266,8 +266,9 @@ Go 那边唯一的 handler 是 FCM 主题同步，按用户的明确划分属于
    40 秒被投递 11 次，`Tasks:MaxAttempts=2` 毫无作用）。第一个 handler 必须自带计数器和
    `DeleteAsync` 终态，否则一行毒任务会按 `StalePoppedTimeout` 的节奏被永久重试。
 3. **没有任何办法在线问一个 pod「你在消费吗」**，只能翻它的启动日志：没有 health check tag、
-   没有端点、没有 metric（决策 20 的三个信号今天只有 trace 和 log，`src/` 里没有 `WithMetrics`，
-   所以队列深度是一行带 `Depth` 结构化属性的日志，见 `QueueDepthSignal`）。
+   没有端点、没有队列自己的 metric。2026-09-04 起宿主经模版的 observability 块暴露了 `/metrics`
+   （ASP.NET Core / HttpClient / 运行时指标），决策 20 的三个信号从此齐了，但**队列本身仍没有
+   Meter**——队列深度还是一行带 `Depth` 结构化属性的日志，见 `QueueDepthSignal`。
    队列关着的时候这不要紧，有 handler 之后就要紧了。
 
 **关掉它需要什么。** 一个真正需要「带重试的后台工作，并且和造成它的那次写原子入队」的能力，

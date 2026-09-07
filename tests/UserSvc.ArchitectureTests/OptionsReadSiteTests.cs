@@ -158,6 +158,13 @@ public sealed class OptionsReadSiteTests
                     var settings = late.Value;
                     return settings.Name + _deferred.Value + _name;
                 }
+
+                public string ReadWithDefault(IOptions<FooOptions> late, int retries = 3)
+                {
+                    // IGNORED, line 61: a method body. The '=' of the default parameter value in the
+                    // signature is not an assignment, so this brace opens a method, not an initializer.
+                    return late.Value.Name + retries;
+                }
             }
             """;
 
@@ -286,6 +293,13 @@ internal static class OptionsReadScan
         var behindArrow = false;
         var inConstructorExpressionBody = false;
 
+        // An '=' inside parentheses is a default parameter value, a named-argument assignment or an
+        // attribute property - never the initializer of the member being declared. Without this,
+        // `void M(CancellationToken ct = default) { ... }` reads as "an initializer follows", and
+        // every options read in that method body is reported as construction-time. Found by
+        // porting the guard to a codebase whose async methods all carry `= default`.
+        var parenthesisDepth = 0;
+
         var line = 1;
 
         for (var i = 0; i < code.Length; i++)
@@ -381,7 +395,23 @@ internal static class OptionsReadScan
                 continue;
             }
 
-            if (c == '=' && !IsComparison(code, i))
+            if (c == '(')
+            {
+                parenthesisDepth++;
+                continue;
+            }
+
+            if (c == ')')
+            {
+                if (parenthesisDepth > 0)
+                {
+                    parenthesisDepth--;
+                }
+
+                continue;
+            }
+
+            if (c == '=' && parenthesisDepth == 0 && !IsComparison(code, i))
             {
                 sawAssignment = true;
                 continue;

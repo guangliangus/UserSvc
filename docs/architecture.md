@@ -296,11 +296,13 @@ bcrypt cost 10 和 Argon2id 不是同一个价钱，所以 wave 7 等价化的�
   `backoffice-sign-in` 计数器、一个 `backoffice-sign-in-ip` key 都没有）；代价是这个维度
   **除非某个测试专门要一个地址，否则完全没有端到端覆盖**。所以 `UserSvcApplicationFactory`
   有一个 `peerAddress` 参数，per-host opt-in，今天恰好只有一个测试用它。
-- **本服务没有任何地方注册 `UseForwardedHeaders`**，所以 `RemoteIpAddress` 是网关的地址。
-  跑在网关后面时，每一个请求共用同一份 per-source 预算——这个控制项在那种部署下等于没有。
-  要补的是宿主层把网关放进 `KnownProxies`，不是在某个 app service 里私下再解一遍
-  `X-Forwarded-For`：那会变成第二套信任模型，审计行记网关、限流信任伪造的头，
-  攻击者每个请求换一个头就换一份新预算。两者要一起改。
+- **ForwardedHeaders 默认是关的**（2026-09-04 起宿主注册了模版的 `AddMsvcForwardedHeaders`，
+  `ForwardedHeaders:Enabled=false`），所以开发机上 `RemoteIpAddress` 就是对端地址，而跑在网关后面时
+  它是网关的地址——每一个请求共用同一份 per-source 预算，这个控制项在那种部署下等于没有。
+  **部署要做的只有配置**：`ForwardedHeaders__Enabled=true`、`ForwardedHeaders__KnownNetworks`
+  填 ingress 的 CIDR（留空等于信任所有来源，与 `ASPNETCORE_FORWARDEDHEADERS_ENABLED` 同义）。
+  不要在某个 app service 里私下再解一遍 `X-Forwarded-For`：那会变成第二套信任模型，审计行记网关、
+  限流信任伪造的头，攻击者每个请求换一个头就换一份新预算。信任决定只在宿主配置里做一次。
 
 ## 生产环境会拒绝启动的配置
 
@@ -320,12 +322,19 @@ bcrypt cost 10 和 Argon2id 不是同一个价钱，所以 wave 7 等价化的�
 
 `Program.cs` 的管道顺序不是风格问题，有两处错了会静默出错：
 
-1. **`UseSerilogRequestLogging()` 必须在 `UseExceptionHandler()` 之前（最外层）。**
+1. **`UseMsvcRequestLogging()`（模版的请求日志块）必须在 `UseExceptionHandler()` 之前（最外层）。**
    放在后面，它看到的是仍在飞的异常，会把请求记成 500——而异常处理器接下来会把它变成 400。
    于是每一次普通的校验失败都在请求日志里长得像一次服务端故障，所有基于该日志的 SLO 看板
-   都会把我们自己的 4xx 读成我们自己的宕机。
+   都会把我们自己的 4xx 读成我们自己的宕机。模版生成的 Program.cs 原本正是这个错误顺序，
+   2026-09-04 已随本条一起回流修正。
 2. **`RevokedSessionMiddleware` 必须在认证之后、授权之前。** 之前没有 `sid` 可读；之后
    一个已撤销的会话可能已经通过了某条授权策略。
+
+模版块加进来之后多了三个位置，都不在上面两处的缝里：`UseMsvcForwardedHeaders()` 在最外层
+（它改写后面所有中间件看到的地址与协议）；`UseMsvcRequestTimeouts()` 在异常处理器与
+`UseStatusCodePages()` **之内**（超时时它自己经 `IProblemDetailsService` 写 504，
+`CustomizeProblemDetails` 因此照常盖上 errorCode / traceId / 语言）；`UseMsvcCors()` 在认证
+**之前**（预检请求要被回答而不是被 401 挑战），Origins 为空时是空操作。
 
 ## 一个缺失的能力只能弄坏它自己
 
@@ -481,6 +490,36 @@ pod 时钟漂多少，每个 backoff 窗口和每个 cutoff 就错多少，而�
 `Microsoft.Extensions.Logging.Abstractions` 允许出现在 Application 层；`Serilog` 被守卫禁止。
 一个说不出自己哪里出错的应用服务，耦合程度比依赖 `ILogger<T>` 更糟。
 
+## BuildingBlocks：接了哪些模版块、哪些有意没接
+
+`src/BuildingBlocks/` 是团队模版仓库（MsTemplate）`src/BuildingBlocks/` 的**源码副本**，只放本服务
+引用的三个项目：`Core`、`Web`、`Observability`，并且只有 `UserSvc.Api` 引用它们（最外环；内环引用
+它们会被 `DependencyRuleTests` 挡住的是技术包，块本身请勿引入 Application/Domain）。**这里的代码不在
+本仓库改**：要改先改模版再同步。同步命令是模版仓库的 `eng/sync-buildingblocks.sh <本仓库根>`，它会
+rsync 整个目录并把没引用的五个项目也带进来——同步后 `git diff` 看一眼，未引用的项目直接删掉。
+本服务因为不是 `dotnet new msvc` 生成的（比模版晚六小时手工搭起），2026-09-04 才第一次接入。
+
+| 接了 | 怎么用 | 为什么 |
+|---|---|---|
+| `Observability` | `AddMsvcObservability("user-svc")`、`UseMsvcRequestLogging()`、`MapMsvcMetrics()` | 补上此前没有的 metrics（`/metrics`）、采样比例、Npgsql/EF 追踪、脱敏 enricher；三探针**保留自己的** `HealthReportWriter`，所以不调 `MapMsvcObservabilityEndpoints()` |
+| `Web/Forwarding` | `AddMsvcForwardedHeaders` + `UseMsvcForwardedHeaders`，默认关 | 网关后的 per-source 限流维度（见「限流」一节） |
+| `Web/Timeouts` | 30s → 504，`RequestTimeouts:ErrorCode = REQUEST_TIMEOUT` | 此前只有出站超时没有入站预算 |
+| `Web/Cors` | `Cors:Origins` 空即空操作 | 网关今天终结 CORS；将来是改配置不是发版 |
+| `Data` 的三个文件 | `PostgresOptions`（重试预算、命令超时）、`NpgsqlDataSource` 单例、探针 `SELECT 1` | **只搬文件不搬项目**：`BuildingBlocks.Data` 还带审计拦截器和 `Entity` 基类，与本服务 `Entity`（"会发领域事件"）语义不同，反射式 xmin 会漏掉三张表 |
+
+| 有意没接 | 原因（细节见各自章节） |
+|---|---|
+| `Tasks` | 所有权模型正相反：模版 runner 计数、事后 Delete/ReArm（第二个事务），本服务 handler 拥有 Delete/ReArm 并与业务写同事务；模版 SQL 硬编码 `task_queues`/`payload`，与 `identity.task_queues`/`payload_json` 连 DDL 都不能共用 |
+| `Messaging`/Outbox | 表形不同（bigint/uuid/jsonb/status）、投递器绑死 RabbitMQ、7 天清理会删掉本服务要留的安全审计痕迹、拦截器式捕获覆盖 OpenIddict 直接调的 SaveChanges |
+| `Caching` | 本服务的 `RedisOptions`/`RedisFailure` 更严（FailFast、500ms、前缀校验、失败分类）；这些 2026-09-04 已回流进模版，但 HybridCache / 分布式锁 / 幂等存储本服务不用 |
+| `Web` 的 ProblemDetails、RateLimiting、Idempotency、Auth、OpenApi、Validation | 自己的实现更全或语义不同（本地化 seam、Retry-After、NOT_CONFIGURED、按失败计数的 Redis 限流、双平面 OpenAPI、OpenIddict）；且 errorCode 大小写不兼容——模版 `not_found`，本服务 `NOT_FOUND`，**不要混用** |
+| `Http` | 每上游一套 Options、派生 `SamplingDuration`、单次凭证禁重试，配置绑定表达不了这些 |
+
+反方向：这次对照发现的模版缺陷（请求日志顺序、任务队列两个时钟与 kill switch、outbox 裸表名、
+`UseSerialColumns`、token 缓存撕裂读、幂等中间件 Redis 故障 500、`TryAdd("traceId")` 空操作）
+已连同本仓库的架构守卫、DDL 规范测试和 CI 门禁 02b/03/04 一起回流到模版，记录在模版
+`docs/spec/microservice-template-spec.md` 的「2026-09-04 增补」。
+
 ## 数据库
 
 `db/README.md`。要点：**应用永不改库**，DDL 手动先行，脚本幂等。
@@ -585,6 +624,6 @@ startup project 必须是 `UserSvc.Infrastructure`：`Microsoft.EntityFrameworkC
 （`BackOffice:PasswordResetPerSourcePerMinute`/`PerHour`，默认 100/min、500/hr，
 dimension `backoffice-password-reset-ip`，与登录门、发码门各自独立）。
 
-> Go 服务这条路由的 per-IP 预算是**每小时 3 次**，本服务**故意没有照抄**：本进程不注册
-> `UseForwardedHeaders`，跑在网关后面时每个请求共用同一个对端地址（见前面限流那节），
+> Go 服务这条路由的 per-IP 预算是**每小时 3 次**，本服务**故意没有照抄**：本进程的
+> ForwardedHeaders 默认关着，跑在网关后面而没打开它时每个请求共用同一个对端地址（见前面限流那节），
 > 3/hr 就不是节流而是「整个运营群体每小时只能改 3 次密码」的停机。

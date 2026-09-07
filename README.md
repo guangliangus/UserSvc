@@ -27,11 +27,15 @@ src/
     Auth/                    OpenIddict 注册、重放事件处理器、撤销中间件、开发期认证
     Controllers/             Profile / Sessions / Token
     Errors/                  ProblemDetails 映射
+  BuildingBlocks/          团队模版（MsTemplate）building blocks 的源码副本，只有 Api 引用
+    Core / Web / Observability   ForwardedHeaders、请求超时、CORS、Serilog+OTel+/metrics
+                             接了哪些、哪些有意没接：docs/architecture.md「BuildingBlocks」
 tests/
   UserSvc.ArchitectureTests/  ★ 依赖方向、分层约定、源码语言的机器强制
   UserSvc.UnitTests/          聚合与 AppService，端口全 mock
   UserSvc.IntegrationTests/   Testcontainers：真 Postgres + 真 Redis + 真代码路径
 db/                        手动执行的幂等 DDL（0001-0003 identity / 0004-0007 iam）
+Dockerfile                 多阶段构建、非 root 运行（取自模版）；不含任何 DDL
 ```
 
 ## 跑起来
@@ -53,7 +57,7 @@ dotnet run --project src/UserSvc.Api        # http://localhost:5080
 和 `Notification:BaseAddress`**——它们是 `[Required]` 且启动时校验，缺失会拒绝启动，而一个
 `localhost` 默认值会让生产静默连错机器。
 
-API 文档：<http://localhost:5080/swagger>（顶部下拉切换 **Consumer API** / **Back office API**——两份独立文档，各自只含本平面的路径）　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>
+API 文档：<http://localhost:5080/swagger>（顶部下拉切换 **Consumer API** / **Back office API**——两份独立文档，各自只含本平面的路径）　OIDC 发现：<http://localhost:5080/.well-known/openid-configuration>　指标：<http://localhost:5080/metrics>（Prometheus 抓取格式；探针在 `/health/{startup,live,ready}`）
 
 ### 拿一个令牌
 

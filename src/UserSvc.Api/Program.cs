@@ -1,10 +1,11 @@
 using System.Diagnostics;
 using Asp.Versioning;
+using BuildingBlocks.Observability;
+using BuildingBlocks.Web.Cors;
+using BuildingBlocks.Web.Forwarding;
+using BuildingBlocks.Web.Timeouts;
 using Microsoft.AspNetCore.OpenApi;
 using FluentValidation;
-using OpenTelemetry.Resources;
-using OpenTelemetry.Trace;
-using Serilog;
 using UserSvc.Api.Auth;
 using UserSvc.Api.Errors;
 using UserSvc.Api.Middleware;
@@ -48,16 +49,16 @@ var builder = WebApplication.CreateBuilder(args);
 // ---------------------------------------------------------------- Observability (decision 20)
 // Three signals with distinct jobs, stitched together by one traceId: metrics say something is
 // wrong, traces say which hop, logs say what happened on this specific request.
-builder.Host.UseSerilog((context, logger) => logger
-    .ReadFrom.Configuration(context.Configuration)
-    .Enrich.FromLogContext());
-
-builder.Services.AddOpenTelemetry()
-    .ConfigureResource(resource => resource.AddService("user-svc"))
-    .WithTracing(tracing => tracing
-        .AddAspNetCoreInstrumentation()
-        .AddHttpClientInstrumentation()
-        .AddOtlpExporter());
+//
+// The template block wires all three. Serilog: compact JSON to stdout by default, text carrying the
+// bare trace id when Observability:ConsoleFormat is "text" (appsettings.Development.json), the
+// "Serilog" section still overriding levels, and a masking enricher blanking password/secret/
+// token/authorization properties. Traces: ASP.NET Core, HttpClient, Npgsql and EF Core, sampled
+// parent-based at Observability:TraceSampleRatio, exported over OTLP only when an endpoint is
+// configured (Observability:OtlpEndpoint or OTEL_EXPORTER_OTLP_ENDPOINT) - a developer box without
+// a collector no longer retries against localhost:4317. Metrics: ASP.NET Core, HttpClient and the
+// runtime, scraped from /metrics (MapMsvcMetrics below); nothing is pushed.
+builder.AddMsvcObservability("user-svc");
 
 // ---------------------------------------------------------------- Configuration
 // Every strongly typed Options object is validated at startup: a bad value or a missing required
@@ -209,6 +210,26 @@ builder.Services.AddUserSvcAuthentication(builder.Configuration, builder.Environ
 
 builder.Services.AddAuthorization(options => options.AddBackOfficePolicies());
 
+// ---------------------------------------------------------------- Host edge (template blocks)
+// ForwardedHeaders: registered, and OFF by default, which is exactly the behaviour this host had
+// before the block existed. Behind the gateway the deployment sets ForwardedHeaders:Enabled=true
+// and KnownNetworks to the ingress CIDR; from then on RemoteIpAddress is the real client, which
+// is what every per-source budget in RedisRateLimiter keys on. Until it is enabled, every request
+// behind a proxy shares one such budget - docs/architecture.md records the consequence.
+builder.Services.AddMsvcForwardedHeaders(builder.Configuration);
+
+// The inbound request budget (RequestTimeouts:DefaultTimeoutSeconds, 30s -> 504 REQUEST_TIMEOUT),
+// the counterpart of the outbound HttpClient timeouts in UserSvc.Infrastructure. It cancels
+// RequestAborted, so it only bites handlers that pass the token down - which every handler here
+// does. A statement that outlives its request no longer holds a connection for as long as
+// PostgreSQL will let it.
+builder.Services.AddMsvcRequestTimeouts(builder.Configuration);
+
+// CORS: inactive until Cors:Origins is non-empty. Browser clients reach this service through the
+// gateway today, which terminates CORS; the block is here so the day a browser talks to a pod
+// directly is a configuration change rather than a release.
+builder.Services.AddMsvcCors(builder.Configuration);
+
 // ---------------------------------------------------------------- HTTP
 builder.Services.AddControllers(options => options.Filters.Add<ValidationFilter>());
 
@@ -336,13 +357,19 @@ builder.Services.AddTaskQueueWorkers(builder.Configuration);
 
 var app = builder.Build();
 
+// First of all: rewrites RemoteIpAddress and the scheme from X-Forwarded-* for everything after
+// it. A no-op while ForwardedHeaders:Enabled is false.
+app.UseMsvcForwardedHeaders();
+
 // Outermost on purpose, ahead of the exception handler. Registered after it, this middleware sees
 // the exception still in flight and records the request as a 500 - so a plain validation failure,
 // which the handler is about to turn into a 400, lands in the request log as a server error. Every
 // SLO dashboard built on that log would then read our own 4xx as our own outage (decision 20).
 // Out here it observes the status the client actually received. The exception itself is not lost:
 // AppExceptionHandler logs it, at a level chosen from the mapped status.
-app.UseSerilogRequestLogging();
+// The template's variant of UseSerilogRequestLogging: 5xx at Error, the probes and /metrics at
+// Verbose so they do not drown the application log, route and caller (sub) as properties.
+app.UseMsvcRequestLogging();
 
 app.UseExceptionHandler();
 
@@ -351,6 +378,12 @@ app.UseExceptionHandler();
 // ProblemDetails" is false for exactly the two statuses clients hit most often, 401 and 403.
 // With AddProblemDetails registered, this middleware fills any empty error response with one.
 app.UseStatusCodePages();
+
+// Inside the exception handler and the status-code pages, as in the template's own pipeline. On
+// expiry it writes the 504 itself through IProblemDetailsService, so CustomizeProblemDetails
+// above stamps errorCode, the bare traceId and the negotiated locale on it like on every other
+// failure - the timeout is one more ProblemDetails, not a second error shape.
+app.UseMsvcRequestTimeouts();
 
 // Both of these only read the request and register response callbacks, so neither can swallow an
 // exception: they belong INSIDE the exception handler and the status-code pages, whose bodies then
@@ -361,6 +394,10 @@ app.UseStatusCodePages();
 // that gap is load-bearing for RevokedSessionMiddleware and BackOfficeAuthzMiddleware, in that order.
 app.UseMiddleware<TraceHeaderMiddleware>();
 app.UseMiddleware<RequestContextMiddleware>();
+
+// Before authentication, so a preflight request is answered rather than challenged. A no-op with
+// no origins configured.
+app.UseMsvcCors();
 
 app.UseAuthentication();
 
@@ -377,6 +414,10 @@ app.UseMiddleware<BackOfficeAuthzMiddleware>();
 app.UseAuthorization();
 
 app.MapControllers();
+
+// The Prometheus scrape endpoint, /metrics. Only the metrics half of the template's observability
+// endpoints is mapped: the three probes below keep their own predicates and HealthReportWriter.
+app.MapMsvcMetrics();
 
 // startup and live self-check only and never aggregate external dependencies — otherwise a
 // database blip triggers a restart storm across every replica.
@@ -447,6 +488,7 @@ static string ErrorCodeFor(int statusCode) => statusCode switch
     StatusCodes.Status403Forbidden => ErrorCodes.Forbidden,
     StatusCodes.Status404NotFound => ErrorCodes.NotFound,
     StatusCodes.Status429TooManyRequests => ErrorCodes.RateLimitExceeded,
+    StatusCodes.Status504GatewayTimeout => ErrorCodes.RequestTimeout,
     >= 500 => ErrorCodes.InternalError,
     _ => ErrorCodes.BadRequest,
 };

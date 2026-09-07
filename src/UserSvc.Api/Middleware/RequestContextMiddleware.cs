@@ -31,7 +31,7 @@ namespace UserSvc.Api.Middleware;
 /// translated sentence is the one class that cannot have one.
 /// </description></item>
 /// <item><description>
-/// <b>Not</b> outermost, unlike <c>UseSerilogRequestLogging()</c>: that one must sit above the
+/// <b>Not</b> outermost, unlike <c>UseMsvcRequestLogging()</c>: that one must sit above the
 /// exception handler to record the status the client actually received, and this one must sit below
 /// it for the opposite reason — its own refusal is an ordinary 400 and must be handled, not logged
 /// as an outage.

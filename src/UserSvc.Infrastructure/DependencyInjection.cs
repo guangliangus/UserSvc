@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
+using Npgsql;
 using StackExchange.Redis;
 using UserSvc.Application.Ports.Auth;
 using UserSvc.Application.Ports.BackOffice;
@@ -38,14 +39,38 @@ public static class DependencyInjection
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("Default")
+        // The retry budget and the per-statement timeout, from the template's PostgresOptions.
+        // Before it the retry was a bare EnableRetryOnFailure() and there was no command timeout
+        // at all. Read once at registration, like the connection string: these shape the pool and
+        // the DbContext options, which exist before any request does.
+        services.AddOptions<PostgresOptions>()
+            .Bind(configuration.GetSection(PostgresOptions.SectionName))
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        var postgres = configuration.GetSection(PostgresOptions.SectionName).Get<PostgresOptions>()
+                       ?? new PostgresOptions();
+
+        var connectionString = configuration.GetConnectionString(postgres.ConnectionStringName)
                                ?? throw new InvalidOperationException(
-                                   "ConnectionStrings:Default is required.");
+                                   $"ConnectionStrings:{postgres.ConnectionStringName} is required.");
+
+        // One NpgsqlDataSource per process. It owns the connection pool; every DbContext borrows
+        // from it, and so does the readiness probe, which says SELECT 1 on a pooled connection
+        // instead of constructing a DbContext to ask whether the database is there.
+        services.AddSingleton(_ => new NpgsqlDataSourceBuilder(connectionString).Build());
 
         services.AddSingleton<DomainEventOutboxInterceptor>();
 
         services.AddDbContext<UserSvcDbContext>((provider, options) => options
-            .UseNpgsql(connectionString, npgsql => npgsql.EnableRetryOnFailure())
+            .UseNpgsql(provider.GetRequiredService<NpgsqlDataSource>(), npgsql =>
+            {
+                npgsql.EnableRetryOnFailure(
+                    maxRetryCount: postgres.MaxRetryCount,
+                    maxRetryDelay: TimeSpan.FromSeconds(postgres.MaxRetryDelaySeconds),
+                    errorCodesToAdd: null);
+                npgsql.CommandTimeout(postgres.CommandTimeoutSeconds);
+            })
             .UseSnakeCaseNamingConvention()
             .AddInterceptors(provider.GetRequiredService<DomainEventOutboxInterceptor>()));
 

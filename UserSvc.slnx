@@ -5,6 +5,11 @@
     <Project Path="src/UserSvc.Domain/UserSvc.Domain.csproj" />
     <Project Path="src/UserSvc.Infrastructure/UserSvc.Infrastructure.csproj" />
   </Folder>
+  <Folder Name="/src/BuildingBlocks/">
+    <Project Path="src/BuildingBlocks/BuildingBlocks.Core/BuildingBlocks.Core.csproj" />
+    <Project Path="src/BuildingBlocks/BuildingBlocks.Observability/BuildingBlocks.Observability.csproj" />
+    <Project Path="src/BuildingBlocks/BuildingBlocks.Web/BuildingBlocks.Web.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/UserSvc.ArchitectureTests/UserSvc.ArchitectureTests.csproj" />
     <Project Path="tests/UserSvc.IntegrationTests/UserSvc.IntegrationTests.csproj" />
